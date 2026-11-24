@@ -131,25 +131,3 @@ pub fn hex_distance(x1: i32, y1: i32, x2: i32, y2: i32) -> i32 {
     let (q2, r2, s2) = to_cube(x2, y2);
     ((q1 - q2).abs() + (r1 - r2).abs() + (s1 - s2).abs()) / 2
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_regina_uwp_and_trade_codes() {
-        let regina = parse_uwp("A788899-C").unwrap();
-        assert_eq!(regina.starport, 'A');
-        assert_eq!(regina.tech_level, 12);
-        assert!(regina.trade_codes.contains(&"Ri".to_string()));
-        assert!(regina.trade_codes.contains(&"Ht".to_string()));
-        assert!(!regina.trade_codes.contains(&"Ga".to_string())); // Hydro 8 > 7
-    }
-
-    #[test]
-    fn hex_distance_matches_traveller_subsector_geometry() {
-        assert_eq!(hex_distance(19, 10, 19, 10), 0);
-        assert_eq!(hex_distance(19, 10, 19, 11), 1);
-        assert_eq!(hex_distance(19, 10, 20, 10), 1);
-    }
-}

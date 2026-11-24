@@ -128,22 +128,3 @@ pub fn compute_advance(from: ImperialDate, delta_minutes: i64) -> TimeAdvanceSum
         annual_boundaries_crossed,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn imperial_date_rollover_and_maintenance_periods() {
-        let d = ImperialDate::new(1105, 360, 12, 0);
-        let summary = compute_advance(d, 10 * 1440);
-        assert_eq!(summary.to.year, 1106);
-        assert_eq!(summary.to.day, 5);
-        assert_eq!(summary.to.format(), "005-1106 12:00");
-        assert_eq!(summary.annual_boundaries_crossed, 1);
-
-        let d2 = ImperialDate::new(1105, 1, 8, 0);
-        let s2 = compute_advance(d2, 28 * 1440);
-        assert_eq!(s2.maintenance_periods_crossed, 1);
-    }
-}

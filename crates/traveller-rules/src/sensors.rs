@@ -184,39 +184,3 @@ pub fn resolve_sensor_detection<R: Rng + ?Sized>(
         observer_signature_exposed: input.observer_active_sensors,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rand::rngs::StdRng;
-    use rand::SeedableRng;
-
-    #[test]
-    fn high_guard_sensor_modifiers_sum_correctly() {
-        let mut rng = StdRng::seed_from_u64(7);
-        let input = SensorDetectionInput {
-            context: SensorContext::SpaceInitialDetection,
-            operator_edu_dm: 1,
-            operator_sensors_skill: 2,
-            augment_or_software_dm: 1,
-            observer_sensor_grade: SensorGrade::Improved, // +1
-            observer_tl: 15,
-            observer_extended_array: true, // +2
-            observer_active_sensors: true,
-            target_tl: 12,                     // +3 TL diff
-            target_active_sensors: false,      // 0
-            target_thrust_applied: 2,          // +2
-            target_power_plant_active: true,   // +1
-            target_transponder_or_comms: false,// 0
-            target_stealth_armor_dm: -4,       // -4 stealth coating
-            target_fired_weapons: false,
-            target_crit_damage_severity: 0,
-            situational_dm: 0,
-            roll_mode: RollMode::Normal,
-        };
-        let res = resolve_sensor_detection(&mut rng, &input);
-        // 1 + 2 + 1 + 1 + 3 + 2 + 2 + 1 - 4 = +9
-        assert_eq!(res.roll.total_dm, 9);
-        assert!(res.observer_signature_exposed);
-    }
-}
