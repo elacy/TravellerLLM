@@ -1,0 +1,6 @@
+{
+  "pack_id": "starter-srd",
+  "name": "TravellerLLM Open Starter Pack",
+  "license": "MIT",
+  "note": "Minimal open starter data for public repo verification. Place extracted personal Mongoose book packs in packs/local/ (gitignored)."
+}

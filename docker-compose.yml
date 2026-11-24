@@ -1,0 +1,32 @@
+services:
+  traveller-llm:
+    build: .
+    container_name: traveller-llm
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3080}:3080"
+    env_file:
+      - .env
+    environment:
+      PORT: 3080
+      FRONTEND_DIR: /app/frontend/dist
+      DATA_PACKS_DIR: /data/packs
+    volumes:
+      - ./packs:/data/packs:ro
+
+  # Optional local Postgres for development (`docker compose --profile local-db up -d`)
+  postgres:
+    image: postgres:17-alpine
+    profiles: ["local-db"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: traveller
+      POSTGRES_PASSWORD: traveller
+      POSTGRES_DB: traveller
+    ports:
+      - "5432:5432"
+    volumes:
+      - traveller_pgdata:/var/lib/postgresql/data
+
+volumes:
+  traveller_pgdata:

@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target
+Cargo.lock.bak
+
+# Frontend
+/frontend/node_modules
+/frontend/dist
+/frontend/.vite
+*.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.local
+*.key
+
+# Copyrighted book packs & raw PDFs (NEVER commit to public repo)
+/packs/local/
+*.pdf
+*.epub
+
+# Local dev / OS
+.DS_Store
+*.log
+*.sqlite
+*.db
+.venv/
+__pycache__/
