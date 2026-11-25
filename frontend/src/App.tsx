@@ -15,6 +15,8 @@ import {
 } from "lucide-react";
 import {
   api,
+  AuthRequiredError,
+  AuthUser,
   Campaign,
   CampaignSnapshot,
   CharacterRow,
@@ -36,6 +38,8 @@ interface LiveToolCard {
 }
 
 export default function App() {
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authLoginUrl, setAuthLoginUrl] = useState<string | null>(null);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<CampaignSnapshot | null>(null);
@@ -70,13 +74,22 @@ export default function App() {
 
   const refreshCampaigns = useCallback(async () => {
     try {
-      const { campaigns: list } = await api.listCampaigns();
+      const [{ user }, { campaigns: list }] = await Promise.all([
+        api.authMe(),
+        api.listCampaigns(),
+      ]);
+      setAuthUser(user);
+      setAuthLoginUrl(null);
       setCampaigns(list);
       if (!activeId && list.length > 0) {
         setActiveId(list[0].id);
       }
     } catch (e) {
-      setErrorBanner((e as Error).message);
+      if (e instanceof AuthRequiredError) {
+        setAuthLoginUrl(e.loginUrl);
+      } else {
+        setErrorBanner((e as Error).message);
+      }
     }
   }, [activeId]);
 
@@ -258,6 +271,28 @@ export default function App() {
   const companyAcc = snapshot?.accounts.find((a) => a.kind === "company");
   const personalAcc = snapshot?.accounts.find((a) => a.kind === "personal");
 
+  if (authLoginUrl) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-slate-950 text-slate-100">
+        <div className="w-full max-w-sm rounded-xl border border-slate-800 bg-slate-900 p-6 text-center shadow-xl">
+          <Rocket className="mx-auto mb-3 h-8 w-8 text-amber-400" />
+          <h1 className="font-mono text-lg font-bold tracking-wider text-amber-400">
+            TRAVELLER<span className="text-slate-400">LLM</span>
+          </h1>
+          <p className="mt-2 text-xs text-slate-400">
+            Sign in with Authentik to access the Starship Command Deck.
+          </p>
+          <a
+            href={authLoginUrl}
+            className="mt-5 inline-block w-full rounded-lg bg-amber-500 px-4 py-2.5 text-sm font-semibold text-slate-950 hover:bg-amber-400"
+          >
+            Sign in with Authentik
+          </a>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen flex-col bg-slate-950 text-slate-100">
       {/* Top Starship HUD */}
@@ -330,6 +365,19 @@ export default function App() {
                 Jump (1wk)
               </button>
             </div>
+            {authUser && (
+              <div className="flex items-center gap-2 border-l border-slate-700 pl-3 text-[11px] text-slate-300">
+                <span>{authUser.display_name || authUser.username}</span>
+                {authUser.logout_url && (
+                  <a
+                    href={authUser.logout_url}
+                    className="rounded border border-slate-700 px-1.5 py-0.5 text-slate-400 hover:text-white"
+                  >
+                    Sign out
+                  </a>
+                )}
+              </div>
+            )}
           </div>
         )}
       </header>

@@ -245,7 +245,7 @@ impl Orchestrator {
             let mut round_text = String::new();
             let resp = self
                 .litellm
-                .stream_anthropic_messages(
+                .stream_referee_turn(
                     &camp.referee_model,
                     system_blocks.clone(),
                     api_messages.clone(),

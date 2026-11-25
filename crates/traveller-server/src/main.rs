@@ -1,26 +1,14 @@
-mod routes;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use axum::Router;
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
-use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use traveller_db::Db;
 use traveller_llm::{HindsightClient, LiteLlmClient, LlmConfig, Orchestrator};
-
-#[derive(Clone)]
-pub struct AppState {
-    pub db: Db,
-    pub orchestrator: Orchestrator,
-    pub hindsight: HindsightClient,
-    pub default_referee_model: String,
-    pub default_worker_model: String,
-}
+use traveller_server::auth::{AuthConfig, AuthMode, AuthState};
+use traveller_server::{build_app, AppState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,6 +46,13 @@ async fn main() -> Result<()> {
         std::env::var("FRONTEND_DIR").unwrap_or_else(|_| "./frontend/dist".to_string()),
     );
 
+    let auth_config = AuthConfig::from_env();
+    if auth_config.mode == AuthMode::None {
+        warn!("AUTH_MODE=none: authentication is DISABLED (local development only)");
+    } else {
+        info!("Authentication enabled: {:?}", auth_config.mode);
+    }
+
     info!("Connecting to PostgreSQL…");
     let db = Db::connect(&database_url).await?;
     db.migrate().await?;
@@ -80,18 +75,12 @@ async fn main() -> Result<()> {
         db,
         orchestrator,
         hindsight,
+        auth: AuthState::new(auth_config),
         default_referee_model,
         default_worker_model,
     };
 
-    let mut app: Router = routes::router(state)
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
-        .layer(TraceLayer::new_for_http());
+    let mut app = build_app(state);
 
     if frontend_dir.exists() {
         let index = frontend_dir.join("index.html");

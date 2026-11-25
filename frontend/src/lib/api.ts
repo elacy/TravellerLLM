@@ -1,3 +1,12 @@
+export interface AuthUser {
+  username: string;
+  email?: string | null;
+  display_name?: string | null;
+  groups: string[];
+  auth_mode: "authentik_proxy" | "oidc" | "none";
+  logout_url?: string | null;
+}
+
 export interface ImperialDate {
   year: number;
   day: number;
@@ -185,17 +194,29 @@ export type TurnEvent =
   | { type: "done"; message_id: number; input_tokens: number; output_tokens: number; cache_read_tokens: number }
   | { type: "error"; message: string };
 
+export class AuthRequiredError extends Error {
+  loginUrl: string;
+  constructor(message: string, loginUrl: string) {
+    super(message);
+    this.loginUrl = loginUrl;
+  }
+}
+
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
   const data = await res.json();
+  if (res.status === 401) {
+    throw new AuthRequiredError(data.error || "Authentication required", data.login_url || "/api/auth/login");
+  }
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data as T;
 }
 
 export const api = {
+  authMe: () => req<{ user: AuthUser }>("/api/auth/me"),
   listCampaigns: () => req<{ campaigns: Campaign[] }>("/api/campaigns"),
   createCampaign: (name: string, systemName = "Regina", systemUwp = "A788899-C") =>
     req<{ campaign: Campaign }>("/api/campaigns", {

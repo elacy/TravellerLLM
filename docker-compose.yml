@@ -13,6 +13,17 @@ services:
       DATA_PACKS_DIR: /data/packs
     volumes:
       - ./packs:/data/packs:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.travellerllm.rule=Host(`traveller.i.lacy.ie`)"
+      - "traefik.http.routers.travellerllm.entrypoints=websecure"
+      - "traefik.http.routers.travellerllm.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.travellerllm.middlewares=authentik@file"
+      - "traefik.http.services.travellerllm.loadbalancer.server.port=3080"
+      - "homepage.group=Games"
+      - "homepage.name=TravellerLLM"
+      - "homepage.href=https://traveller.i.lacy.ie"
+      - "homepage.description=Mongoose Traveller 2e LLM Engine"
 
   # Optional local Postgres for development (`docker compose --profile local-db up -d`)
   postgres:

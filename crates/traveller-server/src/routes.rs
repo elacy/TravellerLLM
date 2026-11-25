@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -25,6 +25,7 @@ use traveller_rules::ship::{
 };
 use uuid::Uuid;
 
+use crate::auth::{auth_me, oidc_callback, oidc_login, oidc_logout, AuthUser};
 use crate::AppState;
 
 pub struct ApiError(anyhow::Error);
@@ -46,8 +47,16 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 }
 
 pub fn router(state: AppState) -> Router {
+    let auth_state = state.auth.clone();
+    let auth_routes = Router::new()
+        .route("/api/auth/login", get(oidc_login))
+        .route("/api/auth/callback", get(oidc_callback))
+        .route("/api/auth/logout", get(oidc_logout))
+        .with_state(auth_state);
+
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/auth/me", get(auth_me))
         .route("/api/campaigns", get(list_campaigns).post(create_campaign))
         .route("/api/campaigns/{id}/snapshot", get(get_campaign_snapshot))
         .route(
@@ -80,6 +89,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/campaigns/{id}/messages", get(list_messages))
         .route("/api/campaigns/{id}/chat", post(chat_sse))
         .with_state(state)
+        .merge(auth_routes)
 }
 
 async fn health() -> Json<Value> {
@@ -194,12 +204,18 @@ async fn list_characters(
 
 async fn create_character(
     State(st): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     Path(id): Path<Uuid>,
     Json(input): Json<NewCharacterInput>,
 ) -> Result<Json<Value>, ApiError> {
     let created = st.db.create_character(id, input).await?;
     st.db
-        .log_audit(id, "player_ui", "create_character", json!({"name": created.character.name}))
+        .log_audit(
+            id,
+            &user.username,
+            "create_character",
+            json!({"name": created.character.name}),
+        )
         .await?;
     Ok(Json(json!({ "character": created })))
 }
@@ -213,6 +229,7 @@ struct UpdateCharacterBody {
 
 async fn update_character(
     State(st): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     Path((id, char_id)): Path<(Uuid, Uuid)>,
     Json(mut body): Json<UpdateCharacterBody>,
 ) -> Result<Json<Value>, ApiError> {
@@ -228,7 +245,7 @@ async fn update_character(
     st.db
         .log_audit(
             id,
-            "player_ui",
+            &user.username,
             "edit_character",
             json!({"id": char_id, "name": body.character.name}),
         )
