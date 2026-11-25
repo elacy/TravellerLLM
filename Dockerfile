@@ -7,7 +7,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: Build Rust Server
-FROM rust:1.88-bookworm AS backend-builder
+FROM rust:1-bookworm AS backend-builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY crates/ ./crates/

@@ -50,6 +50,9 @@ pub struct AuthConfig {
     pub mode: AuthMode,
     pub allowed_users: HashSet<String>,
     pub allowed_groups: HashSet<String>,
+    /// Optional shared secret (`X-Auth-Proxy-Secret`) presented by Traefik to prevent clients
+    /// hitting the published container port directly from spoofing `X-authentik-*` headers.
+    pub proxy_secret: Option<String>,
     pub logout_url: String,
     pub login_url: String,
     pub oidc: Option<OidcConfig>,
@@ -112,10 +115,16 @@ impl AuthConfig {
             None
         };
 
+        let proxy_secret = std::env::var("AUTH_PROXY_SECRET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         Self {
             mode,
             allowed_users: parse_csv("AUTH_ALLOWED_USERS"),
             allowed_groups: parse_csv("AUTH_ALLOWED_GROUPS"),
+            proxy_secret,
             logout_url,
             login_url,
             oidc,
@@ -191,6 +200,12 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 fn extract_authentik_proxy_user(headers: &HeaderMap, cfg: &AuthConfig) -> Option<AuthUser> {
+    if let Some(expected) = &cfg.proxy_secret {
+        let presented = header_str(headers, "x-auth-proxy-secret")?;
+        if presented != *expected {
+            return None;
+        }
+    }
     let username = header_str(headers, "x-authentik-username")?;
     let email = header_str(headers, "x-authentik-email");
     let display_name = header_str(headers, "x-authentik-name");

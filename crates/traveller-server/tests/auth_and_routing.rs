@@ -33,6 +33,7 @@ async fn authentik_proxy_enforces_headers_group_allowlist_and_health_bypass() {
         mode: AuthMode::AuthentikProxy,
         allowed_users: HashSet::new(),
         allowed_groups,
+        proxy_secret: Some("nas-traefik-secret".into()),
         logout_url: "/outpost.goauthentik.io/sign_out".into(),
         login_url: "https://auth.i.lacy.ie".into(),
         oidc: None,
@@ -47,10 +48,31 @@ async fn authentik_proxy_enforces_headers_group_allowlist_and_health_bypass() {
         .unwrap();
     assert_eq!(health_resp.status(), StatusCode::OK);
 
-    // 2. Missing X-authentik-username returns 401 with Authentik login_url
+    // 2. Spoofed X-authentik-username WITHOUT valid X-Auth-Proxy-Secret returns 401
+    let spoofed_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header("X-authentik-username", "eva")
+                .header("X-authentik-groups", "traveller-players")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spoofed_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Missing X-authentik-username returns 401 with Authentik login_url
     let unauth_resp = app
         .clone()
-        .oneshot(Request::builder().uri("/api/auth/me").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .header("X-Auth-Proxy-Secret", "nas-traefik-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
@@ -58,12 +80,13 @@ async fn authentik_proxy_enforces_headers_group_allowlist_and_health_bypass() {
     let json_body: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(json_body["login_url"], "https://auth.i.lacy.ie");
 
-    // 3. Valid Authentik headers with wrong group returns 403 Forbidden
+    // 4. Valid Authentik headers with wrong group returns 403 Forbidden
     let forbidden_resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/auth/me")
+                .header("X-Auth-Proxy-Secret", "nas-traefik-secret")
                 .header("X-authentik-username", "guest")
                 .header("X-authentik-groups", "media-users|plex")
                 .body(Body::empty())
@@ -73,11 +96,12 @@ async fn authentik_proxy_enforces_headers_group_allowlist_and_health_bypass() {
         .unwrap();
     assert_eq!(forbidden_resp.status(), StatusCode::FORBIDDEN);
 
-    // 4. Valid Authentik headers with allowed group returns 200 and full AuthUser
+    // 5. Valid Authentik headers + proxy secret + allowed group returns 200 and full AuthUser
     let ok_resp = app
         .oneshot(
             Request::builder()
                 .uri("/api/auth/me")
+                .header("X-Auth-Proxy-Secret", "nas-traefik-secret")
                 .header("X-authentik-username", "eva")
                 .header("X-authentik-email", "eva@lacy.ie")
                 .header("X-authentik-name", "Eva")
@@ -106,6 +130,7 @@ async fn oidc_signed_session_cookie_authenticates_and_rejects_tampering() {
         mode: AuthMode::Oidc,
         allowed_users: HashSet::new(),
         allowed_groups: HashSet::new(),
+        proxy_secret: None,
         logout_url: "/api/auth/logout".into(),
         login_url: "/api/auth/login".into(),
         oidc: Some(OidcConfig {
