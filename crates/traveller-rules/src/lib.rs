@@ -10,4 +10,5 @@ pub mod finance;
 pub mod sensors;
 pub mod ship;
 pub mod trade;
+pub mod traffic;
 pub mod universe;

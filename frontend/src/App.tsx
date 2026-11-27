@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import {
+  BookOpen,
   Clock,
   Compass,
   CreditCard,
@@ -9,6 +10,7 @@ import {
   ShoppingBag,
   Sparkles,
   Swords,
+  Trash2,
   Users,
 } from "lucide-react";
 import {
@@ -27,8 +29,9 @@ import { ShipsPanel } from "./components/ShipsPanel";
 import { TradeShopPanel } from "./components/TradeShopPanel";
 import { CombatPanel } from "./components/CombatPanel";
 import { FinancesCrewPanel } from "./components/FinancesCrewPanel";
+import { ModulesPanel } from "./components/ModulesPanel";
 
-type Tab = "map" | "characters" | "ships" | "trade" | "combat" | "finances";
+type Tab = "map" | "characters" | "ships" | "trade" | "combat" | "finances" | "modules";
 
 interface LiveToolCard {
   id: string;
@@ -46,6 +49,7 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<CampaignSnapshot | null>(null);
   const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [tab, setTab] = useState<Tab>("characters");
+  const [charPanelMode, setCharPanelMode] = useState<"roster" | "lifepath">("roster");
 
   // Chat state
   const [input, setInput] = useState("");
@@ -71,6 +75,8 @@ export default function App() {
       setCampaigns(list);
       if (!activeId && list.length > 0) {
         setActiveId(list[0].id);
+      } else if (activeId && !list.some((c) => c.id === activeId)) {
+        setActiveId(list[0]?.id ?? null);
       }
     } catch (e) {
       if (e instanceof AuthRequiredError) {
@@ -97,6 +103,10 @@ export default function App() {
 
   useEffect(() => {
     if (activeId) refreshActive(activeId);
+    else {
+      setSnapshot(null);
+      setMessages([]);
+    }
   }, [activeId, refreshActive]);
 
   useEffect(() => {
@@ -110,15 +120,29 @@ export default function App() {
       const { campaign } = await api.createCampaign(newCampName.trim());
       await refreshCampaigns();
       setActiveId(campaign.id);
+      // Jump straight into Lifepath Character Creation so the new game gets its own unique Player Character!
+      setTab("characters");
+      setCharPanelMode("lifepath");
     } catch (e) {
       setErrorBanner((e as Error).message);
     }
   }
 
-  async function handleSend() {
-    if (!activeId || !input.trim() || streaming) return;
-    const text = input.trim();
-    setInput("");
+  async function handleDeleteActiveCampaign() {
+    if (!activeId || !snapshot) return;
+    if (!confirm(`Delete game "${snapshot.campaign.name}" permanently?`)) return;
+    try {
+      await api.deleteCampaign(activeId);
+      setActiveId(null);
+      await refreshCampaigns();
+    } catch (e) {
+      setErrorBanner((e as Error).message);
+    }
+  }
+
+  async function sendChatText(text: string) {
+    if (!activeId || !text.trim() || streaming) return;
+    const clean = text.trim();
     setStreaming(true);
     setStreamText("");
     setLiveTools([]);
@@ -130,7 +154,7 @@ export default function App() {
       {
         id: Date.now(),
         role: "user",
-        content: text,
+        content: clean,
         superseded: false,
         input_tokens: 0,
         output_tokens: 0,
@@ -140,7 +164,7 @@ export default function App() {
     ]);
 
     try {
-      await api.streamChat(activeId, text, (ev: TurnEvent) => {
+      await api.streamChat(activeId, clean, (ev: TurnEvent) => {
         if (ev.type === "status") setStatusChip(ev.message);
         else if (ev.type === "clear_draft") setStreamText("");
         else if (ev.type === "delta") setStreamText((prev) => prev + ev.text);
@@ -170,6 +194,13 @@ export default function App() {
     }
   }
 
+  async function handleSend() {
+    if (!input.trim()) return;
+    const text = input;
+    setInput("");
+    await sendChatText(text);
+  }
+
   async function handleAdvanceTime(opts: Record<string, unknown>) {
     if (!activeId) return;
     try {
@@ -185,7 +216,9 @@ export default function App() {
       <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6">
         <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-xl p-6 text-center space-y-4">
           <div className="text-xl font-bold text-cyan-400">TravellerLLM</div>
-          <p className="text-sm text-slate-400">Sign in via Authentik to access your starship bridge.</p>
+          <p className="text-sm text-slate-400">
+            Sign in via Authentik to access your starship bridge.
+          </p>
           <a
             href={authLoginUrl}
             className="inline-block bg-cyan-600 hover:bg-cyan-500 text-white font-semibold px-5 py-2 rounded-lg"
@@ -201,15 +234,18 @@ export default function App() {
     <div className="h-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden">
       {/* Top Imperial Command Bar */}
       <header className="h-12 shrink-0 border-b border-slate-800 bg-slate-900/90 px-3 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2.5 min-w-0">
+        <div className="flex items-center gap-2 min-w-0">
           <div className="flex items-center gap-1.5 font-bold tracking-tight text-cyan-400">
             <Sparkles className="w-4 h-4" />
             <span>TravellerLLM</span>
           </div>
           <select
-            className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs max-w-[200px]"
+            className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs max-w-[190px]"
             value={activeId ?? ""}
-            onChange={(e) => setActiveId(e.target.value)}
+            onChange={(e) => {
+              setActiveId(e.target.value);
+              setCharPanelMode("roster");
+            }}
           >
             {campaigns.map((c) => (
               <option key={c.id} value={c.id}>
@@ -217,10 +253,19 @@ export default function App() {
               </option>
             ))}
           </select>
+          {activeId && (
+            <button
+              onClick={handleDeleteActiveCampaign}
+              title="Delete current game"
+              className="p-1 text-slate-500 hover:text-red-400"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          )}
           <div className="hidden md:flex items-center gap-1">
             <input
-              className="bg-slate-950 border border-slate-800 rounded px-2 py-1 text-xs w-44"
-              placeholder="New campaign name…"
+              className="bg-slate-950 border border-slate-800 rounded px-2 py-1 text-xs w-40"
+              placeholder="New game name…"
               value={newCampName}
               onChange={(e) => setNewCampName(e.target.value)}
             />
@@ -228,7 +273,7 @@ export default function App() {
               onClick={handleCreateCampaign}
               className="bg-cyan-700 hover:bg-cyan-600 text-white rounded px-2 py-1 text-xs flex items-center gap-1"
             >
-              <Plus className="w-3.5 h-3.5" /> New
+              <Plus className="w-3.5 h-3.5" /> New Game
             </button>
           </div>
         </div>
@@ -241,6 +286,8 @@ export default function App() {
               <span>{formatImperialDate(snapshot.campaign.date)}</span>
               <span className="text-slate-500">|</span>
               <span className="text-cyan-300">{snapshot.campaign.current_system_name}</span>
+              <span className="text-slate-500">|</span>
+              <span className="text-emerald-300">{snapshot.system_ship_count ?? 0} ships</span>
             </div>
             <div className="flex items-center gap-1">
               <button
@@ -300,8 +347,9 @@ export default function App() {
               <div className="max-w-md text-center space-y-3 bg-slate-900 border border-slate-800 rounded-xl p-6">
                 <div className="text-lg font-bold text-cyan-400">Welcome to TravellerLLM</div>
                 <p className="text-xs text-slate-400">
-                  Mongoose Traveller 2e (Core 2022, CSC 2023, High Guard 2024, Companion 2024) engine with
-                  512 sectors of Charted Space, full equipment catalogs, Lifepath chargen, trade, and ship/personal combat.
+                  Run multiple independent Mongoose Traveller 2e campaigns — each with its own
+                  Player Character, starship, Hindsight memory bank, loaded adventure modules, and
+                  live in-system starship encounters.
                 </p>
                 <div className="flex gap-2">
                   <input
@@ -313,7 +361,7 @@ export default function App() {
                     onClick={handleCreateCampaign}
                     className="bg-cyan-600 hover:bg-cyan-500 text-white font-semibold px-4 py-1.5 rounded text-xs"
                   >
-                    Create Campaign
+                    Create Game
                   </button>
                 </div>
               </div>
@@ -324,11 +372,14 @@ export default function App() {
                 {messages.length === 0 && (
                   <div className="text-center text-slate-500 text-xs py-12 space-y-2">
                     <div className="text-slate-300 font-semibold text-sm">
-                      Bridge online at {snapshot?.campaign.current_system_name} [{snapshot?.campaign.current_system_uwp}]
+                      Bridge online at {snapshot?.campaign.current_system_name} [
+                      {snapshot?.campaign.current_system_uwp}] — {snapshot?.system_ship_count ?? 0}{" "}
+                      ship(s) on sensors
                     </div>
                     <div>
-                      Use the Command Deck on the right to generate your Lifepath character, plot Jump routes,
-                      trade cargo, or hire crew — or speak directly to your Referee below!
+                      Roll your unique Player Character in <strong>Crew → New Character</strong>,
+                      load an adventure module into Hindsight in <strong>Modules</strong>, or hail a
+                      vessel in <strong>Map</strong>!
                     </div>
                   </div>
                 )}
@@ -354,7 +405,6 @@ export default function App() {
                   </div>
                 ))}
 
-                {/* Live tool calls + streaming text */}
                 {liveTools.length > 0 && (
                   <div className="space-y-1.5 mr-6">
                     {liveTools.map((t) => (
@@ -364,7 +414,9 @@ export default function App() {
                       >
                         <div className="text-amber-300">⚙ {t.name}</div>
                         {t.result && (
-                          <div className="text-slate-400 truncate mt-0.5">{t.result.slice(0, 220)}</div>
+                          <div className="text-slate-400 truncate mt-0.5">
+                            {t.result.slice(0, 220)}
+                          </div>
                         )}
                       </div>
                     ))}
@@ -377,9 +429,7 @@ export default function App() {
                   </div>
                 )}
 
-                {statusChip && (
-                  <div className="text-xs text-cyan-400 animate-pulse">{statusChip}</div>
-                )}
+                {statusChip && <div className="text-xs text-cyan-400 animate-pulse">{statusChip}</div>}
                 <div ref={chatEndRef} />
               </div>
 
@@ -389,7 +439,7 @@ export default function App() {
                   <textarea
                     rows={2}
                     className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm resize-none focus:outline-none focus:border-cyan-500"
-                    placeholder="Declare an action, negotiate trade, hail a ship, or roll a task…"
+                    placeholder="Declare an action, hail an in-system ship, investigate module leads, or roll a task…"
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={(e) => {
@@ -425,8 +475,8 @@ export default function App() {
 
         {/* Right: Modular Traveller Command Deck */}
         {snapshot && activeId && (
-          <aside className="w-[460px] xl:w-[520px] shrink-0 flex flex-col bg-slate-950/90 min-h-0">
-            <nav className="grid grid-cols-6 border-b border-slate-800 bg-slate-900 text-[11px]">
+          <aside className="w-[480px] xl:w-[540px] shrink-0 flex flex-col bg-slate-950/90 min-h-0">
+            <nav className="grid grid-cols-7 border-b border-slate-800 bg-slate-900 text-[10px]">
               {(
                 [
                   ["map", "Map", Compass],
@@ -435,6 +485,7 @@ export default function App() {
                   ["trade", "Trade", ShoppingBag],
                   ["combat", "Combat", Swords],
                   ["finances", "Credits", CreditCard],
+                  ["modules", "Modules", BookOpen],
                 ] as const
               ).map(([id, label, Icon]) => (
                 <button
@@ -459,12 +510,15 @@ export default function App() {
                   snapshot={snapshot}
                   onRefresh={() => refreshActive(activeId)}
                   onError={setErrorBanner}
+                  onSendChat={sendChatText}
+                  onSwitchToCombat={() => setTab("combat")}
                 />
               )}
               {tab === "characters" && (
                 <CharactersPanel
                   campaignId={activeId}
                   snapshot={snapshot}
+                  initialMode={charPanelMode}
                   onRefresh={() => refreshActive(activeId)}
                   onError={setErrorBanner}
                 />
@@ -495,6 +549,14 @@ export default function App() {
               )}
               {tab === "finances" && (
                 <FinancesCrewPanel
+                  campaignId={activeId}
+                  snapshot={snapshot}
+                  onRefresh={() => refreshActive(activeId)}
+                  onError={setErrorBanner}
+                />
+              )}
+              {tab === "modules" && (
+                <ModulesPanel
                   campaignId={activeId}
                   snapshot={snapshot}
                   onRefresh={() => refreshActive(activeId)}

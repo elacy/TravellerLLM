@@ -291,6 +291,78 @@ export interface MessageRecord {
   created_at: string;
 }
 
+export interface ModuleKnowledgeFile {
+  filename: string;
+  title: string;
+  content: string;
+}
+
+export interface ModuleEventSpec {
+  title: string;
+  kind: string;
+  days_from_now: number;
+  hours_from_now?: number;
+}
+
+export interface ModuleRecord {
+  id: string;
+  slug: string;
+  name: string;
+  version: string;
+  description: string;
+  author: string;
+  starting_system_name?: string | null;
+  starting_system_uwp?: string | null;
+  referee_brief: string;
+  knowledge_files: ModuleKnowledgeFile[];
+  npcs: Array<Record<string, unknown>>;
+  ships: Array<Record<string, unknown>>;
+  events: ModuleEventSpec[];
+  tags: string[];
+  source: string;
+}
+
+export interface CampaignModuleRecord {
+  id: string;
+  campaign_id: string;
+  module_id: string;
+  module_slug: string;
+  module_name: string;
+  referee_brief: string;
+  knowledge_file_count: number;
+  hindsight_chunks_ingested: number;
+  npcs_spawned: number;
+  ships_spawned: number;
+  events_spawned: number;
+  loaded_at: string;
+}
+
+export interface SystemShipRecord {
+  id: string;
+  campaign_id: string;
+  system_name: string;
+  name: string;
+  ship_class: string;
+  role: string;
+  tonnage: number;
+  tl: number;
+  hull_max: number;
+  hull_current: number;
+  armor: number;
+  thrust: number;
+  jump_rating: number;
+  sensor_grade: string;
+  stealth_dm: number;
+  transponder_active: boolean;
+  disposition: string;
+  orbit_location: string;
+  captain_name: string;
+  faction: string;
+  cargo_hint: string;
+  comms_log: Array<Record<string, unknown>>;
+  status: string;
+}
+
 export interface CampaignSnapshot {
   campaign: Campaign;
   characters: CharacterRow[];
@@ -306,6 +378,9 @@ export interface CampaignSnapshot {
   active_personal_combat?: CombatRecord | null;
   active_space_combat?: CombatRecord | null;
   pending_events?: ScheduledEventRecord[];
+  loaded_modules?: CampaignModuleRecord[];
+  system_ships?: SystemShipRecord[];
+  system_ship_count?: number;
   pack_stats?: { sectors: number; items: number };
 }
 
@@ -344,7 +419,7 @@ export const api = {
   authMe: () => req<{ user: AuthUser }>("/api/auth/me"),
   listCampaigns: () => req<{ campaigns: Campaign[] }>("/api/campaigns"),
   createCampaign: (name: string, systemName = "Regina", systemUwp = "A788899-C") =>
-    req<{ campaign: Campaign }>("/api/campaigns", {
+    req<{ campaign: Campaign; in_system_ship_count?: number; traffic_summary?: string }>("/api/campaigns", {
       method: "POST",
       body: JSON.stringify({
         name,
@@ -353,6 +428,8 @@ export const api = {
         seed_starter_ship: true,
       }),
     }),
+  deleteCampaign: (id: string) =>
+    req<{ deleted: boolean }>(`/api/campaigns/${id}`, { method: "DELETE" }),
   getSnapshot: (id: string) => req<CampaignSnapshot>(`/api/campaigns/${id}/snapshot`),
   listMessages: (id: string) => req<{ messages: MessageRecord[] }>(`/api/campaigns/${id}/messages`),
 
@@ -366,6 +443,10 @@ export const api = {
     req<{ character: Character }>(`/api/campaigns/${id}/characters/${charId}`, {
       method: "PATCH",
       body: JSON.stringify({ character, equipment }),
+    }),
+  deleteCharacter: (id: string, charId: string) =>
+    req<{ deleted: boolean }>(`/api/campaigns/${id}/characters/${charId}`, {
+      method: "DELETE",
     }),
   spendXp: (id: string, charId: string, skill: string) =>
     req(`/api/campaigns/${id}/characters/${charId}/spend-xp`, {
@@ -393,11 +474,57 @@ export const api = {
     kind: "player" | "crew" | "npc",
     salary_cr: number,
     station?: string,
-    deposit_cash_account_id?: string
+    deposit_cash_account_id?: string,
+    replace_existing_player = false
   ) =>
     req<{ character: CharacterRow }>(`/api/campaigns/${id}/chargen/commit`, {
       method: "POST",
-      body: JSON.stringify({ session, kind, salary_cr, station, deposit_cash_account_id }),
+      body: JSON.stringify({
+        session,
+        kind,
+        salary_cr,
+        station,
+        deposit_cash_account_id,
+        replace_existing_player,
+      }),
+    }),
+
+  // Campaign Modules (Hindsight Knowledge Files + NPCs)
+  listModules: () => req<{ modules: ModuleRecord[] }>("/api/modules"),
+  createModule: (body: Record<string, unknown>) =>
+    req<{ module: ModuleRecord }>("/api/modules", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteModule: (moduleId: string) =>
+    req<{ deleted: boolean }>(`/api/modules/${moduleId}`, { method: "DELETE" }),
+  loadModule: (campaignId: string, moduleId: string, moveToStartingSystem = false) =>
+    req<{
+      loaded: boolean;
+      module_name: string;
+      hindsight_bank_id: string;
+      hindsight_chunks_ingested: number;
+      npcs_spawned: number;
+      events_spawned: number;
+    }>(`/api/campaigns/${campaignId}/modules/${moduleId}/load`, {
+      method: "POST",
+      body: JSON.stringify({ move_to_starting_system: moveToStartingSystem }),
+    }),
+
+  // In-System Starship Traffic
+  listTraffic: (id: string) =>
+    req<{ system: string; in_system_ship_count: number; ships: SystemShipRecord[] }>(
+      `/api/campaigns/${id}/traffic`
+    ),
+  scanTraffic: (id: string) =>
+    req<{ system: string; in_system_ship_count: number; summary: string; ships: SystemShipRecord[] }>(
+      `/api/campaigns/${id}/traffic/scan`,
+      { method: "POST" }
+    ),
+  interactVessel: (id: string, vesselId: string, body: Record<string, unknown>) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/traffic/${vesselId}/interact`, {
+      method: "POST",
+      body: JSON.stringify(body),
     }),
 
   // Ships

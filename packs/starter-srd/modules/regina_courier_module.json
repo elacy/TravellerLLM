@@ -1,0 +1,66 @@
+{
+  "slug": "regina-courier-starter",
+  "name": "Spinward Frontier: The Regina Courier",
+  "version": "1.0",
+  "author": "TravellerLLM Open Starter",
+  "description": "An original Spinward Marches starter adventure module set around Regina, Roup, and Efate with faction lore, secret Referee dossiers for Hindsight memory, 3 pre-built NPCs, and a timed patron deadline.",
+  "starting_system_name": "Regina",
+  "starting_system_uwp": "A788899-C",
+  "referee_brief": "Active Module: 'Spinward Frontier: The Regina Courier'. Lady Seraphina Vance at Regina Highport seeks a discreet Free Trader captain to deliver a sealed diplomatic data-core to Efate before Day 015-1105. Imperial Customs Inspector Halvor Krell suspects smuggling, while shadow-broker Jax Mercer knows a Vargr Corsair is watching the 100D jump limit. Use recall_memory for full dossier secrets!",
+  "tags": ["starter", "spinward-marches", "courier", "intrigue"],
+  "knowledge_files": [
+    {
+      "filename": "01_regina_highport_dossier.md",
+      "title": "Regina Highport & Local Factions",
+      "content": "# Regina Highport Dossier (1910 Spinward Marches, A788899-C)\n\nRegina Highport orbits the Subsector capital and handles heavy Imperial Navy, Scout Service, and megacorporate traffic. Dockside Berth 14-B is the quietest berthing bay for independent Free Traders looking to avoid megacorp auditors.\n\n## Key Factions\n- **House Vance Logistics**: A minor Regina mercantile house backing discreet courier runs to Efate and Boughene. Pays promptly in Imperial Credits (Cr40,000 flat fee + Cr15,000 speed bonus).\n- **Imperial Customs (Sector Patrol)**: Enforces Regina's strict Law Level 9. Any undeclared military weapons or unlicensed cybernetics found during inspection trigger immediate impoundment.\n- **The Silent Vector**: A covert Vargr/human corsair syndicate operating along the Regina–Roup–Efate jump corridor using stealth-coated fast couriers."
+    },
+    {
+      "filename": "02_referee_secrets_and_twists.md",
+      "title": "Referee Secrets: The Sealed Data-Core",
+      "content": "# Referee Secrets (Do NOT reveal upfront — let the player uncover in play)\n\n## What is actually inside Lady Seraphina's Data-Core\nThe sealed TL-13 diplomatic cylinder does NOT contain ordinary trade tariffs. It holds authenticated jump-drive telemetry proving that an unmarked stealth courier docked at Efate's naval depot three weeks ago carrying black-market Zhodani sensor-spoofing modules.\n\n## Complication at the 100D Jump Limit\nShortly after undocking from Regina Highport or upon arriving at Roup/Efate, a transponder-dark vessel connected to the Silent Vector attempts to shadow the player's ship. If detected via High Guard sensors, the player can hail them, bluff them, outrun them, or report their vector to the local System Defense Boat."
+    }
+  ],
+  "npcs": [
+    {
+      "kind": "npc",
+      "name": "Lady Seraphina Vance",
+      "species": "Human",
+      "age": 38,
+      "upp": { "str_val": 6, "dex_val": 7, "end_val": 7, "int_val": 10, "edu_val": 11, "soc_val": 11 },
+      "skills": { "Diplomat": 2, "Broker": 2, "Admin": 2, "Persuade": 2, "Deception": 1 },
+      "augments": [{ "kind": "wafer_jack", "tl": 12, "computer_rating": 2, "storage_bandwidth": 4, "loaded_expert": [{ "skill": "Advocate", "rating": 2, "active": true }] }],
+      "salary_cr": 0,
+      "notes": "Patron at Regina Highport Lounge. Hiring a reliable captain to deliver a sealed diplomatic data-core to Efate before Day 015-1105 for Cr40,000 (+Cr15,000 bonus if unopened and early)."
+    },
+    {
+      "kind": "npc",
+      "name": "Inspector Halvor Krell",
+      "species": "Human",
+      "age": 46,
+      "upp": { "str_val": 8, "dex_val": 7, "end_val": 8, "int_val": 9, "edu_val": 9, "soc_val": 8 },
+      "skills": { "Investigate": 3, "Admin": 2, "Electronics (sensors)": 2, "Gun Combat (Slug)": 1, "Streetwise": 1 },
+      "augments": [],
+      "salary_cr": 0,
+      "notes": "Imperial Customs Senior Inspector at Regina Highport (Law 9). Thorough, by-the-book, suspicious of sealed diplomatic pouches on independent Free Traders, but genuinely opposed to pirates."
+    },
+    {
+      "kind": "npc",
+      "name": "Jax Mercer",
+      "species": "Human",
+      "age": 33,
+      "upp": { "str_val": 7, "dex_val": 9, "end_val": 8, "int_val": 9, "edu_val": 7, "soc_val": 6 },
+      "skills": { "Streetwise": 3, "Broker": 2, "Deception": 2, "Stealth": 2, "Gun Combat (Slug)": 1 },
+      "augments": [{ "kind": "neural_jack", "tl": 13, "computer_rating": 2, "storage_bandwidth": 8, "loaded_expert": [{ "skill": "Electronics (computers)", "rating": 2, "active": true }] }],
+      "salary_cr": 0,
+      "notes": "Information broker in Regina Downport's Starlight Bar. Knows about Silent Vector corsair spotters watching Berth 14-B and will sell transponder codes or black-market gear for a price."
+    }
+  ],
+  "ships": [],
+  "events": [
+    {
+      "title": "Deadline: Deliver Lady Seraphina's Data-Core to Efate",
+      "kind": "patron_deadline",
+      "days_from_now": 14
+    }
+  ]
+}

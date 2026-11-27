@@ -22,6 +22,7 @@ use traveller_rules::ship::{
     compute_running_costs, roll_poor_maintenance, validate_ship, SensorGrade,
 };
 use traveller_rules::trade::{generate_world_market, roll_speculative_sale};
+use traveller_rules::traffic::generate_system_traffic;
 use traveller_rules::universe::{parse_uwp, plan_jump_route, RouteNode};
 use uuid::Uuid;
 
@@ -88,7 +89,7 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
         }),
         json!({
             "name": "explore_universe",
-            "description": "Search Charted Space systems (all 512 sectors), inspect world UWP/trade codes/starport/gas giants, plot a Jump-1..6 A* route, or execute a jump to a destination system (burning jump fuel and advancing 148 + 6D6 hours).",
+            "description": "Search Charted Space systems (all 512 sectors), inspect world UWP/trade codes/starport/gas giants, plot a Jump-1..6 A* route, or execute a jump to a destination system (burning jump fuel, advancing 148 + 6D6 hours, and automatically sweeping in-system starship traffic on arrival).",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -99,6 +100,22 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
                     "to_system": {"type": "string", "description": "Destination system name for 'route' or 'jump_to'."},
                     "jump_rating": {"type": "integer", "default": 1},
                     "ship_id": {"type": "string", "description": "Optional ship UUID for 'jump_to' fuel deduction."}
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "system_traffic",
+            "description": "Inspect or interact with starships currently in the campaign's star system: list all ships in-system, sweep/refresh system traffic, hail a vessel over comms, run a High Guard sensor scan against a specific vessel's emissions/stealth, engage a vessel in High Guard Space Combat, or update its disposition/status.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "scan_system", "hail", "sensor_scan", "engage", "update_status"]},
+                    "vessel_id": {"type": "string", "description": "UUID of the in-system vessel for hail/sensor_scan/engage/update_status."},
+                    "message": {"type": "string", "description": "Optional comms message when hailing a ship."},
+                    "disposition": {"type": "string", "enum": ["friendly", "neutral", "cautious", "hostile", "distress"]},
+                    "status": {"type": "string", "enum": ["in_system", "docked", "departed", "boarded", "destroyed"]},
+                    "range_band": {"type": "string", "enum": ["adjacent", "close", "short", "medium", "long", "very_long", "distant"], "default": "long"}
                 },
                 "required": ["action"]
             }
@@ -650,11 +667,33 @@ pub async fn execute_tool(
                     .await?;
                     let time_json: Value = serde_json::from_str(&time_res.output_json)?;
 
+                    // Automatically sweep & persist in-system starship traffic on arrival!
+                    let dest_uwp = parse_uwp(&dest.uwp)
+                        .unwrap_or_else(|_| parse_uwp("C555555-9").expect("valid fallback uwp"));
+                    let traffic_report = {
+                        let mut r = rng();
+                        generate_system_traffic(
+                            &mut r,
+                            &dest.name,
+                            &dest_uwp,
+                            &dest.bases,
+                            &dest.travel_zone,
+                        )
+                    };
+                    let stored_ships = db
+                        .replace_system_ships(campaign_id, &dest.name, &traffic_report.vessels)
+                        .await?;
+
                     Ok(ToolExecutionResult {
                         output_json: serde_json::to_string(&json!({
+                            "arrived_at": dest.name,
+                            "uwp": dest.uwp,
                             "arrived_system": dest,
                             "fuel_burned_tons": fuel_burned,
-                            "time_advance": time_json
+                            "time_advance": time_json,
+                            "in_system_ship_count": stored_ships.len(),
+                            "traffic_summary": traffic_report.summary,
+                            "in_system_ships": stored_ships
                         }))?,
                         state_changed: true,
                     })
@@ -1761,6 +1800,261 @@ pub async fn execute_tool(
                 ),
                 state_changed: true,
             })
+        }
+
+        "system_traffic" => {
+            let camp = db
+                .get_campaign(campaign_id)
+                .await?
+                .context("Campaign not found")?;
+            let action = input
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("list");
+
+            match action {
+                "list" => {
+                    let mut ships = db
+                        .list_system_ships(campaign_id, &camp.current_system_name)
+                        .await?;
+                    if ships.is_empty() {
+                        let sys_rec = db.get_system_by_name(&camp.current_system_name).await?;
+                        let uwp = parse_uwp(&camp.current_system_uwp)
+                            .unwrap_or_else(|_| parse_uwp("C555555-9").expect("valid uwp"));
+                        let (bases, zone) = sys_rec
+                            .map(|s| (s.bases, s.travel_zone))
+                            .unwrap_or_else(|| (vec![], "Green".to_string()));
+                        let report = {
+                            let mut r = rng();
+                            generate_system_traffic(
+                                &mut r,
+                                &camp.current_system_name,
+                                &uwp,
+                                &bases,
+                                &zone,
+                            )
+                        };
+                        ships = db
+                            .replace_system_ships(
+                                campaign_id,
+                                &camp.current_system_name,
+                                &report.vessels,
+                            )
+                            .await?;
+                    }
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({
+                            "system": camp.current_system_name,
+                            "in_system_ship_count": ships.len(),
+                            "ships": ships
+                        }))?,
+                        state_changed: false,
+                    })
+                }
+                "scan_system" => {
+                    let sys_rec = db.get_system_by_name(&camp.current_system_name).await?;
+                    let uwp = parse_uwp(&camp.current_system_uwp)
+                        .unwrap_or_else(|_| parse_uwp("C555555-9").expect("valid uwp"));
+                    let (bases, zone) = sys_rec
+                        .map(|s| (s.bases, s.travel_zone))
+                        .unwrap_or_else(|| (vec![], "Green".to_string()));
+                    let report = {
+                        let mut r = rng();
+                        generate_system_traffic(
+                            &mut r,
+                            &camp.current_system_name,
+                            &uwp,
+                            &bases,
+                            &zone,
+                        )
+                    };
+                    let ships = db
+                        .replace_system_ships(
+                            campaign_id,
+                            &camp.current_system_name,
+                            &report.vessels,
+                        )
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({
+                            "system": camp.current_system_name,
+                            "in_system_ship_count": ships.len(),
+                            "summary": report.summary,
+                            "ships": ships
+                        }))?,
+                        state_changed: true,
+                    })
+                }
+                "hail" => {
+                    let vessel_id = Uuid::parse_str(
+                        input
+                            .get("vessel_id")
+                            .and_then(|v| v.as_str())
+                            .context("vessel_id required")?,
+                    )?;
+                    let msg = input
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Opening hailing frequencies.");
+                    let disp = input.get("disposition").and_then(|v| v.as_str());
+                    let entry = json!({
+                        "date": camp.date.format(),
+                        "from": "player",
+                        "message": msg
+                    });
+                    let vessel = db
+                        .update_system_ship(campaign_id, vessel_id, disp, None, Some(entry))
+                        .await?
+                        .context("In-system vessel not found")?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({
+                            "hailed": vessel.name,
+                            "captain": vessel.captain_name,
+                            "faction": vessel.faction,
+                            "disposition": vessel.disposition,
+                            "orbit": vessel.orbit_location,
+                            "transponder_active": vessel.transponder_active,
+                            "cargo_hint": vessel.cargo_hint,
+                            "vessel": vessel
+                        }))?,
+                        state_changed: true,
+                    })
+                }
+                "sensor_scan" => {
+                    let vessel_id = Uuid::parse_str(
+                        input
+                            .get("vessel_id")
+                            .and_then(|v| v.as_str())
+                            .context("vessel_id required")?,
+                    )?;
+                    let vessel = db
+                        .get_system_ship(campaign_id, vessel_id)
+                        .await?
+                        .context("In-system vessel not found")?;
+                    let player_ships = db.list_ships(campaign_id).await?;
+                    let (obs_grade, obs_tl) = player_ships
+                        .first()
+                        .map(|s| (s.spec.sensor_grade, s.spec.tl))
+                        .unwrap_or((SensorGrade::Civilian, 12));
+                    let det = {
+                        let mut r = rng();
+                        resolve_sensor_detection(
+                            &mut r,
+                            &SensorDetectionInput {
+                                context: SensorContext::SpaceInitialDetection,
+                                operator_edu_dm: 1,
+                                operator_sensors_skill: 1,
+                                augment_or_software_dm: 0,
+                                observer_sensor_grade: obs_grade,
+                                observer_tl: obs_tl,
+                                observer_extended_array: false,
+                                observer_active_sensors: true,
+                                target_tl: vessel.tl.max(0) as u8,
+                                target_active_sensors: vessel.transponder_active,
+                                target_thrust_applied: if vessel.transponder_active { 1 } else { 0 },
+                                target_power_plant_active: true,
+                                target_transponder_or_comms: vessel.transponder_active,
+                                target_stealth_armor_dm: i32::from(vessel.stealth_dm),
+                                target_fired_weapons: false,
+                                target_crit_damage_severity: if vessel.hull_current < vessel.hull_max { 1 } else { 0 },
+                                situational_dm: 0,
+                                roll_mode: RollMode::Normal,
+                            },
+                        )
+                    };
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({
+                            "target": vessel.name,
+                            "ship_class": vessel.ship_class,
+                            "sensor_detection": det,
+                            "revealed": if det.roll.success {
+                                json!({
+                                    "tonnage": vessel.tonnage,
+                                    "hull": format!("{}/{}", vessel.hull_current, vessel.hull_max),
+                                    "armor": vessel.armor,
+                                    "thrust": vessel.thrust,
+                                    "stealth_dm": vessel.stealth_dm,
+                                    "cargo_hint": vessel.cargo_hint
+                                })
+                            } else {
+                                json!({"note": "Target signature too faint / stealthed for detailed scan."})
+                            }
+                        }))?,
+                        state_changed: false,
+                    })
+                }
+                "engage" => {
+                    let vessel_id = Uuid::parse_str(
+                        input
+                            .get("vessel_id")
+                            .and_then(|v| v.as_str())
+                            .context("vessel_id required")?,
+                    )?;
+                    let vessel = db
+                        .update_system_ship(campaign_id, vessel_id, Some("hostile"), None, None)
+                        .await?
+                        .context("In-system vessel not found")?;
+                    let player_ships = db.list_ships(campaign_id).await?;
+                    let ps = player_ships.first();
+                    let range = input
+                        .get("range_band")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("long");
+                    let start_body = json!({
+                        "action": "start",
+                        "range_band": range,
+                        "ships": [
+                            {
+                                "ship_id": ps.map(|s| s.id.to_string()),
+                                "name": ps.map(|s| s.name.as_str()).unwrap_or("Player Ship"),
+                                "side": "party",
+                                "tonnage": ps.map(|s| s.spec.tonnage).unwrap_or(200),
+                                "tl": ps.map(|s| s.spec.tl).unwrap_or(12),
+                                "hull_max": ps.map(|s| s.spec.hull_points_max).unwrap_or(80),
+                                "hull_current": ps.map(|s| s.hull_current).unwrap_or(80),
+                                "armor": ps.map(|s| s.spec.armor_rating).unwrap_or(4),
+                                "thrust_max": ps.map(|s| s.spec.thrust).unwrap_or(2)
+                            },
+                            {
+                                "ship_id": vessel.id.to_string(),
+                                "name": vessel.name,
+                                "side": "hostile",
+                                "tonnage": vessel.tonnage,
+                                "tl": vessel.tl,
+                                "hull_max": vessel.hull_max,
+                                "hull_current": vessel.hull_current,
+                                "armor": vessel.armor,
+                                "thrust_max": vessel.thrust
+                            }
+                        ]
+                    });
+                    Box::pin(execute_tool(db, hindsight, campaign_id, "space_combat", &start_body))
+                        .await
+                }
+                "update_status" => {
+                    let vessel_id = Uuid::parse_str(
+                        input
+                            .get("vessel_id")
+                            .and_then(|v| v.as_str())
+                            .context("vessel_id required")?,
+                    )?;
+                    let vessel = db
+                        .update_system_ship(
+                            campaign_id,
+                            vessel_id,
+                            input.get("disposition").and_then(|v| v.as_str()),
+                            input.get("status").and_then(|v| v.as_str()),
+                            None,
+                        )
+                        .await?
+                        .context("In-system vessel not found")?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({ "vessel": vessel }))?,
+                        state_changed: true,
+                    })
+                }
+                other => anyhow::bail!("Unknown system_traffic action '{other}'"),
+            }
         }
 
         "recall_memory" => {

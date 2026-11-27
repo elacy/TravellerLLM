@@ -241,3 +241,130 @@ fn default_species() -> String {
 fn default_age() -> u16 {
     26
 }
+
+// ── Campaign Modules (Knowledge Files for Hindsight + NPCs/Ships/Events) ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleKnowledgeFile {
+    pub filename: String,
+    #[serde(default)]
+    pub title: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleEventSpec {
+    pub title: String,
+    #[serde(default = "default_event_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub days_from_now: i64,
+    #[serde(default)]
+    pub hours_from_now: i64,
+}
+
+fn default_event_kind() -> String {
+    "story".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleRecord {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub author: String,
+    pub starting_system_name: Option<String>,
+    pub starting_system_uwp: Option<String>,
+    pub referee_brief: String,
+    pub knowledge_files: Vec<ModuleKnowledgeFile>,
+    pub npcs: Vec<NewCharacterInput>,
+    pub ships: Vec<Value>,
+    pub events: Vec<ModuleEventSpec>,
+    pub tags: Vec<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertModuleInput {
+    pub slug: String,
+    pub name: String,
+    #[serde(default = "default_mod_ver")]
+    pub version: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub starting_system_name: Option<String>,
+    #[serde(default)]
+    pub starting_system_uwp: Option<String>,
+    #[serde(default)]
+    pub referee_brief: String,
+    #[serde(default)]
+    pub knowledge_files: Vec<ModuleKnowledgeFile>,
+    #[serde(default)]
+    pub npcs: Vec<NewCharacterInput>,
+    #[serde(default)]
+    pub ships: Vec<Value>,
+    #[serde(default)]
+    pub events: Vec<ModuleEventSpec>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default = "default_mod_source")]
+    pub source: String,
+}
+
+fn default_mod_ver() -> String {
+    "1.0".to_string()
+}
+
+fn default_mod_source() -> String {
+    "custom".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CampaignModuleRecord {
+    pub id: Uuid,
+    pub campaign_id: Uuid,
+    pub module_id: Uuid,
+    pub module_slug: String,
+    pub module_name: String,
+    pub referee_brief: String,
+    pub knowledge_file_count: usize,
+    pub hindsight_chunks_ingested: i32,
+    pub npcs_spawned: i32,
+    pub ships_spawned: i32,
+    pub events_spawned: i32,
+    pub loaded_at: DateTime<Utc>,
+}
+
+// ── In-System Starship Traffic ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemShipRecord {
+    pub id: Uuid,
+    pub campaign_id: Uuid,
+    pub system_name: String,
+    pub name: String,
+    pub ship_class: String,
+    pub role: String,
+    pub tonnage: i32,
+    pub tl: i16,
+    pub hull_max: i32,
+    pub hull_current: i32,
+    pub armor: i32,
+    pub thrust: i16,
+    pub jump_rating: i16,
+    pub sensor_grade: String,
+    pub stealth_dm: i16,
+    pub transponder_active: bool,
+    pub disposition: String,
+    pub orbit_location: String,
+    pub captain_name: String,
+    pub faction: String,
+    pub cargo_hint: String,
+    pub comms_log: Vec<Value>,
+    pub status: String,
+}

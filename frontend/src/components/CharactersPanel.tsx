@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Cpu, Dice5, Edit3, Plus, Save, Sparkles, Trash2, UserPlus, X } from "lucide-react";
 import {
   api,
@@ -13,6 +13,7 @@ import {
 interface Props {
   campaignId: string;
   snapshot: CampaignSnapshot;
+  initialMode?: "roster" | "lifepath";
   onRefresh: () => Promise<void>;
   onError: (msg: string) => void;
 }
@@ -32,18 +33,39 @@ const CAREERS = [
   "scout",
 ];
 
-export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Props) {
-  const [mode, setMode] = useState<"roster" | "lifepath">("roster");
+export function CharactersPanel({
+  campaignId,
+  snapshot,
+  initialMode = "roster",
+  onRefresh,
+  onError,
+}: Props) {
+  const existingPlayer = snapshot.characters.find((r) => r.character.kind === "player");
+  const [mode, setMode] = useState<"roster" | "lifepath">(initialMode);
 
-  // Quick add
+  useEffect(() => {
+    setMode(initialMode);
+  }, [initialMode, campaignId]);
+
+  // Quick add (defaults to Crew/NPC once Player Character exists — strictly 1 Player per game)
   const [newName, setNewName] = useState("");
-  const [newKind, setNewKind] = useState<"player" | "crew" | "npc">("player");
+  const [newKind, setNewKind] = useState<"player" | "crew" | "npc">(
+    existingPlayer ? "crew" : "player"
+  );
+
+  useEffect(() => {
+    if (existingPlayer && newKind === "player") {
+      setNewKind("crew");
+    }
+  }, [existingPlayer, newKind]);
 
   // Inline sheet editor state
   const [editingId, setEditingId] = useState<string | null>(null);
   const [newSkillName, setNewSkillName] = useState("");
   const [newSkillLevel, setNewSkillLevel] = useState(1);
-  const [newAugKind, setNewAugKind] = useState<"neural_jack" | "wafer_jack" | "neural_link" | "skill_augmentation">("neural_jack");
+  const [newAugKind, setNewAugKind] = useState<
+    "neural_jack" | "wafer_jack" | "neural_link" | "skill_augmentation"
+  >("neural_jack");
   const [newAugSkill, setNewAugSkill] = useState("Pilot (Spacecraft)");
   const [newAugRating, setNewAugRating] = useState(2);
 
@@ -58,12 +80,13 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
   const [lpSpecialist, setLpSpecialist] = useState(true);
   const [lpCashRolls, setLpCashRolls] = useState(2);
   const [lpCommitKind, setLpCommitKind] = useState<"player" | "crew" | "npc">("player");
+  const [replaceExistingPlayer, setReplaceExistingPlayer] = useState(false);
 
   async function handleQuickCreate() {
     if (!newName.trim()) return;
     try {
       await api.createCharacter(campaignId, {
-        kind: newKind,
+        kind: existingPlayer && newKind === "player" ? "crew" : newKind,
         name: newName.trim(),
         species: "Human",
         age: 30,
@@ -90,6 +113,17 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
   async function saveRow(row: CharacterRow, updatedChar: CharacterRow["character"]) {
     try {
       await api.updateCharacter(campaignId, updatedChar.id, updatedChar, row.equipment);
+      await onRefresh();
+    } catch (e) {
+      onError((e as Error).message);
+    }
+  }
+
+  async function handleDeleteChar(charId: string, name: string) {
+    if (!confirm(`Remove ${name} from this campaign?`)) return;
+    try {
+      await api.deleteCharacter(campaignId, charId);
+      if (editingId === charId) setEditingId(null);
       await onRefresh();
     } catch (e) {
       onError((e as Error).message);
@@ -180,7 +214,9 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
       });
       const r = res.result as Record<string, unknown>;
       setRollResult(
-        `${row.character.name} (${skill}): rolled ${r.total} vs ${r.target} (Effect ${r.effect}) — ${r.success ? "SUCCESS" : "FAILURE"} (+1 XP)`
+        `${row.character.name} (${skill}): rolled ${r.total} vs ${r.target} (Effect ${r.effect}) — ${
+          r.success ? "SUCCESS" : "FAILURE"
+        } (+1 XP)`
       );
       await onRefresh();
     } catch (e) {
@@ -191,7 +227,10 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
   // Lifepath Handlers
   async function startLp() {
     try {
-      const { session } = await api.chargenStart(lpName.trim() || "Traveller", lpSpecies.trim() || "Human");
+      const { session } = await api.chargenStart(
+        lpName.trim() || "Traveller",
+        lpSpecies.trim() || "Human"
+      );
       setLpSession(session);
     } catch (e) {
       onError((e as Error).message);
@@ -228,15 +267,23 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
         lpCommitKind,
         lpCommitKind === "crew" ? 4000 : 0,
         lpCommitKind === "player" ? "Captain" : "Crew",
-        personalAcc?.id
+        personalAcc?.id,
+        lpCommitKind === "player" && Boolean(existingPlayer) ? replaceExistingPlayer : false
       );
       setLpSession(null);
+      setReplaceExistingPlayer(false);
       setMode("roster");
       await onRefresh();
     } catch (e) {
       onError((e as Error).message);
     }
   }
+
+  // Sort strictly so the single Player Character is always rendered first
+  const sortedChars = [...snapshot.characters].sort((a, b) => {
+    const rank = (k: string) => (k === "player" ? 0 : k === "crew" ? 1 : 2);
+    return rank(a.character.kind) - rank(b.character.kind);
+  });
 
   return (
     <div className="space-y-3 text-xs">
@@ -259,9 +306,26 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
               : "bg-slate-900 border-slate-800 text-slate-400"
           }`}
         >
-          <Sparkles className="w-3.5 h-3.5" /> Lifepath Chargen
+          <Sparkles className="w-3.5 h-3.5" /> New Character (Lifepath)
         </button>
       </div>
+
+      {!existingPlayer && mode === "roster" && (
+        <div className="bg-amber-950/40 border border-amber-700/80 rounded p-2.5 flex items-center justify-between gap-2">
+          <div>
+            <div className="font-semibold text-amber-200">No Player Character in This Game Yet</div>
+            <div className="text-[10px] text-amber-300/80">
+              Each game has strictly 1 Player Character. Roll yours with MgT2e Lifepath chargen!
+            </div>
+          </div>
+          <button
+            onClick={() => setMode("lifepath")}
+            className="bg-amber-600 hover:bg-amber-500 text-slate-950 font-semibold rounded px-2.5 py-1.5 shrink-0 flex items-center gap-1"
+          >
+            <Dice5 className="w-3.5 h-3.5" /> Roll PC
+          </button>
+        </div>
+      )}
 
       {rollResult && (
         <div className="p-2 rounded bg-cyan-950/70 border border-cyan-700 text-cyan-100 flex items-center justify-between">
@@ -412,17 +476,30 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
                       value={lpCommitKind}
                       onChange={(e) => setLpCommitKind(e.target.value as "player" | "crew" | "npc")}
                     >
-                      <option value="player">Add as Player</option>
-                      <option value="crew">Add as Hired Crew</option>
-                      <option value="npc">Add as NPC</option>
+                      <option value="player">
+                        {existingPlayer ? "Player Character (Replace Existing)" : "Player Character"}
+                      </option>
+                      <option value="crew">Hired Crew</option>
+                      <option value="npc">NPC</option>
                     </select>
                     <button
+                      disabled={lpCommitKind === "player" && Boolean(existingPlayer) && !replaceExistingPlayer}
                       onClick={commitLp}
-                      className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded py-1 flex items-center justify-center gap-1"
+                      className="flex-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white font-semibold rounded py-1 flex items-center justify-center gap-1"
                     >
-                      <Save className="w-3.5 h-3.5" /> Save to Campaign & Deposit Cash
+                      <Save className="w-3.5 h-3.5" /> Save to Game & Deposit Cash
                     </button>
                   </div>
+                  {lpCommitKind === "player" && existingPlayer && (
+                    <label className="flex items-center gap-1.5 text-[11px] text-amber-300">
+                      <input
+                        type="checkbox"
+                        checked={replaceExistingPlayer}
+                        onChange={(e) => setReplaceExistingPlayer(e.target.checked)}
+                      />
+                      Confirm replacing current Player Character ({existingPlayer.character.name}) — 1 Player max
+                    </label>
+                  )}
                 </div>
               )}
 
@@ -448,11 +525,11 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
         </div>
       ) : (
         <>
-          {/* Quick Character Creator */}
+          {/* Quick Character Creator (strictly enforces 1 Player Character) */}
           <div className="flex gap-1.5">
             <input
               className="flex-1 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs"
-              placeholder="Quick add character name…"
+              placeholder={existingPlayer ? "Quick add Crew or NPC…" : "Quick add Player / Crew / NPC…"}
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
             />
@@ -461,7 +538,7 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
               value={newKind}
               onChange={(e) => setNewKind(e.target.value as "player" | "crew" | "npc")}
             >
-              <option value="player">Player</option>
+              {!existingPlayer && <option value="player">Player (1 max)</option>}
               <option value="crew">Crew</option>
               <option value="npc">NPC</option>
             </select>
@@ -473,16 +550,32 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
             </button>
           </div>
 
-          {snapshot.characters.map((row) => {
+          {sortedChars.map((row) => {
             const c = row.character;
+            const isPlayer = c.kind === "player";
             const isEditing = editingId === c.id;
             return (
-              <div key={c.id} className="bg-slate-900 border border-slate-800 rounded p-2.5 space-y-2">
+              <div
+                key={c.id}
+                className={`rounded p-2.5 space-y-2 border ${
+                  isPlayer
+                    ? "bg-cyan-950/25 border-cyan-700/80"
+                    : "bg-slate-900 border-slate-800"
+                }`}
+              >
                 <div className="flex items-center justify-between">
                   <div>
                     <span className="font-bold text-slate-100 text-sm">{c.name}</span>{" "}
-                    <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300">
-                      {c.kind}
+                    <span
+                      className={`text-[10px] uppercase px-1.5 py-0.5 rounded font-semibold ${
+                        isPlayer
+                          ? "bg-cyan-800 text-cyan-100"
+                          : c.kind === "crew"
+                          ? "bg-emerald-900/70 text-emerald-200"
+                          : "bg-slate-800 text-slate-300"
+                      }`}
+                    >
+                      {isPlayer ? "PLAYER PC" : c.kind}
                     </span>
                     {c.assigned_station && (
                       <span className="ml-1 text-[10px] text-amber-300">[{c.assigned_station}]</span>
@@ -492,16 +585,27 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
                       {c.salary_cr > 0 && ` · Salary: ${formatCr(c.salary_cr)}/4wk`}
                     </div>
                   </div>
-                  <button
-                    onClick={() => setEditingId(isEditing ? null : c.id)}
-                    className={`px-2 py-1 rounded text-[11px] flex items-center gap-1 border ${
-                      isEditing
-                        ? "bg-amber-950 border-amber-600 text-amber-200"
-                        : "bg-slate-800 border-slate-700 text-slate-300 hover:text-white"
-                    }`}
-                  >
-                    <Edit3 className="w-3 h-3" /> {isEditing ? "Done" : "Edit"}
-                  </button>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => setEditingId(isEditing ? null : c.id)}
+                      className={`px-2 py-1 rounded text-[11px] flex items-center gap-1 border ${
+                        isEditing
+                          ? "bg-amber-950 border-amber-600 text-amber-200"
+                          : "bg-slate-800 border-slate-700 text-slate-300 hover:text-white"
+                      }`}
+                    >
+                      <Edit3 className="w-3 h-3" /> {isEditing ? "Done" : "Edit"}
+                    </button>
+                    {isEditing && (
+                      <button
+                        onClick={() => handleDeleteChar(c.id, c.name)}
+                        title="Delete character"
+                        className="p-1 rounded bg-red-950/70 border border-red-800 text-red-300 hover:bg-red-900"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 {/* UPP Row */}
@@ -693,6 +797,12 @@ export function CharactersPanel({ campaignId, snapshot, onRefresh, onError }: Pr
                     </div>
                   )}
                 </div>
+
+                {c.notes && (
+                  <div className="text-[11px] text-slate-400 border-t border-slate-800/80 pt-1">
+                    {c.notes}
+                  </div>
+                )}
 
                 {/* Equipment Inventory */}
                 {row.equipment.length > 0 && (

@@ -198,6 +198,11 @@ impl Db {
         campaign_id: Uuid,
         input: NewCharacterInput,
     ) -> Result<CharacterRow> {
+        if input.kind == CharacterKind::Player && self.has_player_character(campaign_id, None).await? {
+            anyhow::bail!(
+                "This campaign already has a Player Character. Each game supports strictly one Player Character (edit or replace the existing Player Character, or add Crew/NPCs instead)."
+            );
+        }
         let id = Uuid::new_v4();
         let kind_str = match input.kind {
             CharacterKind::Player => "player",
@@ -234,7 +239,55 @@ impl Db {
         Self::map_character(row)
     }
 
+    pub async fn has_player_character(
+        &self,
+        campaign_id: Uuid,
+        exclude_char_id: Option<Uuid>,
+    ) -> Result<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM characters
+             WHERE campaign_id = $1 AND kind = 'player' AND ($2::uuid IS NULL OR id <> $2)",
+        )
+        .bind(campaign_id)
+        .bind(exclude_char_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count > 0)
+    }
+
+    pub async fn delete_player_characters(&self, campaign_id: Uuid) -> Result<()> {
+        sqlx::query("DELETE FROM characters WHERE campaign_id = $1 AND kind = 'player'")
+            .bind(campaign_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_character(&self, campaign_id: Uuid, char_id: Uuid) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM characters WHERE campaign_id = $1 AND id = $2")
+            .bind(campaign_id)
+            .bind(char_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn delete_campaign(&self, campaign_id: Uuid) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM campaigns WHERE id = $1")
+            .bind(campaign_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn save_character(&self, c: &Character, equipment: &[Value]) -> Result<()> {
+        if c.kind == CharacterKind::Player
+            && self.has_player_character(c.campaign_id, Some(c.id)).await?
+        {
+            anyhow::bail!(
+                "Cannot change character to Player: this campaign already has a Player Character."
+            );
+        }
         let kind_str = match c.kind {
             CharacterKind::Player => "player",
             CharacterKind::Crew => "crew",
@@ -958,6 +1011,53 @@ impl Db {
                 out.push_str(&format!("- [{}] ({}) {}\n", ev.due_label, ev.kind, ev.title));
             }
         }
+
+        let loaded_mods = self.list_campaign_modules(campaign_id).await?;
+        if !loaded_mods.is_empty() {
+            out.push_str("\n## Loaded Campaign Modules (Hindsight Lore Active)\n");
+            for m in &loaded_mods {
+                out.push_str(&format!(
+                    "- {} [{}] ({} lore chunks in Hindsight): {}\n",
+                    m.module_name, m.module_slug, m.hindsight_chunks_ingested, m.referee_brief
+                ));
+            }
+        }
+
+        let traffic = self
+            .list_system_ships(campaign_id, &campaign.current_system_name)
+            .await?;
+        out.push_str(&format!(
+            "\n## Ships Currently In System ({} vessel(s) in {})\n",
+            traffic.len(),
+            campaign.current_system_name
+        ));
+        if traffic.is_empty() {
+            out.push_str("- No ships currently detected (call `system_traffic` with `scan_system` to sweep).\n");
+        } else {
+            for v in &traffic {
+                out.push_str(&format!(
+                    "- {} ({}, {}t, TL{}, Hull {}/{}, Armor {}, M-{}, Stealth DM {}, id: {}): Orbit: {} | Disposition: {} | Transponder: {} | Captain: {} ({}) | Status: {} | Hint: {}\n",
+                    v.name,
+                    v.ship_class,
+                    v.tonnage,
+                    v.tl,
+                    v.hull_current,
+                    v.hull_max,
+                    v.armor,
+                    v.thrust,
+                    v.stealth_dm,
+                    v.id,
+                    v.orbit_location,
+                    v.disposition,
+                    if v.transponder_active { "ON" } else { "DARK" },
+                    v.captain_name,
+                    v.faction,
+                    v.status,
+                    v.cargo_hint
+                ));
+            }
+        }
+
         out.push_str("</traveller_state>");
         Ok(out)
     }
@@ -1375,5 +1475,350 @@ impl Db {
                 })
             })
             .collect()
+    }
+
+    // ── Campaign Modules (Knowledge Files + NPCs/Ships/Events) ─────────────
+
+    pub async fn list_modules(&self) -> Result<Vec<ModuleRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, slug, name, version, description, author, starting_system_name,
+                    starting_system_uwp, referee_brief, knowledge_files, npcs, ships, events, tags, source
+             FROM modules ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Self::map_module).collect()
+    }
+
+    pub async fn get_module(&self, module_id: Uuid) -> Result<Option<ModuleRecord>> {
+        let row = sqlx::query(
+            "SELECT id, slug, name, version, description, author, starting_system_name,
+                    starting_system_uwp, referee_brief, knowledge_files, npcs, ships, events, tags, source
+             FROM modules WHERE id = $1",
+        )
+        .bind(module_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Self::map_module).transpose()
+    }
+
+    pub async fn upsert_module(&self, input: UpsertModuleInput) -> Result<ModuleRecord> {
+        let id = Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("module:{}", input.slug).as_bytes());
+        let row = sqlx::query(
+            "INSERT INTO modules
+                (id, slug, name, version, description, author, starting_system_name,
+                 starting_system_uwp, referee_brief, knowledge_files, npcs, ships, events, tags, source)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+             ON CONFLICT (slug) DO UPDATE SET
+                name = EXCLUDED.name,
+                version = EXCLUDED.version,
+                description = EXCLUDED.description,
+                author = EXCLUDED.author,
+                starting_system_name = EXCLUDED.starting_system_name,
+                starting_system_uwp = EXCLUDED.starting_system_uwp,
+                referee_brief = EXCLUDED.referee_brief,
+                knowledge_files = EXCLUDED.knowledge_files,
+                npcs = EXCLUDED.npcs,
+                ships = EXCLUDED.ships,
+                events = EXCLUDED.events,
+                tags = EXCLUDED.tags,
+                source = EXCLUDED.source,
+                updated_at = NOW()
+             RETURNING id, slug, name, version, description, author, starting_system_name,
+                       starting_system_uwp, referee_brief, knowledge_files, npcs, ships, events, tags, source",
+        )
+        .bind(id)
+        .bind(&input.slug)
+        .bind(&input.name)
+        .bind(&input.version)
+        .bind(&input.description)
+        .bind(&input.author)
+        .bind(&input.starting_system_name)
+        .bind(&input.starting_system_uwp)
+        .bind(&input.referee_brief)
+        .bind(serde_json::to_value(&input.knowledge_files)?)
+        .bind(serde_json::to_value(&input.npcs)?)
+        .bind(serde_json::to_value(&input.ships)?)
+        .bind(serde_json::to_value(&input.events)?)
+        .bind(&input.tags)
+        .bind(&input.source)
+        .fetch_one(&self.pool)
+        .await?;
+        Self::map_module(row)
+    }
+
+    pub async fn delete_module(&self, module_id: Uuid) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM modules WHERE id = $1")
+            .bind(module_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    fn map_module(r: sqlx::postgres::PgRow) -> Result<ModuleRecord> {
+        Ok(ModuleRecord {
+            id: r.try_get("id")?,
+            slug: r.try_get("slug")?,
+            name: r.try_get("name")?,
+            version: r.try_get("version")?,
+            description: r.try_get("description")?,
+            author: r.try_get("author")?,
+            starting_system_name: r.try_get("starting_system_name")?,
+            starting_system_uwp: r.try_get("starting_system_uwp")?,
+            referee_brief: r.try_get("referee_brief")?,
+            knowledge_files: serde_json::from_value(r.try_get("knowledge_files")?)?,
+            npcs: serde_json::from_value(r.try_get("npcs")?)?,
+            ships: serde_json::from_value(r.try_get("ships")?)?,
+            events: serde_json::from_value(r.try_get("events")?)?,
+            tags: r.try_get("tags")?,
+            source: r.try_get("source")?,
+        })
+    }
+
+    pub async fn list_campaign_modules(&self, campaign_id: Uuid) -> Result<Vec<CampaignModuleRecord>> {
+        let rows = sqlx::query(
+            "SELECT cm.id, cm.campaign_id, cm.module_id, m.slug AS module_slug, m.name AS module_name,
+                    m.referee_brief, jsonb_array_length(m.knowledge_files) AS kf_count,
+                    cm.hindsight_chunks_ingested, cm.npcs_spawned, cm.ships_spawned, cm.events_spawned, cm.loaded_at
+             FROM campaign_modules cm
+             JOIN modules m ON m.id = cm.module_id
+             WHERE cm.campaign_id = $1
+             ORDER BY cm.loaded_at ASC",
+        )
+        .bind(campaign_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(CampaignModuleRecord {
+                    id: r.try_get("id")?,
+                    campaign_id: r.try_get("campaign_id")?,
+                    module_id: r.try_get("module_id")?,
+                    module_slug: r.try_get("module_slug")?,
+                    module_name: r.try_get("module_name")?,
+                    referee_brief: r.try_get("referee_brief")?,
+                    knowledge_file_count: r.try_get::<i32, _>("kf_count")? as usize,
+                    hindsight_chunks_ingested: r.try_get("hindsight_chunks_ingested")?,
+                    npcs_spawned: r.try_get("npcs_spawned")?,
+                    ships_spawned: r.try_get("ships_spawned")?,
+                    events_spawned: r.try_get("events_spawned")?,
+                    loaded_at: r.try_get("loaded_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn record_campaign_module_load(
+        &self,
+        campaign_id: Uuid,
+        module_id: Uuid,
+        hindsight_chunks_ingested: i32,
+        npcs_spawned: i32,
+        ships_spawned: i32,
+        events_spawned: i32,
+    ) -> Result<()> {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO campaign_modules
+                (id, campaign_id, module_id, hindsight_chunks_ingested, npcs_spawned, ships_spawned, events_spawned)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT (campaign_id, module_id) DO UPDATE SET
+                hindsight_chunks_ingested = EXCLUDED.hindsight_chunks_ingested,
+                loaded_at = NOW()",
+        )
+        .bind(id)
+        .bind(campaign_id)
+        .bind(module_id)
+        .bind(hindsight_chunks_ingested)
+        .bind(npcs_spawned)
+        .bind(ships_spawned)
+        .bind(events_spawned)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ── In-System Starship Traffic ─────────────────────────────────────────
+
+    pub async fn replace_system_ships(
+        &self,
+        campaign_id: Uuid,
+        system_name: &str,
+        vessels: &[traveller_rules::traffic::SystemVessel],
+    ) -> Result<Vec<SystemShipRecord>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM system_ships WHERE campaign_id = $1 AND LOWER(system_name) = LOWER($2)")
+            .bind(campaign_id)
+            .bind(system_name)
+            .execute(&mut *tx)
+            .await?;
+
+        let mut out = Vec::with_capacity(vessels.len());
+        for v in vessels {
+            sqlx::query(
+                "INSERT INTO system_ships
+                    (id, campaign_id, system_name, name, ship_class, role, tonnage, tl,
+                     hull_max, hull_current, armor, thrust, jump_rating, sensor_grade,
+                     stealth_dm, transponder_active, disposition, orbit_location,
+                     captain_name, faction, cargo_hint)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)",
+            )
+            .bind(v.id)
+            .bind(campaign_id)
+            .bind(system_name)
+            .bind(&v.name)
+            .bind(&v.ship_class)
+            .bind(&v.role)
+            .bind(v.tonnage)
+            .bind(v.tl)
+            .bind(v.hull_max)
+            .bind(v.hull_current)
+            .bind(v.armor)
+            .bind(v.thrust)
+            .bind(v.jump_rating)
+            .bind(&v.sensor_grade)
+            .bind(v.stealth_dm)
+            .bind(v.transponder_active)
+            .bind(&v.disposition)
+            .bind(&v.orbit_location)
+            .bind(&v.captain_name)
+            .bind(&v.faction)
+            .bind(&v.cargo_hint)
+            .execute(&mut *tx)
+            .await?;
+
+            out.push(SystemShipRecord {
+                id: v.id,
+                campaign_id,
+                system_name: system_name.to_string(),
+                name: v.name.clone(),
+                ship_class: v.ship_class.clone(),
+                role: v.role.clone(),
+                tonnage: v.tonnage,
+                tl: v.tl,
+                hull_max: v.hull_max,
+                hull_current: v.hull_current,
+                armor: v.armor,
+                thrust: v.thrust,
+                jump_rating: v.jump_rating,
+                sensor_grade: v.sensor_grade.clone(),
+                stealth_dm: v.stealth_dm,
+                transponder_active: v.transponder_active,
+                disposition: v.disposition.clone(),
+                orbit_location: v.orbit_location.clone(),
+                captain_name: v.captain_name.clone(),
+                faction: v.faction.clone(),
+                cargo_hint: v.cargo_hint.clone(),
+                comms_log: vec![],
+                status: "in_system".to_string(),
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    pub async fn list_system_ships(
+        &self,
+        campaign_id: Uuid,
+        system_name: &str,
+    ) -> Result<Vec<SystemShipRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, campaign_id, system_name, name, ship_class, role, tonnage, tl,
+                    hull_max, hull_current, armor, thrust, jump_rating, sensor_grade,
+                    stealth_dm, transponder_active, disposition, orbit_location,
+                    captain_name, faction, cargo_hint, comms_log, status
+             FROM system_ships
+             WHERE campaign_id = $1 AND LOWER(system_name) = LOWER($2) AND status <> 'departed'
+             ORDER BY created_at ASC",
+        )
+        .bind(campaign_id)
+        .bind(system_name)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(Self::map_system_ship).collect()
+    }
+
+    pub async fn get_system_ship(
+        &self,
+        campaign_id: Uuid,
+        vessel_id: Uuid,
+    ) -> Result<Option<SystemShipRecord>> {
+        let row = sqlx::query(
+            "SELECT id, campaign_id, system_name, name, ship_class, role, tonnage, tl,
+                    hull_max, hull_current, armor, thrust, jump_rating, sensor_grade,
+                    stealth_dm, transponder_active, disposition, orbit_location,
+                    captain_name, faction, cargo_hint, comms_log, status
+             FROM system_ships WHERE campaign_id = $1 AND id = $2",
+        )
+        .bind(campaign_id)
+        .bind(vessel_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Self::map_system_ship).transpose()
+    }
+
+    pub async fn update_system_ship(
+        &self,
+        campaign_id: Uuid,
+        vessel_id: Uuid,
+        disposition: Option<&str>,
+        status: Option<&str>,
+        comms_entry: Option<Value>,
+    ) -> Result<Option<SystemShipRecord>> {
+        let Some(mut ship) = self.get_system_ship(campaign_id, vessel_id).await? else {
+            return Ok(None);
+        };
+        if let Some(d) = disposition {
+            ship.disposition = d.to_string();
+        }
+        if let Some(s) = status {
+            ship.status = s.to_string();
+        }
+        if let Some(entry) = comms_entry {
+            ship.comms_log.push(entry);
+        }
+        sqlx::query(
+            "UPDATE system_ships
+             SET disposition = $3, status = $4, comms_log = $5, updated_at = NOW()
+             WHERE campaign_id = $1 AND id = $2",
+        )
+        .bind(campaign_id)
+        .bind(vessel_id)
+        .bind(&ship.disposition)
+        .bind(&ship.status)
+        .bind(serde_json::to_value(&ship.comms_log)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(Some(ship))
+    }
+
+    fn map_system_ship(r: sqlx::postgres::PgRow) -> Result<SystemShipRecord> {
+        Ok(SystemShipRecord {
+            id: r.try_get("id")?,
+            campaign_id: r.try_get("campaign_id")?,
+            system_name: r.try_get("system_name")?,
+            name: r.try_get("name")?,
+            ship_class: r.try_get("ship_class")?,
+            role: r.try_get("role")?,
+            tonnage: r.try_get("tonnage")?,
+            tl: r.try_get("tl")?,
+            hull_max: r.try_get("hull_max")?,
+            hull_current: r.try_get("hull_current")?,
+            armor: r.try_get("armor")?,
+            thrust: r.try_get("thrust")?,
+            jump_rating: r.try_get("jump_rating")?,
+            sensor_grade: r.try_get("sensor_grade")?,
+            stealth_dm: r.try_get("stealth_dm")?,
+            transponder_active: r.try_get("transponder_active")?,
+            disposition: r.try_get("disposition")?,
+            orbit_location: r.try_get("orbit_location")?,
+            captain_name: r.try_get("captain_name")?,
+            faction: r.try_get("faction")?,
+            cargo_hint: r.try_get("cargo_hint")?,
+            comms_log: serde_json::from_value(r.try_get("comms_log")?)?,
+            status: r.try_get("status")?,
+        })
     }
 }

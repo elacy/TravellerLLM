@@ -5,7 +5,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use futures_util::Stream;
 use rand::rng;
@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use traveller_db::{NewCharacterInput, ShipRecord};
+use traveller_db::{NewCharacterInput, ShipRecord, UpsertModuleInput};
 use traveller_llm::tools::execute_tool;
 use traveller_llm::TurnEvent;
 use traveller_rules::character::{Character, CharacterKind, Characteristic};
@@ -28,7 +28,8 @@ use traveller_rules::sensors::{resolve_sensor_detection, SensorDetectionInput};
 use traveller_rules::ship::{
     sample_free_trader, validate_ship, Mortgage, ShipSpec,
 };
-use traveller_rules::universe::{plan_jump_route, RouteNode};
+use traveller_rules::traffic::generate_system_traffic;
+use traveller_rules::universe::{parse_uwp, plan_jump_route, RouteNode};
 use uuid::Uuid;
 
 use crate::auth::{auth_me, oidc_callback, oidc_login, oidc_logout, AuthUser};
@@ -64,6 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/auth/me", get(auth_me))
         .route("/api/campaigns", get(list_campaigns).post(create_campaign))
+        .route("/api/campaigns/{id}", delete(delete_campaign))
         .route("/api/campaigns/{id}/snapshot", get(get_campaign_snapshot))
         .route(
             "/api/campaigns/{id}/characters",
@@ -71,7 +73,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/campaigns/{id}/characters/{char_id}",
-            patch(update_character),
+            patch(update_character).delete(delete_character),
         )
         .route(
             "/api/campaigns/{id}/characters/{char_id}/spend-xp",
@@ -124,6 +126,20 @@ pub fn router(state: AppState) -> Router {
         .route("/api/campaigns/{id}/combat/active", get(active_combats))
         .route("/api/campaigns/{id}/combat/personal", post(personal_combat_handler))
         .route("/api/campaigns/{id}/combat/space", post(space_combat_handler))
+        // Campaign Modules (Knowledge Files -> Hindsight + NPCs/Ships/Events)
+        .route("/api/modules", get(list_modules).post(create_module))
+        .route("/api/modules/{module_id}", delete(delete_module))
+        .route(
+            "/api/campaigns/{id}/modules/{module_id}/load",
+            post(load_module_into_campaign),
+        )
+        // In-System Starship Traffic & Ship Interactions
+        .route("/api/campaigns/{id}/traffic", get(list_system_traffic))
+        .route("/api/campaigns/{id}/traffic/scan", post(scan_system_traffic))
+        .route(
+            "/api/campaigns/{id}/traffic/{vessel_id}/interact",
+            post(interact_system_vessel),
+        )
         // Packs Reload
         .route("/api/packs/reload", post(reload_packs_handler))
         .route("/api/campaigns/{id}/messages", get(list_messages))
@@ -207,7 +223,35 @@ async fn create_campaign(
             .await?;
     }
 
-    Ok(Json(json!({ "campaign": camp })))
+    // Generate initial in-system starship traffic for the starting system
+    let sys_rec = st.db.get_system_by_name(&camp.current_system_name).await.ok().flatten();
+    let uwp = parse_uwp(&camp.current_system_uwp)
+        .unwrap_or_else(|_| parse_uwp("A788899-C").expect("valid uwp"));
+    let (bases, zone) = sys_rec
+        .map(|s| (s.bases, s.travel_zone))
+        .unwrap_or_else(|| (vec![], "Green".to_string()));
+    let traffic = {
+        let mut r = rng();
+        generate_system_traffic(&mut r, &camp.current_system_name, &uwp, &bases, &zone)
+    };
+    let _ = st
+        .db
+        .replace_system_ships(camp.id, &camp.current_system_name, &traffic.vessels)
+        .await;
+
+    Ok(Json(json!({
+        "campaign": camp,
+        "in_system_ship_count": traffic.ship_count,
+        "traffic_summary": traffic.summary
+    })))
+}
+
+async fn delete_campaign(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let deleted = st.db.delete_campaign(id).await?;
+    Ok(Json(json!({ "deleted": deleted })))
 }
 
 async fn get_campaign_snapshot(
@@ -227,8 +271,33 @@ async fn get_campaign_snapshot(
     let active_personal_combat = st.db.get_active_combat(id, "personal").await?;
     let active_space_combat = st.db.get_active_combat(id, "space").await?;
     let pending_events = st.db.list_pending_events(id).await?;
+    let loaded_modules = st.db.list_campaign_modules(id).await?;
+    let mut system_ships = st
+        .db
+        .list_system_ships(id, &camp.current_system_name)
+        .await?;
+    if system_ships.is_empty() {
+        let sys_rec = st.db.get_system_by_name(&camp.current_system_name).await.ok().flatten();
+        let uwp = parse_uwp(&camp.current_system_uwp)
+            .unwrap_or_else(|_| parse_uwp("A788899-C").expect("valid uwp"));
+        let (bases, zone) = sys_rec
+            .map(|s| (s.bases, s.travel_zone))
+            .unwrap_or_else(|| (vec![], "Green".to_string()));
+        let traffic = {
+            let mut r = rng();
+            generate_system_traffic(&mut r, &camp.current_system_name, &uwp, &bases, &zone)
+        };
+        if let Ok(inserted) = st
+            .db
+            .replace_system_ships(id, &camp.current_system_name, &traffic.vessels)
+            .await
+        {
+            system_ships = inserted;
+        }
+    }
     let sector_count = st.db.count_sectors().await.unwrap_or(0);
     let item_count = st.db.count_items().await.unwrap_or(0);
+    let system_ship_count = system_ships.len();
     Ok(Json(json!({
         "campaign": camp,
         "characters": characters,
@@ -239,6 +308,9 @@ async fn get_campaign_snapshot(
         "active_personal_combat": active_personal_combat,
         "active_space_combat": active_space_combat,
         "pending_events": pending_events,
+        "loaded_modules": loaded_modules,
+        "system_ships": system_ships,
+        "system_ship_count": system_ship_count,
         "pack_stats": { "sectors": sector_count, "items": item_count }
     })))
 }
@@ -300,6 +372,18 @@ async fn update_character(
         )
         .await?;
     Ok(Json(json!({ "character": body.character, "equipment": equip })))
+}
+
+async fn delete_character(
+    State(st): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path((id, char_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    let deleted = st.db.delete_character(id, char_id).await?;
+    st.db
+        .log_audit(id, &user.username, "delete_character", json!({"id": char_id}))
+        .await?;
+    Ok(Json(json!({ "deleted": deleted })))
 }
 
 #[derive(Deserialize)]
@@ -901,6 +985,8 @@ struct ChargenCommitBody {
     station: Option<String>,
     #[serde(default)]
     deposit_cash_account_id: Option<Uuid>,
+    #[serde(default)]
+    replace_existing_player: bool,
 }
 
 fn default_player_kind() -> CharacterKind {
@@ -913,6 +999,9 @@ async fn chargen_commit(
     Path(id): Path<Uuid>,
     Json(body): Json<ChargenCommitBody>,
 ) -> Result<Json<Value>, ApiError> {
+    if body.kind == CharacterKind::Player && body.replace_existing_player {
+        st.db.delete_player_characters(id).await?;
+    }
     let finalized = finalize_lifepath_character(
         id,
         body.kind,
@@ -1139,4 +1228,236 @@ async fn reload_packs_handler(State(st): State<AppState>) -> Result<Json<Value>,
         "total_sectors": total_sectors,
         "total_items": total_items
     })))
+}
+
+// ── Campaign Modules (Knowledge Files -> Hindsight + NPCs/Ships/Events) ───
+
+async fn list_modules(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let modules = st.db.list_modules().await?;
+    Ok(Json(json!({ "modules": modules })))
+}
+
+async fn create_module(
+    State(st): State<AppState>,
+    Json(mut input): Json<UpsertModuleInput>,
+) -> Result<Json<Value>, ApiError> {
+    if input.slug.trim().is_empty() {
+        let s: String = input
+            .name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        input.slug = s.trim_matches('-').to_string();
+    }
+    if input.slug.is_empty() || input.name.trim().is_empty() {
+        return Err(anyhow::anyhow!("Module name is required").into());
+    }
+    let rec = st.db.upsert_module(input).await?;
+    Ok(Json(json!({ "module": rec })))
+}
+
+async fn delete_module(
+    State(st): State<AppState>,
+    Path(module_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let deleted = st.db.delete_module(module_id).await?;
+    Ok(Json(json!({ "deleted": deleted })))
+}
+
+#[derive(Deserialize, Default)]
+struct LoadModuleBody {
+    #[serde(default)]
+    move_to_starting_system: bool,
+}
+
+async fn load_module_into_campaign(
+    State(st): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path((id, module_id)): Path<(Uuid, Uuid)>,
+    body: Option<Json<LoadModuleBody>>,
+) -> Result<Json<Value>, ApiError> {
+    let opts = body.map(|b| b.0).unwrap_or_default();
+    let mut camp = st
+        .db
+        .get_campaign(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Campaign not found"))?;
+    let module = st
+        .db
+        .get_module(module_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Module not found"))?;
+
+    // 1. Ensure Hindsight bank exists for this campaign and ingest all knowledge files
+    let _ = st
+        .hindsight
+        .ensure_bank(&camp.hindsight_bank_id, &camp.name)
+        .await;
+    let mut chunks_ingested = 0usize;
+    for kf in &module.knowledge_files {
+        let title = if kf.title.trim().is_empty() {
+            &kf.filename
+        } else {
+            &kf.title
+        };
+        let n = st
+            .hindsight
+            .retain_knowledge_document(
+                &camp.hindsight_bank_id,
+                &module.slug,
+                &kf.filename,
+                title,
+                &kf.content,
+            )
+            .await
+            .unwrap_or(0);
+        chunks_ingested += n;
+    }
+
+    // 2. Spawn module NPCs (deduplicating by name, strictly never spawning a second 'player')
+    let existing_chars = st.db.list_characters(id).await?;
+    let existing_names: std::collections::HashSet<String> = existing_chars
+        .iter()
+        .map(|c| c.character.name.to_lowercase())
+        .collect();
+    let mut npcs_spawned = 0i32;
+    for mut npc in module.npcs.clone() {
+        if existing_names.contains(&npc.name.to_lowercase()) {
+            continue;
+        }
+        if npc.kind == CharacterKind::Player {
+            npc.kind = CharacterKind::Npc;
+        }
+        st.db.create_character(id, npc).await?;
+        npcs_spawned += 1;
+    }
+
+    // 3. Spawn optional module scheduled events
+    let mut events_spawned = 0i32;
+    for ev in &module.events {
+        let delta_mins = ev.days_from_now * 24 * 60 + ev.hours_from_now * 60;
+        let due_date = camp.date.advance_minutes(delta_mins.max(60));
+        let due_total = due_date.to_total_minutes();
+        st.db
+            .create_event(
+                id,
+                due_total,
+                &due_date.format(),
+                &ev.kind,
+                &ev.title,
+                json!({ "module": module.slug }),
+            )
+            .await?;
+        events_spawned += 1;
+    }
+
+    // 4. Optional starting system move
+    if opts.move_to_starting_system
+        && let Some(sys_name) = &module.starting_system_name
+    {
+        let sys_rec = st.db.get_system_by_name(sys_name).await.ok().flatten();
+        let uwp_s = module
+            .starting_system_uwp
+            .clone()
+            .or_else(|| sys_rec.as_ref().map(|s| s.uwp.clone()))
+            .unwrap_or_else(|| camp.current_system_uwp.clone());
+        st.db
+            .update_campaign_system(id, sys_name, &uwp_s, sys_rec.as_ref().map(|s| s.id))
+            .await?;
+    }
+
+    // 5. Append module Referee brief into campaign story_ledger.threads if not already present
+    if !module.referee_brief.trim().is_empty()
+        && !camp.story_ledger.threads.contains(&module.name)
+    {
+        if !camp.story_ledger.threads.is_empty() {
+            camp.story_ledger.threads.push('\n');
+        }
+        camp.story_ledger
+            .threads
+            .push_str(&format!("- [Module: {}] {}", module.name, module.referee_brief.trim()));
+        st.db.update_story_ledger(id, &camp.story_ledger).await?;
+    }
+
+    st.db
+        .record_campaign_module_load(
+            id,
+            module.id,
+            chunks_ingested as i32,
+            npcs_spawned,
+            0,
+            events_spawned,
+        )
+        .await?;
+
+    st.db
+        .log_audit(
+            id,
+            &user.username,
+            "load_module",
+            json!({
+                "module_slug": module.slug,
+                "hindsight_chunks": chunks_ingested,
+                "npcs_spawned": npcs_spawned,
+                "events_spawned": events_spawned
+            }),
+        )
+        .await?;
+
+    Ok(Json(json!({
+        "loaded": true,
+        "module_name": module.name,
+        "hindsight_bank_id": camp.hindsight_bank_id,
+        "hindsight_chunks_ingested": chunks_ingested,
+        "npcs_spawned": npcs_spawned,
+        "events_spawned": events_spawned
+    })))
+}
+
+// ── In-System Starship Traffic & Ship Interactions ────────────────────────
+
+async fn list_system_traffic(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let res = execute_tool(
+        &st.db,
+        &st.hindsight,
+        id,
+        "system_traffic",
+        &json!({"action": "list"}),
+    )
+    .await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+async fn scan_system_traffic(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let res = execute_tool(
+        &st.db,
+        &st.hindsight,
+        id,
+        "system_traffic",
+        &json!({"action": "scan_system"}),
+    )
+    .await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+async fn interact_system_vessel(
+    State(st): State<AppState>,
+    Path((id, vessel_id)): Path<(Uuid, Uuid)>,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("vessel_id".into(), json!(vessel_id.to_string()));
+    }
+    let res = execute_tool(&st.db, &st.hindsight, id, "system_traffic", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
 }

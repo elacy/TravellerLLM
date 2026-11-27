@@ -1,15 +1,33 @@
 import { useEffect, useState, useMemo } from "react";
-import { Compass, Navigation, Search, Sparkles } from "lucide-react";
-import { api, CampaignSnapshot, SectorRecord, SystemRecord } from "../lib/api";
+import {
+  Compass,
+  Crosshair,
+  Navigation,
+  Radar,
+  Radio,
+  RefreshCw,
+  Search,
+  Sparkles,
+} from "lucide-react";
+import { api, CampaignSnapshot, SectorRecord, SystemRecord, SystemShipRecord } from "../lib/api";
 
 interface Props {
   campaignId: string;
   snapshot: CampaignSnapshot;
   onRefresh: () => Promise<void>;
   onError: (msg: string) => void;
+  onSendChat: (prompt: string) => Promise<void>;
+  onSwitchToCombat: () => void;
 }
 
-export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props) {
+export function StarMapPanel({
+  campaignId,
+  snapshot,
+  onRefresh,
+  onError,
+  onSendChat,
+  onSwitchToCombat,
+}: Props) {
   const [sectors, setSectors] = useState<SectorRecord[]>([]);
   const [selectedSectorId, setSelectedSectorId] = useState<string>("");
   const [systems, setSystems] = useState<SystemRecord[]>([]);
@@ -21,9 +39,13 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
   const [jumpRating, setJumpRating] = useState(snapshot.ships[0]?.spec.jump_rating || 1);
   const [avoidRed, setAvoidRed] = useState(true);
   const [requireRefuel, setRequireRefuel] = useState(true);
-  const [routeResult, setRouteResult] = useState<Awaited<ReturnType<typeof api.planRoute>> | null>(null);
+  const [routeResult, setRouteResult] = useState<Awaited<ReturnType<typeof api.planRoute>> | null>(
+    null
+  );
   const [jumping, setJumping] = useState(false);
   const [jumpReport, setJumpReport] = useState<string | null>(null);
+  const [scanningTraffic, setScanningTraffic] = useState(false);
+  const [vesselScanMap, setVesselScanMap] = useState<Record<string, string>>({});
 
   useEffect(() => {
     api
@@ -95,11 +117,12 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
     if (!destName.trim()) return;
     setJumping(true);
     setJumpReport(null);
+    setVesselScanMap({});
     try {
       const res = await api.executeJump(campaignId, destName, snapshot.ships[0]?.id);
-      setJumpReport(
-        `Jumped to ${res.arrived_at ?? destName} (${res.uwp ?? ""}) in ${res.jump_hours ?? "?"}h. Date: ${res.new_date ?? ""}`
-      );
+      const count = Number(res.in_system_ship_count ?? 0);
+      const summary = String(res.traffic_summary ?? `${count} ship(s) detected in-system.`);
+      setJumpReport(`Arrived at ${res.arrived_at ?? destName} [${res.uwp ?? ""}]. ${summary}`);
       await onRefresh();
     } catch (e) {
       onError((e as Error).message);
@@ -107,6 +130,64 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
       setJumping(false);
     }
   }
+
+  async function handleRefreshTraffic() {
+    setScanningTraffic(true);
+    setVesselScanMap({});
+    try {
+      const res = await api.scanTraffic(campaignId);
+      setJumpReport(res.summary);
+      await onRefresh();
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      setScanningTraffic(false);
+    }
+  }
+
+  async function handleHailVessel(v: SystemShipRecord) {
+    try {
+      await api.interactVessel(campaignId, v.id, {
+        action: "hail",
+        message: `Hailing ${v.name} (${v.ship_class}) in ${v.orbit_location}.`,
+      });
+      await onRefresh();
+      await onSendChat(
+        `I open hailing frequencies to ${v.name} (${v.ship_class}, captain ${v.captain_name}, ${v.faction}) currently at ${v.orbit_location} in ${snapshot.campaign.current_system_name}. "Vessel ${v.name}, this is ${snapshot.ships[0]?.name ?? "our ship"}, requesting comms — what's your status and business in system?"`
+      );
+    } catch (e) {
+      onError((e as Error).message);
+    }
+  }
+
+  async function handleScanVessel(v: SystemShipRecord) {
+    try {
+      const res = await api.interactVessel(campaignId, v.id, { action: "sensor_scan" });
+      const det = res.sensor_detection as {
+        detection_level?: string;
+        roll?: { total?: number; target?: number; effect?: number; success?: boolean };
+      };
+      const rev = res.revealed as Record<string, unknown>;
+      const txt = det?.roll?.success
+        ? `Scan ${det.detection_level?.toUpperCase()} (rolled ${det.roll.total}/${det.roll.target}, Eff +${det.roll.effect}): Hull ${rev?.hull ?? "?"}, Armor ${rev?.armor ?? "?"}, M-${rev?.thrust ?? "?"}, Stealth ${rev?.stealth_dm ?? 0}. ${rev?.cargo_hint ?? ""}`
+        : `Scan FAILED (rolled ${det?.roll?.total ?? "?"}/${det?.roll?.target ?? "?"}) — ${rev?.note ?? "signature masked."}`;
+      setVesselScanMap((prev) => ({ ...prev, [v.id]: txt }));
+    } catch (e) {
+      onError((e as Error).message);
+    }
+  }
+
+  async function handleEngageVessel(v: SystemShipRecord) {
+    try {
+      await api.interactVessel(campaignId, v.id, { action: "engage", range_band: "long" });
+      await onRefresh();
+      onSwitchToCombat();
+    } catch (e) {
+      onError((e as Error).message);
+    }
+  }
+
+  const systemShips = snapshot.system_ships ?? [];
 
   // SVG Hex coordinates for a 32x40 Traveller sector
   const hexSize = 11;
@@ -131,15 +212,20 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
           <div className="truncate">
             <div className="text-slate-200 font-semibold truncate">
               {snapshot.campaign.current_system_name}{" "}
-              <span className="font-mono text-cyan-400">[{snapshot.campaign.current_system_uwp}]</span>
+              <span className="font-mono text-cyan-400">
+                [{snapshot.campaign.current_system_uwp}]
+              </span>
             </div>
             <div className="text-[10px] text-slate-400">
-              {snapshot.pack_stats?.sectors ?? sectors.length} sectors loaded
+              {snapshot.pack_stats?.sectors ?? sectors.length} sectors ·{" "}
+              <span className="text-amber-300 font-semibold">
+                {systemShips.length} ship(s) in system
+              </span>
             </div>
           </div>
         </div>
         <select
-          className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] max-w-[180px]"
+          className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-[11px] max-w-[170px]"
           value={selectedSectorId}
           onChange={(e) => setSelectedSectorId(e.target.value)}
         >
@@ -149,6 +235,105 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
             </option>
           ))}
         </select>
+      </div>
+
+      {jumpReport && (
+        <div className="p-2 rounded bg-emerald-950/60 border border-emerald-700 text-emerald-200 text-[11px]">
+          {jumpReport}
+        </div>
+      )}
+
+      {/* In-System Starship Traffic & Ship Interactions */}
+      <div className="bg-slate-900 border border-cyan-900/70 rounded p-2.5 space-y-2">
+        <div className="flex items-center justify-between">
+          <div className="font-semibold text-cyan-300 flex items-center gap-1.5">
+            <Radar className="w-3.5 h-3.5" /> Ships in {snapshot.campaign.current_system_name} (
+            {systemShips.length} detected)
+          </div>
+          <button
+            disabled={scanningTraffic}
+            onClick={handleRefreshTraffic}
+            className="bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded px-2 py-0.5 text-[10px] flex items-center gap-1"
+          >
+            <RefreshCw className={`w-3 h-3 ${scanningTraffic ? "animate-spin" : ""}`} /> Sweep
+          </button>
+        </div>
+
+        {systemShips.length === 0 ? (
+          <div className="text-[11px] text-slate-500">
+            Sensors report empty space (0 vessels in system).
+          </div>
+        ) : (
+          <div className="max-h-56 overflow-y-auto space-y-1.5">
+            {systemShips.map((v) => (
+              <div
+                key={v.id}
+                className="bg-slate-950 border border-slate-800 rounded p-2 space-y-1"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="font-semibold text-slate-100 truncate">
+                      {v.name}{" "}
+                      <span className="text-[10px] font-normal text-slate-400">
+                        ({v.ship_class}, {v.tonnage}t)
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-slate-400">
+                      {v.orbit_location} · {v.faction} · {v.captain_name}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {!v.transponder_active && (
+                      <span className="px-1 py-0.5 rounded bg-purple-950 text-purple-300 text-[9px] font-mono">
+                        DARK
+                      </span>
+                    )}
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[9px] uppercase font-semibold ${
+                        v.disposition === "hostile"
+                          ? "bg-red-950 text-red-300"
+                          : v.disposition === "distress"
+                          ? "bg-amber-950 text-amber-300"
+                          : v.disposition === "friendly"
+                          ? "bg-emerald-950 text-emerald-300"
+                          : "bg-slate-800 text-slate-300"
+                      }`}
+                    >
+                      {v.disposition}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex gap-1 pt-0.5">
+                  <button
+                    onClick={() => handleHailVessel(v)}
+                    className="flex-1 bg-cyan-900/70 hover:bg-cyan-800 text-cyan-100 rounded py-0.5 text-[10px] flex items-center justify-center gap-1"
+                  >
+                    <Radio className="w-3 h-3" /> Hail / Talk
+                  </button>
+                  <button
+                    onClick={() => handleScanVessel(v)}
+                    className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded py-0.5 text-[10px] flex items-center justify-center gap-1"
+                  >
+                    <Radar className="w-3 h-3" /> Sensor Scan
+                  </button>
+                  <button
+                    onClick={() => handleEngageVessel(v)}
+                    className="bg-red-900/70 hover:bg-red-800 text-red-100 rounded px-2 py-0.5 text-[10px] flex items-center justify-center gap-1"
+                  >
+                    <Crosshair className="w-3 h-3" /> Engage
+                  </button>
+                </div>
+
+                {vesselScanMap[v.id] && (
+                  <div className="text-[10px] bg-slate-900 border border-cyan-900/60 rounded px-1.5 py-1 text-cyan-200 font-mono">
+                    {vesselScanMap[v.id]}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Global Search */}
@@ -182,7 +367,7 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
         </div>
 
         {searchResults.length > 0 && (
-          <div className="max-h-36 overflow-y-auto divide-y divide-slate-800 border border-slate-800 rounded bg-slate-950">
+          <div className="max-h-32 overflow-y-auto divide-y divide-slate-800 border border-slate-800 rounded bg-slate-950">
             {searchResults.map((sys) => (
               <div
                 key={sys.id}
@@ -210,13 +395,8 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
       </div>
 
       {/* Interactive Sector SVG Hex Map */}
-      <div className="bg-slate-950 border border-slate-800 rounded overflow-auto max-h-72 relative">
-        <svg
-          width={32 * colStep + 36}
-          height={40 * rowStep + 36}
-          className="block select-none"
-        >
-          {/* Subsector divider lines (4x4 subsectors, 8x10 hexes each) */}
+      <div className="bg-slate-950 border border-slate-800 rounded overflow-auto max-h-60 relative">
+        <svg width={32 * colStep + 36} height={40 * rowStep + 36} className="block select-none">
           {[8, 16, 24].map((c) => (
             <line
               key={`vc-${c}`}
@@ -240,7 +420,6 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
             />
           ))}
 
-          {/* Route polyline */}
           {routeResult?.route?.legs.map((leg, i) => {
             const p1 = hexCenter(leg.from.hex);
             const p2 = hexCenter(leg.to.hex);
@@ -259,7 +438,6 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
             );
           })}
 
-          {/* Star systems */}
           {systems.map((sys) => {
             const pt = hexCenter(sys.hex);
             if (!pt) return null;
@@ -340,17 +518,6 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
             <span className="px-1.5 py-0.5 rounded bg-slate-800 text-amber-300">
               GG: {selectedSystem.gas_giants}
             </span>
-            {selectedSystem.travel_zone !== "Green" && (
-              <span
-                className={`px-1.5 py-0.5 rounded font-semibold ${
-                  selectedSystem.travel_zone === "Red"
-                    ? "bg-red-900/70 text-red-200"
-                    : "bg-amber-900/70 text-amber-200"
-                }`}
-              >
-                {selectedSystem.travel_zone} Zone
-              </span>
-            )}
             {selectedSystem.trade_codes.map((tc) => (
               <span key={tc} className="px-1.5 py-0.5 rounded bg-cyan-950 text-cyan-300">
                 {tc}
@@ -418,12 +585,6 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
           </label>
         </div>
 
-        {jumpReport && (
-          <div className="p-2 rounded bg-emerald-950/60 border border-emerald-700 text-emerald-200 text-[11px]">
-            {jumpReport}
-          </div>
-        )}
-
         {routeResult && (
           <div className="bg-slate-950 border border-slate-800 rounded p-2 space-y-1">
             {!routeResult.found || !routeResult.route ? (
@@ -433,7 +594,8 @@ export function StarMapPanel({ campaignId, snapshot, onRefresh, onError }: Props
             ) : (
               <>
                 <div className="text-cyan-300 font-semibold">
-                  {routeResult.route.total_jumps} jump(s) · {routeResult.route.total_parsecs} parsec(s)
+                  {routeResult.route.total_jumps} jump(s) · {routeResult.route.total_parsecs}{" "}
+                  parsec(s)
                 </div>
                 {routeResult.route.legs.map((leg, i) => (
                   <div

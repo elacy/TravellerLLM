@@ -178,8 +178,8 @@ export function CombatPanel({ campaignId, snapshot, onRefresh, onError }: Props)
         target_stealth_armor_dm: targetStealth,
         target_fired_weapons: false,
         target_crit_damage_severity: 0,
-        operator_skill_dm: 1,
-        operator_stat_dm: 1,
+        operator_edu_dm: 1,
+        operator_sensors_skill: 1,
         situational_dm: 0,
       });
       setSensorResult(res.sensor_check);

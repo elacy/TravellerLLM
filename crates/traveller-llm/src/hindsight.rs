@@ -93,6 +93,49 @@ impl HindsightClient {
         Ok(())
     }
 
+    /// Chunk and ingest a module knowledge file (Markdown/text lore, patron brief, faction dossier)
+    /// into a campaign's Hindsight bank so the Referee can recall module facts & secrets on demand.
+    pub async fn retain_knowledge_document(
+        &self,
+        bank_id: &str,
+        module_slug: &str,
+        filename: &str,
+        title: &str,
+        content: &str,
+    ) -> Result<usize> {
+        if !self.is_enabled() || content.trim().is_empty() {
+            return Ok(0);
+        }
+        let chunks = chunk_markdown(content, 3500);
+        let url = format!("{}/v1/default/banks/{}/memories", self.base_url, bank_id);
+        let safe_file: String = filename
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+
+        let mut items = Vec::with_capacity(chunks.len());
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let doc_id = format!("mod-{module_slug}-{safe_file}-p{}", idx + 1);
+            items.push(json!({
+                "document_id": doc_id,
+                "content": format!("[Module: {module_slug} | File: {filename} | {title} (part {}/{})]\n\n{}", idx + 1, chunks.len(), chunk),
+                "tags": ["module", module_slug, filename]
+            }));
+        }
+
+        let body = json!({
+            "async": true,
+            "items": items
+        });
+        let resp = self.apply_auth(self.http.post(&url).json(&body)).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            warn!("Hindsight retain_knowledge_document {module_slug}/{filename} returned {status}: {text}");
+        }
+        Ok(chunks.len())
+    }
+
     pub async fn delete_message(&self, bank_id: &str, content_hash: &str) -> Result<bool> {
         if !self.is_enabled() {
             return Ok(false);
@@ -145,4 +188,43 @@ impl HindsightClient {
             Ok(lines.join("\n"))
         }
     }
+}
+
+fn chunk_markdown(text: &str, max_chars: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for para in text.split("\n\n") {
+        let trimmed = para.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !current.is_empty() && current.len() + trimmed.len() + 2 > max_chars {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if trimmed.len() > max_chars {
+            // Split oversized paragraphs cleanly by characters
+            let mut buf = String::new();
+            for ch in trimmed.chars() {
+                buf.push(ch);
+                if buf.len() >= max_chars {
+                    chunks.push(std::mem::take(&mut buf));
+                }
+            }
+            if !buf.is_empty() {
+                current = buf;
+            }
+        } else {
+            if !current.is_empty() {
+                current.push_str("\n\n");
+            }
+            current.push_str(trimmed);
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(text.trim().to_string());
+    }
+    chunks
 }

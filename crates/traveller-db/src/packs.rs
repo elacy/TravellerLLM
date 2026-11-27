@@ -147,6 +147,31 @@ pub async fn load_packs_from_dir(db: &Db, packs_dir: &Path) -> Result<(usize, us
                 }
                 Err(e) => warn!("Failed to parse item pack {}: {e}", path.display()),
             }
+        } else if fname.contains("module")
+            || path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|s| s.eq_ignore_ascii_case("modules"))
+                .unwrap_or(false)
+        {
+            match read_json_or_gz(&path)
+                .and_then(|s| Ok(serde_json::from_str::<crate::UpsertModuleInput>(&s)?))
+            {
+                Ok(mut m) => {
+                    m.source = "pack".to_string();
+                    match db.upsert_module(m).await {
+                        Ok(rec) => info!(
+                            "Registered module '{}' ({}) from {}",
+                            rec.name,
+                            rec.slug,
+                            path.display()
+                        ),
+                        Err(e) => warn!("Failed to register module {}: {e}", path.display()),
+                    }
+                }
+                Err(e) => warn!("Failed to parse module pack {}: {e}", path.display()),
+            }
         }
     }
 
