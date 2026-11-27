@@ -164,8 +164,8 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
       onError("Select an account first.");
       return;
     }
-    const avail = availMap[item.id] as { availability?: { final_unit_price_cr?: number } } | undefined;
-    const unitPrice = avail?.availability?.final_unit_price_cr ?? item.cost_cr;
+    const avail = availMap[item.id] as { final_unit_price_cr?: number } | undefined;
+    const unitPrice = avail?.final_unit_price_cr ?? item.cost_cr;
     try {
       const res = await api.shopPurchase(campaignId, {
         item_id: item.id,
@@ -532,12 +532,10 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
             {items.map((item) => {
               const av = availMap[item.id] as
                 | {
-                    availability?: {
-                      available: boolean;
-                      final_unit_price_cr: number;
-                      law_response: string;
-                      note: string;
-                    };
+                    available: boolean;
+                    final_unit_price_cr: number;
+                    law_response: string;
+                    note: string;
                   }
                 | undefined;
               const statsSummary = Object.entries(item.stats || {})
@@ -580,20 +578,20 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
                       </button>
                     </div>
                   </div>
-                  {av?.availability && (
+                  {av && typeof av.available === "boolean" && (
                     <div
                       className={`text-[10px] px-2 py-1 rounded border flex items-center gap-1.5 ${
-                        av.availability.available
+                        av.available
                           ? "bg-emerald-950/50 border-emerald-700 text-emerald-200"
-                          : av.availability.law_response !== "none"
+                          : av.law_response !== "none"
                           ? "bg-red-950/70 border-red-700 text-red-200"
                           : "bg-slate-950 border-slate-700 text-slate-400"
                       }`}
                     >
-                      {av.availability.law_response !== "none" && (
+                      {av.law_response !== "none" && (
                         <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
                       )}
-                      <span>{av.availability.note}</span>
+                      <span>{av.note}</span>
                     </div>
                   )}
                 </div>

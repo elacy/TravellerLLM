@@ -23,14 +23,14 @@ DMG_RE = re.compile(r"^\d+D[D]?(?:[+-]\d+)?$", re.I)
 
 
 def parse_price_cr(s: str) -> int | None:
-    s = s.strip().replace(" ", "")
-    m = PRICE_RE.match(s)
+    first_line = (s or "").strip().splitlines()[0] if (s or "").strip() else ""
+    first_line = first_line.split("/")[0].strip().replace(" ", "")
+    m = PRICE_RE.match(first_line)
     if not m:
         return None
     unit, num = m.group(1).lower(), float(m.group(2).replace(",", ""))
-    if unit == "mcr":
-        return int(round(num * 1_000_000))
-    return int(round(num))
+    val = int(round(num * 1_000_000)) if unit == "mcr" else int(round(num))
+    return val if 0 < val <= 500_000_000 else None
 
 
 def parse_float(s: str) -> float:
