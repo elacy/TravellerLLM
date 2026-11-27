@@ -45,6 +45,9 @@ async fn main() -> Result<()> {
     let frontend_dir = PathBuf::from(
         std::env::var("FRONTEND_DIR").unwrap_or_else(|_| "./frontend/dist".to_string()),
     );
+    let packs_dir = PathBuf::from(
+        std::env::var("DATA_PACKS_DIR").unwrap_or_else(|_| "./packs".to_string()),
+    );
 
     let auth_config = AuthConfig::from_env();
     if auth_config.mode == AuthMode::None {
@@ -57,6 +60,29 @@ async fn main() -> Result<()> {
     let db = Db::connect(&database_url).await?;
     db.migrate().await?;
     info!("PostgreSQL migrations up to date.");
+
+    // Spawn non-blocking pack loader so /api/health comes up immediately while Charted Space
+    // sectors & item catalogs import idempotently into PostgreSQL.
+    let db_bg = db.clone();
+    let packs_bg = packs_dir.clone();
+    tokio::spawn(async move {
+        let starter_dir = PathBuf::from("/app/packs/starter-srd");
+        for dir in [packs_bg, starter_dir] {
+            if dir.exists() {
+                match traveller_db::load_packs_from_dir(&db_bg, &dir).await {
+                    Ok((sys, items)) => {
+                        if sys > 0 || items > 0 {
+                            info!(
+                                "Pack loader imported {sys} systems and {items} items from {}",
+                                dir.display()
+                            );
+                        }
+                    }
+                    Err(e) => warn!("Pack loader error for {}: {e}", dir.display()),
+                }
+            }
+        }
+    });
 
     let litellm = LiteLlmClient::new(litellm_base_url, litellm_api_key);
     let hindsight = HindsightClient::new(hindsight_base_url, hindsight_api_key, hindsight_enabled);
@@ -78,6 +104,7 @@ async fn main() -> Result<()> {
         auth: AuthState::new(auth_config),
         default_referee_model,
         default_worker_model,
+        packs_dir,
     };
 
     let mut app = build_app(state);

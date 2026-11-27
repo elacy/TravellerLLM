@@ -1,0 +1,20 @@
+{
+  "sectors": [
+    {
+      "name": "Spinward Marches (Starter)",
+      "abbreviation": "Spin",
+      "sector_x": -4,
+      "sector_y": -1,
+      "systems": [
+        { "hex": "1910", "name": "Regina", "uwp": "A788899-C", "starport": "A", "tech_level": 12, "law_level": 9, "trade_codes": ["Ri", "Ht"], "bases": ["N", "S"], "allegiance": "Im", "travel_zone": "Green", "gas_giants": 1, "global_x": -109, "global_y": -30, "pbg": "703", "stars": "F7 V M8 D" },
+        { "hex": "2007", "name": "Roup", "uwp": "C77A9A9-C", "starport": "C", "tech_level": 12, "law_level": 9, "trade_codes": ["Hi", "In", "Wa", "Ht"], "bases": ["S"], "allegiance": "Im", "travel_zone": "Green", "gas_giants": 1, "global_x": -108, "global_y": -33, "pbg": "913", "stars": "G4 V" },
+        { "hex": "1809", "name": "Jenghe", "uwp": "C799663-9", "starport": "C", "tech_level": 9, "law_level": 3, "trade_codes": ["Ni"], "bases": ["S"], "allegiance": "Im", "travel_zone": "Green", "gas_giants": 1, "global_x": -110, "global_y": -31, "pbg": "502", "stars": "M1 V" },
+        { "hex": "2010", "name": "Yori", "uwp": "C360757-A", "starport": "C", "tech_level": 10, "law_level": 7, "trade_codes": ["De", "Ri"], "bases": [], "allegiance": "Im", "travel_zone": "Green", "gas_giants": 1, "global_x": -108, "global_y": -30, "pbg": "812", "stars": "K2 V" },
+        { "hex": "1911", "name": "Forboldn", "uwp": "E893610-5", "starport": "E", "tech_level": 5, "law_level": 0, "trade_codes": ["Ni", "Lt"], "bases": [], "allegiance": "Im", "travel_zone": "Amber", "gas_giants": 1, "global_x": -109, "global_y": -29, "pbg": "411", "stars": "G8 V" },
+        { "hex": "1705", "name": "Efate", "uwp": "A646930-D", "starport": "A", "tech_level": 13, "law_level": 0, "trade_codes": ["Hi", "In", "Ht"], "bases": ["N"], "allegiance": "Im", "travel_zone": "Green", "gas_giants": 1, "global_x": -111, "global_y": -35, "pbg": "323", "stars": "F9 V" },
+        { "hex": "2106", "name": "Pixie", "uwp": "A100103-D", "starport": "A", "tech_level": 13, "law_level": 3, "trade_codes": ["Lo", "Va", "Ht"], "bases": [], "allegiance": "Im", "travel_zone": "Green", "gas_giants": 1, "global_x": -107, "global_y": -34, "pbg": "112", "stars": "M3 V" },
+        { "hex": "1904", "name": "Boughene", "uwp": "A8B3531-D", "starport": "A", "tech_level": 13, "law_level": 1, "trade_codes": ["Fl", "Ni", "Ht"], "bases": ["S"], "allegiance": "Im", "travel_zone": "Green", "gas_giants": 1, "global_x": -109, "global_y": -36, "pbg": "602", "stars": "K0 V" }
+      ]
+    }
+  ]
+}

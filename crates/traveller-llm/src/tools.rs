@@ -4,11 +4,25 @@ use serde_json::{json, Value};
 use traveller_db::Db;
 use traveller_rules::calendar::{compute_advance, roll_jump_duration_hours};
 use traveller_rules::character::{Characteristic, CharacterKind};
+use traveller_rules::combat_personal::{
+    next_personal_round, resolve_personal_attack, start_personal_combat, PersonalAttackInput,
+    PersonalCombatState, PersonalCombatant, PersonalRangeBand, PersonalWeapon, ReactionKind,
+};
+use traveller_rules::combat_space::{
+    acquire_sensor_lock, advance_space_round, allocate_maneuver_thrust, ew_jam_missiles,
+    launch_missile_salvo, resolve_space_attack, start_space_combat, SpaceCombatShip,
+    SpaceCombatState, SpaceRangeBand, SpaceWeaponAttackInput,
+};
+use traveller_rules::commerce::{check_item_availability, AvailabilityInput, LegalityCategory};
+use traveller_rules::crew::generate_hiring_hall;
 use traveller_rules::dice::{resolve_task, roll_d66, roll_nd6, Difficulty, ModifierItem, RollMode};
+use traveller_rules::finance::AccountKind;
 use traveller_rules::sensors::{resolve_sensor_detection, SensorContext, SensorDetectionInput};
 use traveller_rules::ship::{
     compute_running_costs, roll_poor_maintenance, validate_ship, SensorGrade,
 };
+use traveller_rules::trade::{generate_world_market, roll_speculative_sale};
+use traveller_rules::universe::{parse_uwp, plan_jump_route, RouteNode};
 use uuid::Uuid;
 
 use crate::hindsight::HindsightClient;
@@ -54,7 +68,7 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "context": {"type": "string", "enum": ["space_initial_detection", "space_stealthed_reacquire", "personal_ground"], "default": "space_initial_detection"},
-                    "operator_character_id": {"type": "string", "description": "Optional character UUID to pull EDU DM, Electronics (sensors), and Neural Jack bonuses automatically."},
+                    "operator_character_id": {"type": "string"},
                     "observer_sensor_grade": {"type": "string", "enum": ["basic", "civilian", "military", "improved", "advanced"], "default": "civilian"},
                     "observer_tl": {"type": "integer", "default": 12},
                     "observer_extended_array": {"type": "boolean", "default": false},
@@ -73,17 +87,158 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "explore_universe",
+            "description": "Search Charted Space systems (all 512 sectors), inspect world UWP/trade codes/starport/gas giants, plot a Jump-1..6 A* route, or execute a jump to a destination system (burning jump fuel and advancing 148 + 6D6 hours).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["search", "route", "jump_to"]},
+                    "query": {"type": "string", "description": "World/sector name or hex for 'search'."},
+                    "trade_code": {"type": "string", "description": "Optional 2-letter trade code filter (e.g. 'Hi', 'In', 'Ri', 'Ag')."},
+                    "from_system": {"type": "string", "description": "Origin system name (defaults to campaign current system)."},
+                    "to_system": {"type": "string", "description": "Destination system name for 'route' or 'jump_to'."},
+                    "jump_rating": {"type": "integer", "default": 1},
+                    "ship_id": {"type": "string", "description": "Optional ship UUID for 'jump_to' fuel deduction."}
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "trade_ops",
+            "description": "Core 2022 Trade System: generate a world's Freight, Passengers, Mail, and Speculative Trade market; buy speculative goods into a ship's cargo hold (deducting from Company account); or sell cargo from the hold on the current world.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["market", "buy_cargo", "sell_cargo"]},
+                    "dest_system": {"type": "string", "description": "Target system name for freight/passenger calculation."},
+                    "parsecs": {"type": "integer", "default": 1},
+                    "broker_skill": {"type": "integer", "default": 1},
+                    "steward_skill": {"type": "integer", "default": 0},
+                    "include_illegal": {"type": "boolean", "default": false},
+                    "ship_id": {"type": "string"},
+                    "d66": {"type": "integer", "description": "D66 code of trade good (11..65) for buy_cargo or sell_cargo."},
+                    "good_name": {"type": "string"},
+                    "tons": {"type": "integer"},
+                    "unit_price_cr": {"type": "integer"}
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "shop_market",
+            "description": "Search the complete MgT2e item catalog (CSC 2023 / Core 2022 / Vehicles / Robots), run exact CSC 2023 Availability & Black Market checks with Law Enforcement response, and purchase items from Personal or Company accounts into character inventory.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["search", "check_availability", "purchase"]},
+                    "query": {"type": "string"},
+                    "category": {"type": "string", "description": "weapon, armor, augment, software, electronics, medical, vehicle, robot_drone, equipment"},
+                    "max_tl": {"type": "integer"},
+                    "item_id": {"type": "string"},
+                    "black_market": {"type": "boolean", "default": false},
+                    "willing_price_multiplier": {"type": "integer", "default": 1},
+                    "skill_dm": {"type": "integer", "default": 0},
+                    "stat_dm": {"type": "integer", "default": 0},
+                    "account_id": {"type": "string"},
+                    "character_id": {"type": "string"},
+                    "quantity": {"type": "integer", "default": 1},
+                    "unit_price_cr": {"type": "integer"}
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "hire_crew",
+            "description": "Generate Starport Hiring Hall crew candidates (using MgT2e lifepath careers & Core 2022 salaries) or hire a candidate onto a ship station (automatically adding their monthly salary to 4-week payroll).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["hiring_hall", "hire"]},
+                    "roles": {"type": "array", "items": {"type": "string"}, "description": "e.g. ['Pilot', 'Engineer', 'Gunner', 'Medic']"},
+                    "name": {"type": "string"},
+                    "role": {"type": "string"},
+                    "salary_cr": {"type": "integer"},
+                    "ship_id": {"type": "string"}
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "personal_combat",
+            "description": "Core 2022 6-second personal combat tracker: start combat, resolve attacks (ammo, range, cover, aim, reactions, armor-AP, END->DEX->STR damage & unconsciousness/death), advance round, or end combat.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["start", "attack", "next_round", "end"]},
+                    "combatants": {"type": "array", "items": {"type": "object"}},
+                    "attacker_id": {"type": "string"},
+                    "defender_id": {"type": "string"},
+                    "burst_mode": {"type": "boolean", "default": false},
+                    "reaction": {"type": "string", "enum": ["none", "dodge", "parry", "dive_for_cover"], "default": "none"},
+                    "defender_reaction_dm": {"type": "integer", "default": 0},
+                    "extra_dm": {"type": "integer", "default": 0}
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "space_combat",
+            "description": "Core 2022 / High Guard 2024 6-minute spacecraft combat: start combat, allocate Thrust Pool (range shift, evasive action, aid gunners), fire linked turrets/barbettes (sandcasters, armor, 2D x Severity 1-6 Critical Hits on Effect 6+ and 10% hull loss), launch missiles, EW jam missiles, Sensor Lock (+2), advance round, or end combat.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["start", "maneuver", "fire", "launch_missiles", "ew_jam", "sensor_lock", "next_round", "end"]},
+                    "range_band": {"type": "string", "enum": ["adjacent", "close", "short", "medium", "long", "very_long", "distant"], "default": "long"},
+                    "ships": {"type": "array", "items": {"type": "object"}},
+                    "ship_id": {"type": "string"},
+                    "target_ship_id": {"type": "string"},
+                    "thrust_to_range": {"type": "integer", "default": 0},
+                    "thrust_to_evade": {"type": "integer", "default": 0},
+                    "pilot_skill": {"type": "integer", "default": 1},
+                    "aid_gunners": {"type": "boolean", "default": false},
+                    "weapon_name": {"type": "string", "default": "Pulse Laser"},
+                    "linked_count": {"type": "integer", "default": 1},
+                    "damage_dice": {"type": "integer", "default": 2},
+                    "is_laser": {"type": "boolean", "default": true},
+                    "gunner_skill": {"type": "integer", "default": 1},
+                    "gunner_dex_dm": {"type": "integer", "default": 0},
+                    "fire_control_dm": {"type": "integer", "default": 0},
+                    "sandcaster_count": {"type": "integer", "default": 0},
+                    "missile_count": {"type": "integer", "default": 3},
+                    "smart_tl": {"type": "integer", "default": 12},
+                    "salvo_id": {"type": "string"},
+                    "sensors_skill": {"type": "integer", "default": 1},
+                    "edu_dm": {"type": "integer", "default": 0}
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
             "name": "advance_time",
-            "description": "Advance the Imperial Calendar (DDD-YYYY HH:MM) by minutes/hours/days or execute a 1-week Jump (148 + 6D6 hours). When a 28-day Maintenance Period passes and pay_maintenance_periods=true, this tool AUTOMATICALLY debits ship mortgages, 0.1%/yr maintenance, life support, and crew salaries from the Company account — NEVER call record_transaction again for those bills.",
+            "description": "Advance the Imperial Calendar (DDD-YYYY HH:MM) by minutes/hours/days or execute a 1-week Jump (148 + 6D6 hours). Automatically completes due scheduled events AND when a 28-day Maintenance Period passes with pay_maintenance_periods=true, AUTOMATICALLY debits ship mortgages, 0.1%/yr maintenance, life support, and crew salaries from the Company account — NEVER call record_transaction again for those bills.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "minutes": {"type": "integer", "default": 0},
                     "hours": {"type": "integer", "default": 0},
                     "days": {"type": "integer", "default": 0},
-                    "execute_jump": {"type": "boolean", "default": false, "description": "Roll 148 + 6D6 hours jump transit."},
-                    "pay_maintenance_periods": {"type": "boolean", "default": true, "description": "If false when a 28-day Maintenance Period passes, skips payment and triggers arrears / Poor Maintenance checks."}
+                    "execute_jump": {"type": "boolean", "default": false},
+                    "pay_maintenance_periods": {"type": "boolean", "default": true}
                 }
+            }
+        }),
+        json!({
+            "name": "schedule_event",
+            "description": "Schedule a future event/deadline/delivery on the Imperial Calendar (hours/days from now). Automatically triggers when advance_time crosses it.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "kind": {"type": "string", "default": "story"},
+                    "hours_from_now": {"type": "integer", "default": 0},
+                    "days_from_now": {"type": "integer", "default": 0}
+                },
+                "required": ["title"]
             }
         }),
         json!({
@@ -92,9 +247,9 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "account_id": {"type": "string", "description": "UUID of the target account."},
-                    "amount_cr": {"type": "integer", "description": "Positive for income/deposit, negative for expense."},
-                    "category": {"type": "string", "description": "e.g. trade, fuel, berthing, purchase, salary, mortgage, maintenance, transfer."},
+                    "account_id": {"type": "string"},
+                    "amount_cr": {"type": "integer"},
+                    "category": {"type": "string"},
                     "description": {"type": "string"},
                     "counterparty": {"type": "string", "default": ""}
                 },
@@ -108,7 +263,7 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "character_id": {"type": "string"},
-                    "skill": {"type": "string", "description": "Skill name for per-skill Dedicated XP. Omit to award General XP."},
+                    "skill": {"type": "string"},
                     "amount": {"type": "integer", "default": 1},
                     "reason": {"type": "string"}
                 },
@@ -133,7 +288,7 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "section": {"type": "string", "enum": ["who_knows_what", "settled", "people", "threads"]},
-                    "text": {"type": "string", "description": "Full concise replacement text for this section (max 1800 chars)."}
+                    "text": {"type": "string"}
                 },
                 "required": ["section", "text"]
             }
@@ -144,7 +299,7 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "correction": {"type": "string", "description": "One-sentence corrected fact to lock into settled facts."}
+                    "correction": {"type": "string"}
                 },
                 "required": ["correction"]
             }
@@ -158,14 +313,13 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "What to recall from campaign history."}
+                    "query": {"type": "string"}
                 },
                 "required": ["query"]
             }
         }));
     }
 
-    // Place prompt-cache breakpoint on the final tool definition (anthropic-pipe parity)
     if let Some(last) = specs.last_mut() {
         last["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
     }
@@ -237,13 +391,12 @@ pub async fn execute_tool(
 
             let mut xp_awarded = None;
             let mut state_changed = false;
-            if award_xp
-                && let Some(sk) = skill {
-                    let new_xp = row.character.award_skill_xp(sk, 1);
-                    db.save_character(&row.character, &row.equipment).await?;
-                    xp_awarded = Some(json!({"skill": sk, "dedicated_xp_total": new_xp}));
-                    state_changed = true;
-                }
+            if award_xp && let Some(sk) = skill {
+                let new_xp = row.character.award_skill_xp(sk, 1);
+                db.save_character(&row.character, &row.equipment).await?;
+                xp_awarded = Some(json!({"skill": sk, "dedicated_xp_total": new_xp}));
+                state_changed = true;
+            }
 
             Ok(ToolExecutionResult {
                 output_json: serde_json::to_string(&json!({
@@ -261,15 +414,18 @@ pub async fn execute_tool(
         "roll_dice" => {
             let kind = input.get("kind").and_then(|v| v.as_str()).unwrap_or("nd6");
             let dm = input.get("dm").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            let mut r = rng();
-            let out = if kind == "d66" {
-                let d66 = roll_d66(&mut r);
-                json!({"kind": "d66", "result": d66, "reason": input.get("reason")})
-            } else {
-                let count = input.get("count").and_then(|v| v.as_u64()).unwrap_or(2).clamp(1, 20) as usize;
-                let dice = roll_nd6(&mut r, count);
-                let sum: i32 = dice.iter().map(|&d| i32::from(d)).sum();
-                json!({"kind": format!("{count}D6"), "dice": dice, "dm": dm, "total": sum + dm, "reason": input.get("reason")})
+            let out = {
+                let mut r = rng();
+                if kind == "d66" {
+                    let d66 = roll_d66(&mut r);
+                    json!({"kind": "d66", "result": d66, "reason": input.get("reason")})
+                } else {
+                    let count =
+                        input.get("count").and_then(|v| v.as_u64()).unwrap_or(2).clamp(1, 20) as usize;
+                    let dice = roll_nd6(&mut r, count);
+                    let sum: i32 = dice.iter().map(|&d| i32::from(d)).sum();
+                    json!({"kind": format!("{count}D6"), "dice": dice, "dm": dm, "total": sum + dm, "reason": input.get("reason")})
+                }
             };
             Ok(ToolExecutionResult {
                 output_json: serde_json::to_string(&out)?,
@@ -302,16 +458,17 @@ pub async fn execute_tool(
             let (mut edu_dm, mut skill_lvl, mut aug_dm) = (0, 0, 0);
             if let Some(cid_str) = input.get("operator_character_id").and_then(|v| v.as_str())
                 && let Ok(cid) = Uuid::parse_str(cid_str)
-                    && let Some(row) = db.get_character(campaign_id, cid).await? {
-                        let mods = row.character.task_modifiers(
-                            Some("Electronics (sensors)"),
-                            Characteristic::Edu,
-                            Difficulty::Average,
-                        );
-                        edu_dm = mods.first().map(|m| m.value).unwrap_or(0);
-                        skill_lvl = mods.get(1).map(|m| m.value).unwrap_or(-3);
-                        aug_dm = mods.iter().skip(2).map(|m| m.value).sum();
-                    }
+                && let Some(row) = db.get_character(campaign_id, cid).await?
+            {
+                let mods = row.character.task_modifiers(
+                    Some("Electronics (sensors)"),
+                    Characteristic::Edu,
+                    Difficulty::Average,
+                );
+                edu_dm = mods.first().map(|m| m.value).unwrap_or(0);
+                skill_lvl = mods.get(1).map(|m| m.value).unwrap_or(-3);
+                aug_dm = mods.iter().skip(2).map(|m| m.value).sum();
+            }
 
             let req = SensorDetectionInput {
                 context,
@@ -364,11 +521,930 @@ pub async fn execute_tool(
                 roll_mode: RollMode::Normal,
             };
 
-            let mut r = rng();
-            let res = resolve_sensor_detection(&mut r, &req);
+            let res = {
+                let mut r = rng();
+                resolve_sensor_detection(&mut r, &req)
+            };
             Ok(ToolExecutionResult {
                 output_json: serde_json::to_string(&res)?,
                 state_changed: false,
+            })
+        }
+
+        "explore_universe" => {
+            let action = input
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("search");
+            match action {
+                "search" => {
+                    let systems = db
+                        .search_systems(
+                            input.get("query").and_then(|v| v.as_str()),
+                            input.get("trade_code").and_then(|v| v.as_str()),
+                            25,
+                        )
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({ "systems": systems }))?,
+                        state_changed: false,
+                    })
+                }
+                "route" => {
+                    let camp = db
+                        .get_campaign(campaign_id)
+                        .await?
+                        .context("Campaign not found")?;
+                    let from_name = input
+                        .get("from_system")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&camp.current_system_name);
+                    let to_name = input
+                        .get("to_system")
+                        .and_then(|v| v.as_str())
+                        .context("to_system required")?;
+                    let jump_rating =
+                        input.get("jump_rating").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
+
+                    let from = db
+                        .get_system_by_name(from_name)
+                        .await?
+                        .with_context(|| format!("Origin system '{from_name}' not found"))?;
+                    let to = db
+                        .get_system_by_name(to_name)
+                        .await?
+                        .with_context(|| format!("Destination system '{to_name}' not found"))?;
+
+                    let pad = 8;
+                    let box_sys = db
+                        .list_systems_in_box(
+                            from.global_x.min(to.global_x) - pad,
+                            from.global_x.max(to.global_x) + pad,
+                            from.global_y.min(to.global_y) - pad,
+                            from.global_y.max(to.global_y) + pad,
+                        )
+                        .await?;
+                    let nodes: Vec<RouteNode> = box_sys
+                        .into_iter()
+                        .map(|s| RouteNode {
+                            id: s.id,
+                            name: s.name,
+                            hex: s.hex,
+                            uwp: s.uwp,
+                            starport: s.starport.chars().next().unwrap_or('X'),
+                            gas_giants: s.gas_giants,
+                            travel_zone: s.travel_zone,
+                            global_x: s.global_x,
+                            global_y: s.global_y,
+                        })
+                        .collect();
+                    let route = plan_jump_route(&nodes, from.id, to.id, jump_rating, true, true);
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({ "route": route }))?,
+                        state_changed: false,
+                    })
+                }
+                "jump_to" => {
+                    let to_name = input
+                        .get("to_system")
+                        .and_then(|v| v.as_str())
+                        .context("to_system required")?;
+                    let dest = db
+                        .get_system_by_name(to_name)
+                        .await?
+                        .with_context(|| format!("Destination system '{to_name}' not found"))?;
+
+                    // Deduct jump fuel from active ship if present
+                    let mut ships = db.list_ships(campaign_id).await?;
+                    let mut fuel_burned = 0.0;
+                    if let Some(ship) = ships.first_mut() {
+                        let req_fuel =
+                            f64::from(ship.spec.tonnage) * 0.10 * f64::from(ship.spec.jump_rating.max(1));
+                        let total_fuel = ship.fuel_refined + ship.fuel_unrefined;
+                        if total_fuel + 0.01 < req_fuel {
+                            anyhow::bail!(
+                                "{} needs {:.1}t fuel for Jump-{}, only has {:.1}t!",
+                                ship.name,
+                                req_fuel,
+                                ship.spec.jump_rating,
+                                total_fuel
+                            );
+                        }
+                        let from_ref = ship.fuel_refined.min(req_fuel);
+                        ship.fuel_refined -= from_ref;
+                        ship.fuel_unrefined = (ship.fuel_unrefined - (req_fuel - from_ref)).max(0.0);
+                        ship.docked_system_name = dest.name.clone();
+                        db.save_ship(ship).await?;
+                        fuel_burned = req_fuel;
+                    }
+
+                    db.update_campaign_system(campaign_id, &dest.name, &dest.uwp, Some(dest.id))
+                        .await?;
+                    let time_res = Box::pin(execute_tool(
+                        db,
+                        hindsight,
+                        campaign_id,
+                        "advance_time",
+                        &json!({"execute_jump": true, "pay_maintenance_periods": true}),
+                    ))
+                    .await?;
+                    let time_json: Value = serde_json::from_str(&time_res.output_json)?;
+
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({
+                            "arrived_system": dest,
+                            "fuel_burned_tons": fuel_burned,
+                            "time_advance": time_json
+                        }))?,
+                        state_changed: true,
+                    })
+                }
+                other => anyhow::bail!("Unknown explore_universe action '{other}'"),
+            }
+        }
+
+        "trade_ops" => {
+            let camp = db
+                .get_campaign(campaign_id)
+                .await?
+                .context("Campaign not found")?;
+            let action = input
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("market");
+            let origin_uwp = parse_uwp(&camp.current_system_uwp)?;
+
+            match action {
+                "market" => {
+                    let dest_name = input
+                        .get("dest_system")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Roup");
+                    let dest_uwp = if let Some(s) = db.get_system_by_name(dest_name).await? {
+                        parse_uwp(&s.uwp).unwrap_or_else(|_| origin_uwp.clone())
+                    } else {
+                        origin_uwp.clone()
+                    };
+                    let parsecs = input.get("parsecs").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
+                    let broker = input.get("broker_skill").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                    let steward = input.get("steward_skill").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    let illegal = input.get("include_illegal").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                    let market = {
+                        let mut r = rng();
+                        generate_world_market(
+                            &mut r,
+                            &camp.current_system_name,
+                            &origin_uwp,
+                            "Green",
+                            dest_name,
+                            &dest_uwp,
+                            parsecs,
+                            broker,
+                            steward,
+                            illegal,
+                        )
+                    };
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&market)?,
+                        state_changed: false,
+                    })
+                }
+                "buy_cargo" => {
+                    let d66 = input.get("d66").and_then(|v| v.as_u64()).context("d66 required")? as u8;
+                    let good_name = input
+                        .get("good_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Speculative Cargo");
+                    let tons = input.get("tons").and_then(|v| v.as_u64()).context("tons required")? as u32;
+                    let unit_price = input
+                        .get("unit_price_cr")
+                        .and_then(|v| v.as_i64())
+                        .context("unit_price_cr required")?;
+                    let total_cost = i64::from(tons) * unit_price;
+
+                    let mut ships = db.list_ships(campaign_id).await?;
+                    let ship = ships.first_mut().context("No ship owned")?;
+                    let used_tons: f64 = ship
+                        .cargo
+                        .iter()
+                        .filter_map(|c| c.get("tons").and_then(|v| v.as_f64()))
+                        .sum();
+                    if used_tons + f64::from(tons) > ship.spec.cargo_capacity_tons + 0.01 {
+                        anyhow::bail!(
+                            "Insufficient cargo hold: {:.1}t used + {}t > {:.1}t cap",
+                            used_tons,
+                            tons,
+                            ship.spec.cargo_capacity_tons
+                        );
+                    }
+
+                    let accounts = db.list_accounts(campaign_id).await?;
+                    let company = accounts
+                        .iter()
+                        .find(|a| a.kind == AccountKind::Company)
+                        .context("Company account not found")?;
+                    let tx = db
+                        .post_transaction(
+                            campaign_id,
+                            company.id,
+                            &camp.date.format_date_only(),
+                            -total_cost,
+                            "trade_buy",
+                            &format!("Bought {tons}t {good_name} @ Cr{unit_price}/t on {}", camp.current_system_name),
+                            &camp.current_system_name,
+                        )
+                        .await?;
+                    ship.cargo.push(json!({
+                        "d66": d66,
+                        "name": good_name,
+                        "tons": tons,
+                        "unit_cost_cr": unit_price,
+                        "origin": camp.current_system_name
+                    }));
+                    db.save_ship(ship).await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({
+                            "purchased": {"d66": d66, "name": good_name, "tons": tons, "total_cost_cr": total_cost},
+                            "balance_after_cr": tx.balance_after_cr
+                        }))?,
+                        state_changed: true,
+                    })
+                }
+                "sell_cargo" => {
+                    let d66 = input.get("d66").and_then(|v| v.as_u64()).context("d66 required")? as u8;
+                    let broker = input.get("broker_skill").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                    let mut ships = db.list_ships(campaign_id).await?;
+                    let ship = ships.first_mut().context("No ship owned")?;
+                    let idx = ship
+                        .cargo
+                        .iter()
+                        .position(|c| c.get("d66").and_then(|v| v.as_u64()) == Some(u64::from(d66)))
+                        .context("No matching cargo lot in ship hold")?;
+                    let lot = ship.cargo.remove(idx);
+                    let tons = lot.get("tons").and_then(|v| v.as_i64()).unwrap_or(1);
+                    let cost_basis = lot.get("unit_cost_cr").and_then(|v| v.as_i64()).unwrap_or(0) * tons;
+                    let lot_name = lot
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Cargo")
+                        .to_string();
+
+                    let (sale_pct, unit_sale, roll_total) = {
+                        let mut r = rng();
+                        roll_speculative_sale(&mut r, d66, &origin_uwp, "Green", broker, 2)
+                            .context("Invalid trade good d66")?
+                    };
+                    let proceeds = unit_sale * tons;
+                    let profit = proceeds - cost_basis;
+
+                    let accounts = db.list_accounts(campaign_id).await?;
+                    let company = accounts
+                        .iter()
+                        .find(|a| a.kind == AccountKind::Company)
+                        .context("Company account not found")?;
+                    let tx = db
+                        .post_transaction(
+                            campaign_id,
+                            company.id,
+                            &camp.date.format_date_only(),
+                            proceeds,
+                            "trade_sell",
+                            &format!("Sold {tons}t {lot_name} @ Cr{unit_sale}/t ({sale_pct}%, profit Cr{profit:+})"),
+                            &camp.current_system_name,
+                        )
+                        .await?;
+                    db.save_ship(ship).await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({
+                            "sold": lot_name,
+                            "tons": tons,
+                            "sale_percent": sale_pct,
+                            "price_roll": roll_total,
+                            "unit_price_cr": unit_sale,
+                            "proceeds_cr": proceeds,
+                            "profit_cr": profit,
+                            "balance_after_cr": tx.balance_after_cr
+                        }))?,
+                        state_changed: true,
+                    })
+                }
+                other => anyhow::bail!("Unknown trade_ops action '{other}'"),
+            }
+        }
+
+        "shop_market" => {
+            let camp = db
+                .get_campaign(campaign_id)
+                .await?
+                .context("Campaign not found")?;
+            let action = input
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("search");
+            match action {
+                "search" => {
+                    let items = db
+                        .search_items(
+                            input.get("query").and_then(|v| v.as_str()),
+                            input.get("category").and_then(|v| v.as_str()),
+                            input.get("max_tl").and_then(|v| v.as_i64()).map(|x| x as i16),
+                            25,
+                        )
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({ "items": items }))?,
+                        state_changed: false,
+                    })
+                }
+                "check_availability" => {
+                    let item_id = Uuid::parse_str(
+                        input
+                            .get("item_id")
+                            .and_then(|v| v.as_str())
+                            .context("item_id required")?,
+                    )?;
+                    let item = db.get_item(item_id).await?.context("Item not found")?;
+                    let world = parse_uwp(&camp.current_system_uwp)?;
+                    let cat = match item.law_restriction {
+                        0..=1 => LegalityCategory::Category5RestrictedMilitary,
+                        2..=3 => LegalityCategory::Category4Military,
+                        4..=5 => LegalityCategory::Category3Paramilitary,
+                        6..=7 => LegalityCategory::Category2Civilian,
+                        _ => LegalityCategory::Category1Unrestricted,
+                    };
+                    let req = AvailabilityInput {
+                        item_name: item.name.clone(),
+                        item_tl: item.tl as u8,
+                        base_cost_cr: item.cost_cr,
+                        specialized: item.category == "augment" || item.category == "software",
+                        military_use: item.law_restriction <= 3,
+                        category: cat,
+                        black_market: input
+                            .get("black_market")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        willing_price_multiplier: input
+                            .get("willing_price_multiplier")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(1) as u8,
+                        previous_attempts_this_month: 0,
+                        skill_dm: input.get("skill_dm").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        stat_dm: input.get("stat_dm").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        referee_dm: 0,
+                    };
+                    let res = {
+                        let mut r = rng();
+                        check_item_availability(&mut r, &world, &req)
+                    };
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&res)?,
+                        state_changed: false,
+                    })
+                }
+                "purchase" => {
+                    let item_id = Uuid::parse_str(
+                        input
+                            .get("item_id")
+                            .and_then(|v| v.as_str())
+                            .context("item_id required")?,
+                    )?;
+                    let item = db.get_item(item_id).await?.context("Item not found")?;
+                    let qty = input.get("quantity").and_then(|v| v.as_i64()).unwrap_or(1).max(1);
+                    let unit_price = input
+                        .get("unit_price_cr")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(item.cost_cr);
+                    let total = unit_price * qty;
+
+                    let accounts = db.list_accounts(campaign_id).await?;
+                    let acc_id = if let Some(s) = input.get("account_id").and_then(|v| v.as_str()) {
+                        Uuid::parse_str(s)?
+                    } else {
+                        accounts
+                            .iter()
+                            .find(|a| a.kind == AccountKind::Personal)
+                            .or_else(|| accounts.first())
+                            .context("No account found")?
+                            .id
+                    };
+                    let tx = db
+                        .post_transaction(
+                            campaign_id,
+                            acc_id,
+                            &camp.date.format_date_only(),
+                            -total,
+                            "purchase",
+                            &format!("Purchased {qty}x {} @ Cr{}", item.name, unit_price),
+                            &camp.current_system_name,
+                        )
+                        .await?;
+                    if let Some(cid_s) = input.get("character_id").and_then(|v| v.as_str())
+                        && let Ok(cid) = Uuid::parse_str(cid_s)
+                        && let Some(mut row) = db.get_character(campaign_id, cid).await?
+                    {
+                        row.equipment.push(json!({
+                            "item_id": item.id,
+                            "name": item.name,
+                            "category": item.category,
+                            "tl": item.tl,
+                            "quantity": qty,
+                            "mass_kg": item.mass_kg,
+                            "stats": item.stats,
+                            "equipped": true
+                        }));
+                        db.save_character(&row.character, &row.equipment).await?;
+                    }
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({
+                            "item": item.name,
+                            "quantity": qty,
+                            "total_cr": total,
+                            "balance_after_cr": tx.balance_after_cr
+                        }))?,
+                        state_changed: true,
+                    })
+                }
+                other => anyhow::bail!("Unknown shop_market action '{other}'"),
+            }
+        }
+
+        "hire_crew" => {
+            let camp = db
+                .get_campaign(campaign_id)
+                .await?
+                .context("Campaign not found")?;
+            let action = input
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("hiring_hall");
+            let world = parse_uwp(&camp.current_system_uwp)?;
+            match action {
+                "hiring_hall" => {
+                    let roles: Vec<String> = input
+                        .get("roles")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    let pool = {
+                        let mut r = rng();
+                        generate_hiring_hall(&mut r, campaign_id, &world, &roles)
+                    };
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({ "candidates": pool }))?,
+                        state_changed: false,
+                    })
+                }
+                "hire" => {
+                    let role = input.get("role").and_then(|v| v.as_str()).unwrap_or("Engineer");
+                    let roles = vec![role.to_string()];
+                    let mut cand = {
+                        let mut r = rng();
+                        generate_hiring_hall(&mut r, campaign_id, &world, &roles)
+                            .into_iter()
+                            .next()
+                            .context("Failed to generate crew candidate")?
+                    };
+                    if let Some(n) = input.get("name").and_then(|v| v.as_str()) {
+                        cand.character.name = n.to_string();
+                    }
+                    if let Some(sal) = input.get("salary_cr").and_then(|v| v.as_i64()) {
+                        cand.character.salary_cr = sal;
+                    }
+                    let ships = db.list_ships(campaign_id).await?;
+                    let ship_id = input
+                        .get("ship_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                        .or_else(|| ships.first().map(|s| s.id));
+
+                    let created = db
+                        .create_character(
+                            campaign_id,
+                            traveller_db::NewCharacterInput {
+                                kind: CharacterKind::Crew,
+                                name: cand.character.name,
+                                species: cand.character.species,
+                                age: cand.character.age,
+                                upp: cand.character.upp_max,
+                                skills: cand.character.skills,
+                                augments: vec![],
+                                salary_cr: cand.character.salary_cr,
+                                assigned_ship_id: ship_id,
+                                assigned_station: Some(role.to_string()),
+                                notes: cand.character.notes,
+                            },
+                        )
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&json!({ "hired": created }))?,
+                        state_changed: true,
+                    })
+                }
+                other => anyhow::bail!("Unknown hire_crew action '{other}'"),
+            }
+        }
+
+        "personal_combat" => {
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("start");
+            match action {
+                "start" => {
+                    let mut combatants: Vec<PersonalCombatant> =
+                        if let Some(arr) = input.get("combatants").and_then(|v| v.as_array()) {
+                            arr.iter()
+                                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                                .collect()
+                        } else {
+                            vec![]
+                        };
+                    if combatants.is_empty() {
+                        // Auto-seed party characters from DB
+                        for row in db.list_characters(campaign_id).await? {
+                            let c = row.character;
+                            combatants.push(PersonalCombatant {
+                                character_id: c.id,
+                                name: c.name,
+                                side: if c.kind == CharacterKind::Npc { "hostile".into() } else { "party".into() },
+                                initiative: 0,
+                                next_round_init_penalty: 0,
+                                armor: 4,
+                                cover_dm: 0,
+                                aim_bonus: 0,
+                                range_band: PersonalRangeBand::Medium,
+                                weapon: PersonalWeapon {
+                                    name: "Autopistol".into(),
+                                    skill: "Gun Combat (Slug)".into(),
+                                    range_m: 10,
+                                    damage_dice: 3,
+                                    damage_bonus: -3,
+                                    ap: 0,
+                                    auto_rating: 0,
+                                    stun: false,
+                                    magazine_current: 15,
+                                    magazine_max: 15,
+                                },
+                                conscious: true,
+                                alive: true,
+                                str_cur: c.upp_current.str_val,
+                                dex_cur: c.upp_current.dex_val,
+                                end_cur: c.upp_current.end_val,
+                            });
+                        }
+                    }
+                    let state = {
+                        let mut r = rng();
+                        start_personal_combat(&mut r, combatants, 0, 0)
+                    };
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(state.id, campaign_id, "personal", "active", 1, "active", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&state)?,
+                        state_changed: true,
+                    })
+                }
+                "attack" => {
+                    let rec = db
+                        .get_active_combat(campaign_id, "personal")
+                        .await?
+                        .context("No active personal combat")?;
+                    let mut state: PersonalCombatState = serde_json::from_value(rec.state)?;
+                    let atk_id = Uuid::parse_str(
+                        input.get("attacker_id").and_then(|v| v.as_str()).context("attacker_id required")?,
+                    )?;
+                    let def_id = Uuid::parse_str(
+                        input.get("defender_id").and_then(|v| v.as_str()).context("defender_id required")?,
+                    )?;
+                    let reaction = match input.get("reaction").and_then(|v| v.as_str()).unwrap_or("none") {
+                        "dodge" => ReactionKind::Dodge,
+                        "parry" => ReactionKind::Parry,
+                        "dive_for_cover" => ReactionKind::DiveForCover,
+                        _ => ReactionKind::None,
+                    };
+                    let atk_char = db
+                        .get_character(campaign_id, atk_id)
+                        .await?
+                        .map(|r| r.character);
+                    let res = {
+                        let mut r = rng();
+                        resolve_personal_attack(
+                            &mut r,
+                            &mut state,
+                            atk_char.as_ref(),
+                            &PersonalAttackInput {
+                                attacker_id: atk_id,
+                                defender_id: def_id,
+                                burst_mode: input.get("burst_mode").and_then(|v| v.as_bool()).unwrap_or(false),
+                                reaction,
+                                defender_reaction_dm: input.get("defender_reaction_dm").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                                extra_dm: input.get("extra_dm").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                            },
+                        )?
+                    };
+                    // Sync defender wounds back to characters table if they're a tracked character
+                    if let Some(def_c) = state.combatants.iter().find(|c| c.character_id == def_id)
+                        && let Some(mut row) = db.get_character(campaign_id, def_id).await?
+                    {
+                        row.character.upp_current.end_val = def_c.end_cur;
+                        row.character.upp_current.dex_val = def_c.dex_cur;
+                        row.character.upp_current.str_val = def_c.str_cur;
+                        db.save_character(&row.character, &row.equipment).await?;
+                    }
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(rec.id, campaign_id, "personal", "active", state.round as i32, "active", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&res)?,
+                        state_changed: true,
+                    })
+                }
+                "next_round" => {
+                    let rec = db
+                        .get_active_combat(campaign_id, "personal")
+                        .await?
+                        .context("No active personal combat")?;
+                    let mut state: PersonalCombatState = serde_json::from_value(rec.state)?;
+                    next_personal_round(&mut state);
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(rec.id, campaign_id, "personal", "active", state.round as i32, "active", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&state)?,
+                        state_changed: true,
+                    })
+                }
+                "end" => {
+                    if let Some(rec) = db.get_active_combat(campaign_id, "personal").await? {
+                        db.upsert_combat(rec.id, campaign_id, "personal", "ended", rec.round, "ended", &rec.state)
+                            .await?;
+                    }
+                    Ok(ToolExecutionResult {
+                        output_json: json!({"status": "ended"}).to_string(),
+                        state_changed: true,
+                    })
+                }
+                other => anyhow::bail!("Unknown personal_combat action '{other}'"),
+            }
+        }
+
+        "space_combat" => {
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("start");
+            match action {
+                "start" => {
+                    let range_band: SpaceRangeBand = serde_json::from_value(
+                        input.get("range_band").cloned().unwrap_or_else(|| json!("long")),
+                    )
+                    .unwrap_or(SpaceRangeBand::Long);
+                    let mut ships_list: Vec<SpaceCombatShip> =
+                        if let Some(arr) = input.get("ships").and_then(|v| v.as_array()) {
+                            arr.iter()
+                                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                                .collect()
+                        } else {
+                            vec![]
+                        };
+                    if ships_list.is_empty() {
+                        for s in db.list_ships(campaign_id).await? {
+                            ships_list.push(SpaceCombatShip {
+                                ship_id: s.id,
+                                name: s.name,
+                                side: "party".into(),
+                                tonnage: s.spec.tonnage,
+                                tl: s.spec.tl,
+                                hull_max: s.spec.hull_points_max,
+                                hull_current: s.hull_current,
+                                armor: s.spec.armor_rating,
+                                thrust_max: s.spec.thrust,
+                                thrust_remaining: s.spec.thrust,
+                                evasive_dm: 0,
+                                aid_gunners_dm: 0,
+                                power_available: s.spec.power_plant_output,
+                                sensor_lock_targets: vec![],
+                                crits: Default::default(),
+                                initiative: 0,
+                                last_ten_pct_threshold: 0,
+                            });
+                        }
+                        ships_list.push(SpaceCombatShip {
+                            ship_id: Uuid::new_v4(),
+                            name: "Corsair Raider".into(),
+                            side: "hostile".into(),
+                            tonnage: 400,
+                            tl: 12,
+                            hull_max: 160,
+                            hull_current: 160,
+                            armor: 4,
+                            thrust_max: 3,
+                            thrust_remaining: 3,
+                            evasive_dm: 0,
+                            aid_gunners_dm: 0,
+                            power_available: 160,
+                            sensor_lock_targets: vec![],
+                            crits: Default::default(),
+                            initiative: 0,
+                            last_ten_pct_threshold: 0,
+                        });
+                    }
+                    let state = {
+                        let mut r = rng();
+                        start_space_combat(&mut r, range_band, ships_list, 0, 0)
+                    };
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(state.id, campaign_id, "space", "active", 1, "maneuver", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&state)?,
+                        state_changed: true,
+                    })
+                }
+                "maneuver" => {
+                    let rec = db.get_active_combat(campaign_id, "space").await?.context("No active space combat")?;
+                    let mut state: SpaceCombatState = serde_json::from_value(rec.state)?;
+                    let ship_id = Uuid::parse_str(input.get("ship_id").and_then(|v| v.as_str()).context("ship_id required")?)?;
+                    let msg = {
+                        let mut r = rng();
+                        allocate_maneuver_thrust(
+                            &mut r,
+                            &mut state,
+                            ship_id,
+                            input.get("thrust_to_range").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                            input.get("thrust_to_evade").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+                            input.get("pilot_skill").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
+                            input.get("aid_gunners").and_then(|v| v.as_bool()).unwrap_or(false),
+                        )?
+                    };
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(rec.id, campaign_id, "space", "active", state.round as i32, "maneuver", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: json!({"message": msg, "range_band": state.range_band}).to_string(),
+                        state_changed: true,
+                    })
+                }
+                "fire" => {
+                    let rec = db.get_active_combat(campaign_id, "space").await?.context("No active space combat")?;
+                    let mut state: SpaceCombatState = serde_json::from_value(rec.state)?;
+                    let atk_id = Uuid::parse_str(input.get("ship_id").and_then(|v| v.as_str()).context("ship_id required")?)?;
+                    let tgt_id = Uuid::parse_str(input.get("target_ship_id").and_then(|v| v.as_str()).context("target_ship_id required")?)?;
+                    let res = {
+                        let mut r = rng();
+                        resolve_space_attack(
+                            &mut r,
+                            &mut state,
+                            &SpaceWeaponAttackInput {
+                                attacker_ship_id: atk_id,
+                                target_ship_id: tgt_id,
+                                weapon_name: input.get("weapon_name").and_then(|v| v.as_str()).unwrap_or("Pulse Laser").into(),
+                                linked_count: input.get("linked_count").and_then(|v| v.as_u64()).unwrap_or(1) as u8,
+                                damage_dice: input.get("damage_dice").and_then(|v| v.as_u64()).unwrap_or(2) as u8,
+                                is_laser: input.get("is_laser").and_then(|v| v.as_bool()).unwrap_or(true),
+                                gunner_skill: input.get("gunner_skill").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
+                                gunner_dex_dm: input.get("gunner_dex_dm").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                                fire_control_dm: input.get("fire_control_dm").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                                sandcaster_count_defending: input.get("sandcaster_count").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+                                defender_gunner_skill: 1,
+                                called_shot: None,
+                            },
+                        )?
+                    };
+                    // Sync hull & crits back to ships table if target is a player ship
+                    let mut owned = db.list_ships(campaign_id).await?;
+                    if let Some(ship) = owned.iter_mut().find(|s| s.id == tgt_id) {
+                        ship.hull_current = res.target_hull_remaining;
+                        for cr in &res.crits_inflicted {
+                            ship.crits.push(serde_json::to_value(cr)?);
+                        }
+                        db.save_ship(ship).await?;
+                    }
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(rec.id, campaign_id, "space", "active", state.round as i32, "attack", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&res)?,
+                        state_changed: true,
+                    })
+                }
+                "launch_missiles" => {
+                    let rec = db.get_active_combat(campaign_id, "space").await?.context("No active space combat")?;
+                    let mut state: SpaceCombatState = serde_json::from_value(rec.state)?;
+                    let atk_id = Uuid::parse_str(input.get("ship_id").and_then(|v| v.as_str()).context("ship_id required")?)?;
+                    let tgt_id = Uuid::parse_str(input.get("target_ship_id").and_then(|v| v.as_str()).context("target_ship_id required")?)?;
+                    let salvo = launch_missile_salvo(
+                        &mut state,
+                        atk_id,
+                        tgt_id,
+                        input.get("missile_count").and_then(|v| v.as_u64()).unwrap_or(3) as u32,
+                        input.get("smart_tl").and_then(|v| v.as_u64()).unwrap_or(12) as u8,
+                    );
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(rec.id, campaign_id, "space", "active", state.round as i32, "attack", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&salvo)?,
+                        state_changed: true,
+                    })
+                }
+                "ew_jam" => {
+                    let rec = db.get_active_combat(campaign_id, "space").await?.context("No active space combat")?;
+                    let mut state: SpaceCombatState = serde_json::from_value(rec.state)?;
+                    let salvo_id = Uuid::parse_str(input.get("salvo_id").and_then(|v| v.as_str()).context("salvo_id required")?)?;
+                    let (roll, destroyed) = {
+                        let mut r = rng();
+                        ew_jam_missiles(
+                            &mut r,
+                            &mut state,
+                            salvo_id,
+                            input.get("sensors_skill").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
+                            input.get("edu_dm").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        )?
+                    };
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(rec.id, campaign_id, "space", "active", state.round as i32, "actions", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: json!({"roll": roll, "missiles_destroyed": destroyed}).to_string(),
+                        state_changed: true,
+                    })
+                }
+                "sensor_lock" => {
+                    let rec = db.get_active_combat(campaign_id, "space").await?.context("No active space combat")?;
+                    let mut state: SpaceCombatState = serde_json::from_value(rec.state)?;
+                    let ship_id = Uuid::parse_str(input.get("ship_id").and_then(|v| v.as_str()).context("ship_id required")?)?;
+                    let tgt_id = Uuid::parse_str(input.get("target_ship_id").and_then(|v| v.as_str()).context("target_ship_id required")?)?;
+                    let roll = {
+                        let mut r = rng();
+                        acquire_sensor_lock(
+                            &mut r,
+                            &mut state,
+                            ship_id,
+                            tgt_id,
+                            input.get("sensors_skill").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
+                            input.get("edu_dm").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                        )?
+                    };
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(rec.id, campaign_id, "space", "active", state.round as i32, "actions", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: json!({"roll": roll, "lock_acquired": roll.success}).to_string(),
+                        state_changed: true,
+                    })
+                }
+                "next_round" => {
+                    let rec = db.get_active_combat(campaign_id, "space").await?.context("No active space combat")?;
+                    let mut state: SpaceCombatState = serde_json::from_value(rec.state)?;
+                    let events = {
+                        let mut r = rng();
+                        advance_space_round(&mut r, &mut state)
+                    };
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(rec.id, campaign_id, "space", "active", state.round as i32, "maneuver", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: json!({"round": state.round, "events": events, "state": state}).to_string(),
+                        state_changed: true,
+                    })
+                }
+                "end" => {
+                    if let Some(rec) = db.get_active_combat(campaign_id, "space").await? {
+                        db.upsert_combat(rec.id, campaign_id, "space", "ended", rec.round, "ended", &rec.state)
+                            .await?;
+                    }
+                    Ok(ToolExecutionResult {
+                        output_json: json!({"status": "ended"}).to_string(),
+                        state_changed: true,
+                    })
+                }
+                other => anyhow::bail!("Unknown space_combat action '{other}'"),
+            }
+        }
+
+        "schedule_event" => {
+            let camp = db
+                .get_campaign(campaign_id)
+                .await?
+                .context("Campaign not found")?;
+            let title = input
+                .get("title")
+                .and_then(|v| v.as_str())
+                .context("title required")?;
+            let kind = input.get("kind").and_then(|v| v.as_str()).unwrap_or("story");
+            let delta = input.get("hours_from_now").and_then(|v| v.as_i64()).unwrap_or(0) * 60
+                + input.get("days_from_now").and_then(|v| v.as_i64()).unwrap_or(0) * 1440;
+            let due = camp.date.advance_minutes(delta.max(1));
+            let ev = db
+                .create_event(
+                    campaign_id,
+                    due.to_total_minutes(),
+                    &due.format(),
+                    kind,
+                    title,
+                    json!({}),
+                )
+                .await?;
+            Ok(ToolExecutionResult {
+                output_json: serde_json::to_string(&ev)?,
+                state_changed: true,
             })
         }
 
@@ -405,6 +1481,9 @@ pub async fn execute_tool(
 
             let adv = compute_advance(camp.date, total_minutes);
             db.update_campaign_date(campaign_id, adv.to).await?;
+            let due_events = db
+                .complete_due_events(campaign_id, adv.to.to_total_minutes())
+                .await?;
 
             let mut billing_events = Vec::new();
             if adv.maintenance_periods_crossed > 0 {
@@ -413,7 +1492,7 @@ pub async fn execute_tool(
                 let accounts = db.list_accounts(campaign_id).await?;
                 let company_acc = accounts
                     .iter()
-                    .find(|a| a.kind == traveller_rules::finance::AccountKind::Company);
+                    .find(|a| a.kind == AccountKind::Company);
 
                 let crew_salaries: i64 = chars
                     .iter()
@@ -457,9 +1536,11 @@ pub async fn execute_tool(
                                     )
                                     .await?;
                                 if let Some(m) = &mut ship.mortgage
-                                    && m.active && m.periods_paid < m.periods_total {
-                                        m.periods_paid += 1;
-                                    }
+                                    && m.active
+                                    && m.periods_paid < m.periods_total
+                                {
+                                    m.periods_paid += 1;
+                                }
                                 ship.skipped_maintenance_periods = 0;
                                 db.save_ship(ship).await?;
                                 billing_events.push(json!({
@@ -474,10 +1555,11 @@ pub async fn execute_tool(
                         } else {
                             ship.skipped_maintenance_periods += 1;
                             if let Some(m) = &mut ship.mortgage
-                                && m.active {
-                                    m.periods_overdue += 1;
-                                    m.arrears_cr += m.monthly_payment_cr;
-                                }
+                                && m.active
+                            {
+                                m.periods_overdue += 1;
+                                m.arrears_cr += m.monthly_payment_cr;
+                            }
                             let poor = {
                                 let mut r = rng();
                                 roll_poor_maintenance(
@@ -512,6 +1594,7 @@ pub async fn execute_tool(
                     "jump_hours": jump_hours,
                     "maintenance_periods_crossed": adv.maintenance_periods_crossed,
                     "annual_boundaries_crossed": adv.annual_boundaries_crossed,
+                    "completed_events": due_events,
                     "billing_events": billing_events
                 }))?,
                 state_changed: true,

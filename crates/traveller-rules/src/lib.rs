@@ -1,7 +1,13 @@
 pub mod calendar;
 pub mod character;
+pub mod chargen;
+pub mod combat_personal;
+pub mod combat_space;
+pub mod commerce;
+pub mod crew;
 pub mod dice;
 pub mod finance;
 pub mod sensors;
 pub mod ship;
+pub mod trade;
 pub mod universe;

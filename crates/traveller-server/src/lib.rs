@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod routes;
 
+use std::path::PathBuf;
+
 use axum::middleware;
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
@@ -18,6 +20,7 @@ pub struct AppState {
     pub auth: AuthState,
     pub default_referee_model: String,
     pub default_worker_model: String,
+    pub packs_dir: PathBuf,
 }
 
 /// Build the full TravellerLLM HTTP router with Authentik auth middleware.

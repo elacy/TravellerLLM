@@ -149,6 +149,62 @@ pub struct ScheduledEventRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectorRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub abbreviation: String,
+    pub sector_x: i32,
+    pub sector_y: i32,
+    pub system_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemRecord {
+    pub id: Uuid,
+    pub sector_id: Uuid,
+    pub sector_name: String,
+    pub hex: String,
+    pub name: String,
+    pub uwp: String,
+    pub starport: String,
+    pub tech_level: i16,
+    pub law_level: i16,
+    pub trade_codes: Vec<String>,
+    pub bases: Vec<String>,
+    pub allegiance: String,
+    pub travel_zone: String,
+    pub gas_giants: i16,
+    pub global_x: i32,
+    pub global_y: i32,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemRecord {
+    pub id: Uuid,
+    pub pack_id: String,
+    pub category: String,
+    pub name: String,
+    pub tl: i16,
+    pub cost_cr: i64,
+    pub mass_kg: f64,
+    pub law_restriction: i16,
+    pub stats: Value,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CombatRecord {
+    pub id: Uuid,
+    pub campaign_id: Uuid,
+    pub kind: String,
+    pub status: String,
+    pub round: i32,
+    pub phase: String,
+    pub state: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CharacterRow {
     pub character: Character,
     pub equipment: Vec<Value>,

@@ -1,0 +1,203 @@
+{
+  "pack_id": "starter-srd",
+  "items": [
+    {
+      "pack_id": "starter-srd",
+      "category": "weapon",
+      "name": "Autopistol",
+      "tl": 5,
+      "cost_cr": 200,
+      "mass_kg": 0.75,
+      "law_restriction": 5,
+      "stats": { "range": "10", "damage": "3D-3", "magazine": "15", "skill": "Gun Combat (Slug)", "traits": "None" },
+      "tags": ["weapon", "tl5", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "weapon",
+      "name": "Snub Pistol",
+      "tl": 8,
+      "cost_cr": 150,
+      "mass_kg": 0.25,
+      "law_restriction": 5,
+      "stats": { "range": "5", "damage": "3D-3", "magazine": "6", "skill": "Gun Combat (Slug)", "traits": "Zero-G" },
+      "tags": ["weapon", "tl8", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "weapon",
+      "name": "Laser Pistol",
+      "tl": 11,
+      "cost_cr": 3000,
+      "mass_kg": 1.0,
+      "law_restriction": 3,
+      "stats": { "range": "20", "damage": "3D+3", "magazine": "20", "skill": "Gun Combat (Energy)", "traits": "Zero-G" },
+      "tags": ["weapon", "tl11", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "weapon",
+      "name": "Gauss Rifle",
+      "tl": 13,
+      "cost_cr": 1500,
+      "mass_kg": 4.0,
+      "law_restriction": 3,
+      "stats": { "range": "600", "damage": "4D", "magazine": "40", "ap": "5", "auto": "3", "skill": "Gun Combat (Slug)", "traits": "AP 5, Auto 3, Scope" },
+      "tags": ["weapon", "tl13", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "weapon",
+      "name": "Cutlass",
+      "tl": 3,
+      "cost_cr": 300,
+      "mass_kg": 1.2,
+      "law_restriction": 8,
+      "stats": { "range": "Melee", "damage": "3D", "skill": "Melee (Blade)", "traits": "Shipboard" },
+      "tags": ["weapon", "tl3", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "armor",
+      "name": "Flak Jacket",
+      "tl": 5,
+      "cost_cr": 100,
+      "mass_kg": 3.0,
+      "law_restriction": 7,
+      "stats": { "protection": "3 (5 vs explosives)", "rad": "0" },
+      "tags": ["armor", "tl5", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "armor",
+      "name": "Cloth Armour",
+      "tl": 8,
+      "cost_cr": 250,
+      "mass_kg": 2.0,
+      "law_restriction": 7,
+      "stats": { "protection": "8", "rad": "0" },
+      "tags": ["armor", "tl8", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "armor",
+      "name": "Vacc Suit (TL12)",
+      "tl": 12,
+      "cost_cr": 20000,
+      "mass_kg": 5.0,
+      "law_restriction": 9,
+      "stats": { "protection": "10", "rad": "80", "air": "6 hours" },
+      "tags": ["armor", "tl12", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "armor",
+      "name": "Combat Armour (Stealth)",
+      "tl": 12,
+      "cost_cr": 90000,
+      "mass_kg": 6.0,
+      "law_restriction": 3,
+      "stats": { "protection": "18", "rad": "140", "stealth_dm": -4, "traits": "Sealed, Stealth -4" },
+      "tags": ["armor", "tl12", "stealth", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "augment",
+      "name": "Wafer Jack (TL12)",
+      "tl": 12,
+      "cost_cr": 5000,
+      "mass_kg": 0.0,
+      "law_restriction": 9,
+      "stats": { "effect": "Runs INT/EDU Expert wafers (Bandwidth - 1 unskilled, DM+1 if skilled)" },
+      "tags": ["augment", "tl12", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "augment",
+      "name": "Neural Jack (TL13)",
+      "tl": 13,
+      "cost_cr": 50000,
+      "mass_kg": 0.0,
+      "law_restriction": 9,
+      "stats": { "effect": "Runs physical & mental Expert software + direct computer/vehicle interface" },
+      "tags": ["augment", "tl13", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "augment",
+      "name": "Neural Link (TL13)",
+      "tl": 13,
+      "cost_cr": 25000,
+      "mass_kg": 0.0,
+      "law_restriction": 9,
+      "stats": { "effect": "Boon on mental/electronic tasks linked to ship or personal computer" },
+      "tags": ["augment", "tl13", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "software",
+      "name": "Expert/1 Software Wafer",
+      "tl": 11,
+      "cost_cr": 1000,
+      "mass_kg": 0.0,
+      "law_restriction": 9,
+      "stats": { "bandwidth": "1", "effect": "Skill 0 (unskilled) or DM+1 (possessed)" },
+      "tags": ["software", "tl11", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "software",
+      "name": "Expert/2 Software Wafer",
+      "tl": 12,
+      "cost_cr": 10000,
+      "mass_kg": 0.0,
+      "law_restriction": 9,
+      "stats": { "bandwidth": "2", "effect": "Skill 1 (unskilled) or DM+1 (possessed)" },
+      "tags": ["software", "tl12", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "software",
+      "name": "Expert/3 Software Wafer",
+      "tl": 13,
+      "cost_cr": 100000,
+      "mass_kg": 0.0,
+      "law_restriction": 9,
+      "stats": { "bandwidth": "3", "effect": "Skill 2 (unskilled) or DM+1 (possessed)" },
+      "tags": ["software", "tl13", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "medical",
+      "name": "Medikit (TL12)",
+      "tl": 12,
+      "cost_cr": 5000,
+      "mass_kg": 1.0,
+      "law_restriction": 9,
+      "stats": { "effect": "DM+2 to Medic checks" },
+      "tags": ["medical", "tl12", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "electronics",
+      "name": "PRIS Binoculars (TL10)",
+      "tl": 10,
+      "cost_cr": 3500,
+      "mass_kg": 1.0,
+      "law_restriction": 9,
+      "stats": { "effect": "Multi-spectral thermal/IR/optical detection" },
+      "tags": ["electronics", "tl10", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "vehicle",
+      "name": "Air/Raft (TL8)",
+      "tl": 8,
+      "cost_cr": 275000,
+      "mass_kg": 4000.0,
+      "law_restriction": 9,
+      "stats": { "speed": "Medium (100 km/h)", "shipping": "4 tons", "passengers": "4" },
+      "tags": ["vehicle", "tl8", "srd"]
+    }
+  ]
+}

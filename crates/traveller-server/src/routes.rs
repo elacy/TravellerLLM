@@ -1,6 +1,7 @@
 use std::convert::Infallible;
+use std::path::PathBuf;
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -17,12 +18,17 @@ use traveller_db::{NewCharacterInput, ShipRecord};
 use traveller_llm::tools::execute_tool;
 use traveller_llm::TurnEvent;
 use traveller_rules::character::{Character, CharacterKind, Characteristic};
+use traveller_rules::chargen::{
+    finalize_lifepath_character, muster_out, run_lifepath_term, start_lifepath, Career,
+    LifepathSession,
+};
 use traveller_rules::dice::{resolve_task, Difficulty, ModifierItem, RollMode};
 use traveller_rules::finance::AccountKind;
 use traveller_rules::sensors::{resolve_sensor_detection, SensorDetectionInput};
 use traveller_rules::ship::{
     sample_free_trader, validate_ship, Mortgage, ShipSpec,
 };
+use traveller_rules::universe::{plan_jump_route, RouteNode};
 use uuid::Uuid;
 
 use crate::auth::{auth_me, oidc_callback, oidc_login, oidc_logout, AuthUser};
@@ -82,10 +88,44 @@ pub fn router(state: AppState) -> Router {
             get(list_accounts).post(create_account),
         )
         .route("/api/campaigns/{id}/accounts/transfer", post(transfer_funds))
-        .route("/api/campaigns/{id}/transactions", get(list_transactions))
+        .route(
+            "/api/campaigns/{id}/transactions",
+            get(list_transactions).post(create_transaction),
+        )
         .route("/api/campaigns/{id}/time/advance", post(advance_time))
+        .route(
+            "/api/campaigns/{id}/events",
+            get(list_events).post(create_event),
+        )
         .route("/api/campaigns/{id}/dice/task", post(roll_task_ui))
         .route("/api/campaigns/{id}/sensors/check", post(sensor_check_ui))
+        // Universe / Star Map / Jump Routing
+        .route("/api/universe/sectors", get(list_sectors))
+        .route("/api/universe/sectors/{sector_id}/systems", get(list_sector_systems))
+        .route("/api/universe/systems/search", get(search_systems))
+        .route("/api/universe/route", post(plan_route_handler))
+        .route("/api/campaigns/{id}/jump", post(execute_jump_handler))
+        // Items Catalog & CSC 2023 Shop / Availability / Black Market
+        .route("/api/items", get(search_items_handler))
+        .route("/api/campaigns/{id}/shop/availability", post(shop_availability))
+        .route("/api/campaigns/{id}/shop/purchase", post(shop_purchase))
+        // Interactive Lifepath Chargen & Starport Hiring Hall
+        .route("/api/chargen/start", post(chargen_start))
+        .route("/api/chargen/term", post(chargen_term))
+        .route("/api/chargen/muster", post(chargen_muster))
+        .route("/api/campaigns/{id}/chargen/commit", post(chargen_commit))
+        .route("/api/campaigns/{id}/crew/hiring-hall", post(crew_hiring_hall))
+        .route("/api/campaigns/{id}/crew/hire", post(crew_hire))
+        // Trade (Freight, Passengers, Mail, Speculative)
+        .route("/api/campaigns/{id}/trade/market", post(trade_market))
+        .route("/api/campaigns/{id}/trade/buy", post(trade_buy))
+        .route("/api/campaigns/{id}/trade/sell", post(trade_sell))
+        // Personal & High Guard Space Combat
+        .route("/api/campaigns/{id}/combat/active", get(active_combats))
+        .route("/api/campaigns/{id}/combat/personal", post(personal_combat_handler))
+        .route("/api/campaigns/{id}/combat/space", post(space_combat_handler))
+        // Packs Reload
+        .route("/api/packs/reload", post(reload_packs_handler))
         .route("/api/campaigns/{id}/messages", get(list_messages))
         .route("/api/campaigns/{id}/chat", post(chat_sse))
         .with_state(state)
@@ -184,13 +224,22 @@ async fn get_campaign_snapshot(
     let accounts = st.db.list_accounts(id).await?;
     let transactions = st.db.list_transactions(id, 30).await?;
     let costs = st.db.campaign_cost_totals(id).await?;
+    let active_personal_combat = st.db.get_active_combat(id, "personal").await?;
+    let active_space_combat = st.db.get_active_combat(id, "space").await?;
+    let pending_events = st.db.list_pending_events(id).await?;
+    let sector_count = st.db.count_sectors().await.unwrap_or(0);
+    let item_count = st.db.count_items().await.unwrap_or(0);
     Ok(Json(json!({
         "campaign": camp,
         "characters": characters,
         "ships": ships,
         "accounts": accounts,
         "transactions": transactions,
-        "llm_costs": costs
+        "llm_costs": costs,
+        "active_personal_combat": active_personal_combat,
+        "active_space_combat": active_space_combat,
+        "pending_events": pending_events,
+        "pack_stats": { "sectors": sector_count, "items": item_count }
     })))
 }
 
@@ -586,4 +635,508 @@ async fn chat_sse(
         Ok(Event::default().data(data))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// ── Manual Transactions & Scheduled Events ────────────────────────────────
+
+async fn create_transaction(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let res = execute_tool(&st.db, &st.hindsight, id, "record_transaction", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+async fn list_events(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let events = st.db.list_pending_events(id).await?;
+    Ok(Json(json!({ "events": events })))
+}
+
+async fn create_event(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let res = execute_tool(&st.db, &st.hindsight, id, "schedule_event", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+// ── Universe / Star Map / Jump Routing ────────────────────────────────────
+
+async fn list_sectors(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let sectors = st.db.list_sectors().await?;
+    Ok(Json(json!({ "sectors": sectors })))
+}
+
+async fn list_sector_systems(
+    State(st): State<AppState>,
+    Path(sector_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let systems = st.db.list_sector_systems(sector_id).await?;
+    Ok(Json(json!({ "systems": systems })))
+}
+
+#[derive(Deserialize)]
+struct SearchSystemsQuery {
+    q: Option<String>,
+    trade_code: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn search_systems(
+    State(st): State<AppState>,
+    Query(q): Query<SearchSystemsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let systems = st
+        .db
+        .search_systems(q.q.as_deref(), q.trade_code.as_deref(), q.limit.unwrap_or(40))
+        .await?;
+    Ok(Json(json!({ "systems": systems })))
+}
+
+#[derive(Deserialize)]
+struct PlanRouteBody {
+    from_system: String,
+    to_system: String,
+    #[serde(default = "default_jump")]
+    jump_rating: u8,
+    #[serde(default = "default_true")]
+    avoid_red_zones: bool,
+    #[serde(default = "default_true")]
+    require_refuel: bool,
+}
+
+fn default_jump() -> u8 {
+    1
+}
+
+async fn plan_route_handler(
+    State(st): State<AppState>,
+    Json(body): Json<PlanRouteBody>,
+) -> Result<Json<Value>, ApiError> {
+    let start = st
+        .db
+        .get_system_by_name(&body.from_system)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Origin system '{}' not found", body.from_system))?;
+    let goal = st
+        .db
+        .get_system_by_name(&body.to_system)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Destination system '{}' not found", body.to_system))?;
+
+    let pad = i32::from(body.jump_rating.max(1)) * 4 + 8;
+    let min_x = start.global_x.min(goal.global_x) - pad;
+    let max_x = start.global_x.max(goal.global_x) + pad;
+    let min_y = start.global_y.min(goal.global_y) - pad;
+    let max_y = start.global_y.max(goal.global_y) + pad;
+    let box_systems = st.db.list_systems_in_box(min_x, max_x, min_y, max_y).await?;
+    let nodes: Vec<RouteNode> = box_systems
+        .into_iter()
+        .map(|s| RouteNode {
+            id: s.id,
+            name: s.name,
+            hex: s.hex,
+            uwp: s.uwp,
+            starport: s.starport.chars().next().unwrap_or('X'),
+            gas_giants: s.gas_giants,
+            travel_zone: s.travel_zone,
+            global_x: s.global_x,
+            global_y: s.global_y,
+        })
+        .collect();
+
+    let route = plan_jump_route(
+        &nodes,
+        start.id,
+        goal.id,
+        body.jump_rating,
+        body.avoid_red_zones,
+        body.require_refuel,
+    );
+    Ok(Json(json!({
+        "found": route.is_some(),
+        "jump_rating": body.jump_rating,
+        "route": route
+    })))
+}
+
+async fn execute_jump_handler(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("action".into(), json!("jump_to"));
+    }
+    let res = execute_tool(&st.db, &st.hindsight, id, "explore_universe", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+// ── Items Catalog & CSC 2023 Shop / Availability / Black Market ───────────
+
+#[derive(Deserialize)]
+struct SearchItemsQuery {
+    q: Option<String>,
+    category: Option<String>,
+    max_tl: Option<i16>,
+    limit: Option<i64>,
+}
+
+async fn search_items_handler(
+    State(st): State<AppState>,
+    Query(q): Query<SearchItemsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let items = st
+        .db
+        .search_items(
+            q.q.as_deref(),
+            q.category.as_deref(),
+            q.max_tl,
+            q.limit.unwrap_or(60),
+        )
+        .await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+async fn shop_availability(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("action".into(), json!("check_availability"));
+    }
+    let res = execute_tool(&st.db, &st.hindsight, id, "shop_market", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+async fn shop_purchase(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("action".into(), json!("purchase"));
+    }
+    let res = execute_tool(&st.db, &st.hindsight, id, "shop_market", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+// ── Interactive Lifepath Character Generation & Crew Hiring Hall ──────────
+
+#[derive(Deserialize)]
+struct ChargenStartBody {
+    name: String,
+    #[serde(default = "default_human")]
+    species: String,
+    #[serde(default)]
+    background_skills: Vec<String>,
+}
+
+fn default_human() -> String {
+    "Human".to_string()
+}
+
+async fn chargen_start(Json(body): Json<ChargenStartBody>) -> Result<Json<Value>, ApiError> {
+    let session = {
+        let mut r = rng();
+        start_lifepath(&mut r, body.name, body.species, body.background_skills)
+    };
+    Ok(Json(json!({ "session": session })))
+}
+
+#[derive(Deserialize)]
+struct ChargenTermBody {
+    session: LifepathSession,
+    career: Career,
+    #[serde(default)]
+    prefer_specialist: bool,
+}
+
+async fn chargen_term(Json(mut body): Json<ChargenTermBody>) -> Result<Json<Value>, ApiError> {
+    let entry = {
+        let mut r = rng();
+        run_lifepath_term(&mut r, &mut body.session, body.career, body.prefer_specialist)
+    };
+    Ok(Json(json!({ "session": body.session, "entry": entry })))
+}
+
+#[derive(Deserialize)]
+struct ChargenMusterBody {
+    session: LifepathSession,
+    #[serde(default = "default_cash_rolls")]
+    cash_rolls: u32,
+}
+
+fn default_cash_rolls() -> u32 {
+    2
+}
+
+async fn chargen_muster(Json(mut body): Json<ChargenMusterBody>) -> Result<Json<Value>, ApiError> {
+    {
+        let mut r = rng();
+        muster_out(&mut r, &mut body.session, body.cash_rolls);
+    }
+    Ok(Json(json!({ "session": body.session })))
+}
+
+#[derive(Deserialize)]
+struct ChargenCommitBody {
+    session: LifepathSession,
+    #[serde(default = "default_player_kind")]
+    kind: CharacterKind,
+    #[serde(default)]
+    salary_cr: i64,
+    #[serde(default)]
+    station: Option<String>,
+    #[serde(default)]
+    deposit_cash_account_id: Option<Uuid>,
+}
+
+fn default_player_kind() -> CharacterKind {
+    CharacterKind::Player
+}
+
+async fn chargen_commit(
+    State(st): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ChargenCommitBody>,
+) -> Result<Json<Value>, ApiError> {
+    let finalized = finalize_lifepath_character(
+        id,
+        body.kind,
+        &body.session,
+        body.salary_cr,
+        body.station,
+    );
+    let created = st
+        .db
+        .create_character(
+            id,
+            NewCharacterInput {
+                kind: finalized.kind,
+                name: finalized.name.clone(),
+                species: finalized.species,
+                age: finalized.age,
+                upp: finalized.upp_max,
+                skills: finalized.skills,
+                augments: finalized.augments,
+                salary_cr: finalized.salary_cr,
+                assigned_ship_id: finalized.assigned_ship_id,
+                assigned_station: finalized.assigned_station,
+                notes: finalized.notes,
+            },
+        )
+        .await?;
+
+    if body.session.cash_cr > 0
+        && let Some(acc_id) = body.deposit_cash_account_id
+    {
+        let camp = st
+            .db
+            .get_campaign(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Campaign not found"))?;
+        let date_s = camp.date.format_date_only();
+        let _ = st
+            .db
+            .post_transaction(
+                id,
+                acc_id,
+                &date_s,
+                body.session.cash_cr,
+                "mustering_out",
+                &format!("Mustering out cash for {}", created.character.name),
+                "Imperial Treasury",
+            )
+            .await?;
+    }
+
+    st.db
+        .log_audit(
+            id,
+            &user.username,
+            "chargen_commit",
+            json!({"name": created.character.name, "terms": body.session.terms_completed, "cash_cr": body.session.cash_cr}),
+        )
+        .await?;
+
+    Ok(Json(json!({ "character": created })))
+}
+
+async fn crew_hiring_hall(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("action".into(), json!("hiring_hall"));
+    }
+    let res = execute_tool(&st.db, &st.hindsight, id, "hire_crew", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+#[derive(Deserialize)]
+struct HireCrewBody {
+    character: Option<Character>,
+    name: Option<String>,
+    role: Option<String>,
+    salary_cr: Option<i64>,
+    ship_id: Option<Uuid>,
+}
+
+async fn crew_hire(
+    State(st): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<HireCrewBody>,
+) -> Result<Json<Value>, ApiError> {
+    // If the UI passes the full lifepath-generated candidate Character, persist it verbatim!
+    if let Some(ch) = body.character {
+        let created = st
+            .db
+            .create_character(
+                id,
+                NewCharacterInput {
+                    kind: CharacterKind::Crew,
+                    name: ch.name.clone(),
+                    species: ch.species,
+                    age: ch.age,
+                    upp: ch.upp_max,
+                    skills: ch.skills,
+                    augments: ch.augments,
+                    salary_cr: body.salary_cr.unwrap_or(ch.salary_cr),
+                    assigned_ship_id: body.ship_id.or(ch.assigned_ship_id),
+                    assigned_station: body.role.or(ch.assigned_station),
+                    notes: ch.notes,
+                },
+            )
+            .await?;
+        st.db
+            .log_audit(
+                id,
+                &user.username,
+                "hire_crew",
+                json!({"name": created.character.name, "salary_cr": created.character.salary_cr}),
+            )
+            .await?;
+        return Ok(Json(json!({ "hired": created })));
+    }
+
+    let tool_body = json!({
+        "action": "hire",
+        "name": body.name,
+        "role": body.role,
+        "salary_cr": body.salary_cr,
+        "ship_id": body.ship_id,
+    });
+    let res = execute_tool(&st.db, &st.hindsight, id, "hire_crew", &tool_body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+// ── Trade (Freight, Passengers, Mail, Speculative) ────────────────────────
+
+async fn trade_market(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("action".into(), json!("market"));
+    }
+    let res = execute_tool(&st.db, &st.hindsight, id, "trade_ops", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+async fn trade_buy(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("action".into(), json!("buy_cargo"));
+    }
+    let res = execute_tool(&st.db, &st.hindsight, id, "trade_ops", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+async fn trade_sell(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("action".into(), json!("sell_cargo"));
+    }
+    let res = execute_tool(&st.db, &st.hindsight, id, "trade_ops", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+// ── Personal Combat & High Guard Space Combat ─────────────────────────────
+
+async fn active_combats(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let personal = st.db.get_active_combat(id, "personal").await?;
+    let space = st.db.get_active_combat(id, "space").await?;
+    Ok(Json(json!({ "personal": personal, "space": space })))
+}
+
+async fn personal_combat_handler(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let res = execute_tool(&st.db, &st.hindsight, id, "personal_combat", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+async fn space_combat_handler(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let res = execute_tool(&st.db, &st.hindsight, id, "space_combat", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+// ── Pack Reload ───────────────────────────────────────────────────────────
+
+async fn reload_packs_handler(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let mut imported_systems = 0usize;
+    let mut imported_items = 0usize;
+    for dir in [st.packs_dir.clone(), PathBuf::from("/app/packs/starter-srd")] {
+        if dir.exists() {
+            let (s, i) = traveller_db::load_packs_from_dir(&st.db, &dir).await?;
+            imported_systems += s;
+            imported_items += i;
+        }
+    }
+    let total_sectors = st.db.count_sectors().await.unwrap_or(0);
+    let total_items = st.db.count_items().await.unwrap_or(0);
+    Ok(Json(json!({
+        "imported_systems": imported_systems,
+        "imported_items": imported_items,
+        "total_sectors": total_sectors,
+        "total_items": total_items
+    })))
 }

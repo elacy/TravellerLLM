@@ -131,3 +131,152 @@ pub fn hex_distance(x1: i32, y1: i32, x2: i32, y2: i32) -> i32 {
     let (q2, r2, s2) = to_cube(x2, y2);
     ((q1 - q2).abs() + (r1 - r2).abs() + (s1 - s2).abs()) / 2
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteNode {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub hex: String,
+    pub uwp: String,
+    pub starport: char,
+    pub gas_giants: i16,
+    pub travel_zone: String,
+    pub global_x: i32,
+    pub global_y: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JumpRouteLeg {
+    pub from: RouteNode,
+    pub to: RouteNode,
+    pub parsecs: i32,
+    pub refuel_options: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedJumpRoute {
+    pub total_jumps: usize,
+    pub total_parsecs: i32,
+    pub legs: Vec<JumpRouteLeg>,
+}
+
+/// A* Jump-1..6 route planner over star systems, respecting ship Jump rating, Red Zone avoidance,
+/// and optional refueling requirement (Class A–D starport or gas giant at intermediate stops).
+pub fn plan_jump_route(
+    nodes: &[RouteNode],
+    start_id: uuid::Uuid,
+    goal_id: uuid::Uuid,
+    jump_rating: u8,
+    avoid_red_zones: bool,
+    require_refuel: bool,
+) -> Option<PlannedJumpRoute> {
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, HashMap};
+
+    let max_jump = i32::from(jump_rating.max(1));
+    let start_idx = nodes.iter().position(|n| n.id == start_id)?;
+    let goal_idx = nodes.iter().position(|n| n.id == goal_id)?;
+    if start_idx == goal_idx {
+        return Some(PlannedJumpRoute {
+            total_jumps: 0,
+            total_parsecs: 0,
+            legs: vec![],
+        });
+    }
+
+    let can_refuel = |n: &RouteNode| -> bool {
+        matches!(n.starport, 'A' | 'B' | 'C' | 'D') || n.gas_giants > 0
+    };
+
+    let mut open: BinaryHeap<Reverse<(i32, i32, usize)>> = BinaryHeap::new();
+    let mut came_from: HashMap<usize, usize> = HashMap::new();
+    let mut g_jumps: HashMap<usize, i32> = HashMap::new();
+
+    g_jumps.insert(start_idx, 0);
+    let h0 = (hex_distance(
+        nodes[start_idx].global_x,
+        nodes[start_idx].global_y,
+        nodes[goal_idx].global_x,
+        nodes[goal_idx].global_y,
+    ) + max_jump
+        - 1)
+        / max_jump;
+    open.push(Reverse((h0, 0, start_idx)));
+
+    while let Some(Reverse((_, cur_g, cur))) = open.pop() {
+        if cur == goal_idx {
+            let mut path = vec![goal_idx];
+            let mut c = goal_idx;
+            while let Some(&p) = came_from.get(&c) {
+                path.push(p);
+                c = p;
+            }
+            path.reverse();
+
+            let mut legs = Vec::new();
+            let mut total_parsecs = 0;
+            for w in path.windows(2) {
+                let a = &nodes[w[0]];
+                let b = &nodes[w[1]];
+                let d = hex_distance(a.global_x, a.global_y, b.global_x, b.global_y);
+                total_parsecs += d;
+                let mut refuel = Vec::new();
+                if matches!(b.starport, 'A' | 'B') {
+                    refuel.push("Refined Starport Fuel".into());
+                } else if matches!(b.starport, 'C' | 'D') {
+                    refuel.push("Unrefined Starport Fuel".into());
+                }
+                if b.gas_giants > 0 {
+                    refuel.push("Gas Giant Skimming".into());
+                }
+                legs.push(JumpRouteLeg {
+                    from: a.clone(),
+                    to: b.clone(),
+                    parsecs: d,
+                    refuel_options: refuel,
+                });
+            }
+            return Some(PlannedJumpRoute {
+                total_jumps: legs.len(),
+                total_parsecs,
+                legs,
+            });
+        }
+
+        if cur_g > *g_jumps.get(&cur).unwrap_or(&i32::MAX) {
+            continue;
+        }
+
+        let a = &nodes[cur];
+        for (nxt, b) in nodes.iter().enumerate() {
+            if nxt == cur {
+                continue;
+            }
+            if avoid_red_zones && nxt != goal_idx && b.travel_zone.eq_ignore_ascii_case("Red") {
+                continue;
+            }
+            if require_refuel && nxt != goal_idx && !can_refuel(b) {
+                continue;
+            }
+            let d = hex_distance(a.global_x, a.global_y, b.global_x, b.global_y);
+            if d == 0 || d > max_jump {
+                continue;
+            }
+            let tentative_g = cur_g + 1;
+            if tentative_g < *g_jumps.get(&nxt).unwrap_or(&i32::MAX) {
+                came_from.insert(nxt, cur);
+                g_jumps.insert(nxt, tentative_g);
+                let h = (hex_distance(
+                    b.global_x,
+                    b.global_y,
+                    nodes[goal_idx].global_x,
+                    nodes[goal_idx].global_y,
+                ) + max_jump
+                    - 1)
+                    / max_jump;
+                open.push(Reverse((tentative_g + h, tentative_g, nxt)));
+            }
+        }
+    }
+    None
+}

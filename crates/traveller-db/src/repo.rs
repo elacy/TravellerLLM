@@ -906,7 +906,7 @@ impl Db {
             );
             let valid_tag = if ship.validation.valid { "VALID" } else { "INVALID" };
             out.push_str(&format!(
-                "- {} ({}, {}t, J-{}/M-{}, {}, id: {}): Hull {}/{}, Fuel {:.1}t ref / {:.1}t unref (cap {:.1}t), Sensors {:?}, Stealth DM {}, Running Cost Cr{}/4wk (Mortgage Cr{}, Maint Cr{}, LifeSupp Cr{}, Salaries Cr{}), Skipped Maint: {}, Crits: {}\n",
+                "- {} ({}, {}t, J-{}/M-{}, {}, id: {}): Hull {}/{}, Fuel {:.1}t ref / {:.1}t unref (cap {:.1}t), Cargo {} lot(s) / {:.1}t cap, Sensors {:?}, Stealth DM {}, Running Cost Cr{}/4wk (Mortgage Cr{}, Maint Cr{}, LifeSupp Cr{}, Salaries Cr{}), Skipped Maint: {}, Crits: {}\n",
                 ship.name,
                 ship.class_name,
                 ship.spec.tonnage,
@@ -919,6 +919,8 @@ impl Db {
                 ship.fuel_refined,
                 ship.fuel_unrefined,
                 ship.spec.fuel_capacity_tons,
+                ship.cargo.len(),
+                ship.spec.cargo_capacity_tons,
                 ship.spec.sensor_grade,
                 ship.spec.stealth_dm,
                 costs.total_cr,
@@ -929,6 +931,32 @@ impl Db {
                 ship.skipped_maintenance_periods,
                 ship.crits.len()
             ));
+        }
+
+        if let Some(pc) = self.get_active_combat(campaign_id, "personal").await? {
+            out.push_str(&format!(
+                "\n## Active Personal Combat (Round {}, id: {})\n{}\n",
+                pc.round,
+                pc.id,
+                serde_json::to_string(&pc.state).unwrap_or_default()
+            ));
+        }
+        if let Some(sc) = self.get_active_combat(campaign_id, "space").await? {
+            out.push_str(&format!(
+                "\n## Active Spacecraft Combat (Round {}, Phase {}, id: {})\n{}\n",
+                sc.round,
+                sc.phase,
+                sc.id,
+                serde_json::to_string(&sc.state).unwrap_or_default()
+            ));
+        }
+
+        let events = self.list_pending_events(campaign_id).await?;
+        if !events.is_empty() {
+            out.push_str("\n## Upcoming Scheduled Events\n");
+            for ev in events.iter().take(8) {
+                out.push_str(&format!("- [{}] ({}) {}\n", ev.due_label, ev.kind, ev.title));
+            }
         }
         out.push_str("</traveller_state>");
         Ok(out)
@@ -952,5 +980,400 @@ impl Db {
             "output_tokens": row.try_get::<i64, _>("output_tokens")?,
             "cache_read_tokens": row.try_get::<i64, _>("cache_read_tokens")?,
         }))
+    }
+
+    // ── Universe (Sectors & Systems) ───────────────────────────────────────
+
+    pub async fn count_sectors(&self) -> Result<i64> {
+        let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sectors")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(c)
+    }
+
+    pub async fn count_items(&self) -> Result<i64> {
+        let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(c)
+    }
+
+    pub async fn update_campaign_system(
+        &self,
+        campaign_id: Uuid,
+        name: &str,
+        uwp: &str,
+        system_id: Option<Uuid>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE campaigns
+             SET current_system_name = $2, current_system_uwp = $3, current_system_id = $4, updated_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(campaign_id)
+        .bind(name)
+        .bind(uwp)
+        .bind(system_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_sectors(&self) -> Result<Vec<SectorRecord>> {
+        let rows = sqlx::query(
+            "SELECT s.id, s.name, s.abbreviation, s.sector_x, s.sector_y, COUNT(y.id) AS system_count
+             FROM sectors s
+             LEFT JOIN systems y ON y.sector_id = s.id
+             GROUP BY s.id
+             ORDER BY s.name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(SectorRecord {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    abbreviation: r.try_get("abbreviation")?,
+                    sector_x: r.try_get("sector_x")?,
+                    sector_y: r.try_get("sector_y")?,
+                    system_count: r.try_get("system_count")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_sector_systems(&self, sector_id: Uuid) -> Result<Vec<SystemRecord>> {
+        let rows = sqlx::query(
+            "SELECT y.id, y.sector_id, s.name AS sector_name, y.hex, y.name, y.uwp,
+                    TRIM(y.starport) AS starport, y.tech_level, y.law_level, y.trade_codes,
+                    y.bases, y.allegiance, y.travel_zone, y.gas_giants, y.global_x, y.global_y, y.metadata
+             FROM systems y
+             JOIN sectors s ON s.id = y.sector_id
+             WHERE y.sector_id = $1
+             ORDER BY y.hex ASC",
+        )
+        .bind(sector_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Self::map_system).collect()
+    }
+
+    pub async fn search_systems(
+        &self,
+        query: Option<&str>,
+        trade_code: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SystemRecord>> {
+        let q_like = query
+            .map(|s| format!("%{}%", s.trim().to_lowercase()))
+            .unwrap_or_else(|| "%".to_string());
+        let rows = sqlx::query(
+            "SELECT y.id, y.sector_id, s.name AS sector_name, y.hex, y.name, y.uwp,
+                    TRIM(y.starport) AS starport, y.tech_level, y.law_level, y.trade_codes,
+                    y.bases, y.allegiance, y.travel_zone, y.gas_giants, y.global_x, y.global_y, y.metadata
+             FROM systems y
+             JOIN sectors s ON s.id = y.sector_id
+             WHERE (LOWER(y.name) LIKE $1 OR LOWER(s.name) LIKE $1 OR y.hex LIKE $1)
+               AND ($2::text IS NULL OR $2 = ANY(y.trade_codes))
+             ORDER BY (LOWER(y.name) = LOWER(TRIM(BOTH '%' FROM $1))) DESC, y.name ASC
+             LIMIT $3",
+        )
+        .bind(&q_like)
+        .bind(trade_code.filter(|s| !s.trim().is_empty()))
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Self::map_system).collect()
+    }
+
+    pub async fn get_system_by_name(&self, name: &str) -> Result<Option<SystemRecord>> {
+        let row = sqlx::query(
+            "SELECT y.id, y.sector_id, s.name AS sector_name, y.hex, y.name, y.uwp,
+                    TRIM(y.starport) AS starport, y.tech_level, y.law_level, y.trade_codes,
+                    y.bases, y.allegiance, y.travel_zone, y.gas_giants, y.global_x, y.global_y, y.metadata
+             FROM systems y
+             JOIN sectors s ON s.id = y.sector_id
+             WHERE LOWER(y.name) = LOWER($1)
+             LIMIT 1",
+        )
+        .bind(name.trim())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Self::map_system).transpose()
+    }
+
+    pub async fn list_systems_in_box(
+        &self,
+        min_x: i32,
+        max_x: i32,
+        min_y: i32,
+        max_y: i32,
+    ) -> Result<Vec<SystemRecord>> {
+        let rows = sqlx::query(
+            "SELECT y.id, y.sector_id, s.name AS sector_name, y.hex, y.name, y.uwp,
+                    TRIM(y.starport) AS starport, y.tech_level, y.law_level, y.trade_codes,
+                    y.bases, y.allegiance, y.travel_zone, y.gas_giants, y.global_x, y.global_y, y.metadata
+             FROM systems y
+             JOIN sectors s ON s.id = y.sector_id
+             WHERE y.global_x BETWEEN $1 AND $2 AND y.global_y BETWEEN $3 AND $4",
+        )
+        .bind(min_x)
+        .bind(max_x)
+        .bind(min_y)
+        .bind(max_y)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Self::map_system).collect()
+    }
+
+    fn map_system(r: sqlx::postgres::PgRow) -> Result<SystemRecord> {
+        Ok(SystemRecord {
+            id: r.try_get("id")?,
+            sector_id: r.try_get("sector_id")?,
+            sector_name: r.try_get("sector_name")?,
+            hex: r.try_get("hex")?,
+            name: r.try_get("name")?,
+            uwp: r.try_get("uwp")?,
+            starport: r.try_get("starport")?,
+            tech_level: r.try_get("tech_level")?,
+            law_level: r.try_get("law_level")?,
+            trade_codes: r.try_get("trade_codes")?,
+            bases: r.try_get("bases")?,
+            allegiance: r.try_get("allegiance")?,
+            travel_zone: r.try_get("travel_zone")?,
+            gas_giants: r.try_get("gas_giants")?,
+            global_x: r.try_get("global_x")?,
+            global_y: r.try_get("global_y")?,
+            metadata: r.try_get("metadata")?,
+        })
+    }
+
+    // ── Items Catalog ──────────────────────────────────────────────────────
+
+    pub async fn search_items(
+        &self,
+        query: Option<&str>,
+        category: Option<&str>,
+        max_tl: Option<i16>,
+        limit: i64,
+    ) -> Result<Vec<ItemRecord>> {
+        let q_like = query
+            .map(|s| format!("%{}%", s.trim().to_lowercase()))
+            .unwrap_or_else(|| "%".to_string());
+        let rows = sqlx::query(
+            "SELECT id, pack_id, category, name, tl, cost_cr, mass_kg, law_restriction, stats, tags
+             FROM items
+             WHERE LOWER(name) LIKE $1
+               AND ($2::text IS NULL OR LOWER(category) = LOWER($2))
+               AND ($3::int2 IS NULL OR tl <= $3)
+             ORDER BY tl ASC, name ASC
+             LIMIT $4",
+        )
+        .bind(&q_like)
+        .bind(category.filter(|s| !s.trim().is_empty()))
+        .bind(max_tl)
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(ItemRecord {
+                    id: r.try_get("id")?,
+                    pack_id: r.try_get("pack_id")?,
+                    category: r.try_get("category")?,
+                    name: r.try_get("name")?,
+                    tl: r.try_get("tl")?,
+                    cost_cr: r.try_get("cost_cr")?,
+                    mass_kg: r.try_get("mass_kg")?,
+                    law_restriction: r.try_get("law_restriction")?,
+                    stats: r.try_get("stats")?,
+                    tags: r.try_get("tags")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn get_item(&self, item_id: Uuid) -> Result<Option<ItemRecord>> {
+        let row = sqlx::query(
+            "SELECT id, pack_id, category, name, tl, cost_cr, mass_kg, law_restriction, stats, tags
+             FROM items WHERE id = $1",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| {
+            Ok(ItemRecord {
+                id: r.try_get("id")?,
+                pack_id: r.try_get("pack_id")?,
+                category: r.try_get("category")?,
+                name: r.try_get("name")?,
+                tl: r.try_get("tl")?,
+                cost_cr: r.try_get("cost_cr")?,
+                mass_kg: r.try_get("mass_kg")?,
+                law_restriction: r.try_get("law_restriction")?,
+                stats: r.try_get("stats")?,
+                tags: r.try_get("tags")?,
+            })
+        })
+        .transpose()
+    }
+
+    // ── Combats (Personal & Space) ─────────────────────────────────────────
+
+    pub async fn get_active_combat(
+        &self,
+        campaign_id: Uuid,
+        kind: &str,
+    ) -> Result<Option<CombatRecord>> {
+        let row = sqlx::query(
+            "SELECT id, campaign_id, kind, status, round, phase, state
+             FROM combats WHERE campaign_id = $1 AND kind = $2 AND status = 'active'
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(campaign_id)
+        .bind(kind)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| {
+            Ok(CombatRecord {
+                id: r.try_get("id")?,
+                campaign_id: r.try_get("campaign_id")?,
+                kind: r.try_get("kind")?,
+                status: r.try_get("status")?,
+                round: r.try_get("round")?,
+                phase: r.try_get("phase")?,
+                state: r.try_get("state")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn upsert_combat(
+        &self,
+        id: Uuid,
+        campaign_id: Uuid,
+        kind: &str,
+        status: &str,
+        round: i32,
+        phase: &str,
+        state: &Value,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO combats (id, campaign_id, kind, status, round, phase, state)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT (id) DO UPDATE SET
+                status = EXCLUDED.status, round = EXCLUDED.round, phase = EXCLUDED.phase,
+                state = EXCLUDED.state, updated_at = NOW()",
+        )
+        .bind(id)
+        .bind(campaign_id)
+        .bind(kind)
+        .bind(status)
+        .bind(round)
+        .bind(phase)
+        .bind(state)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ── Scheduled Events ───────────────────────────────────────────────────
+
+    pub async fn create_event(
+        &self,
+        campaign_id: Uuid,
+        due_total_minutes: i64,
+        due_label: &str,
+        kind: &str,
+        title: &str,
+        payload: Value,
+    ) -> Result<ScheduledEventRecord> {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO scheduled_events (id, campaign_id, due_total_minutes, due_label, kind, title, payload)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(id)
+        .bind(campaign_id)
+        .bind(due_total_minutes)
+        .bind(due_label)
+        .bind(kind)
+        .bind(title)
+        .bind(&payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(ScheduledEventRecord {
+            id,
+            campaign_id,
+            due_total_minutes,
+            due_label: due_label.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            payload,
+            completed: false,
+        })
+    }
+
+    pub async fn list_pending_events(&self, campaign_id: Uuid) -> Result<Vec<ScheduledEventRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, campaign_id, due_total_minutes, due_label, kind, title, payload, completed
+             FROM scheduled_events
+             WHERE campaign_id = $1 AND completed = FALSE
+             ORDER BY due_total_minutes ASC",
+        )
+        .bind(campaign_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(ScheduledEventRecord {
+                    id: r.try_get("id")?,
+                    campaign_id: r.try_get("campaign_id")?,
+                    due_total_minutes: r.try_get("due_total_minutes")?,
+                    due_label: r.try_get("due_label")?,
+                    kind: r.try_get("kind")?,
+                    title: r.try_get("title")?,
+                    payload: r.try_get("payload")?,
+                    completed: r.try_get("completed")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn complete_due_events(
+        &self,
+        campaign_id: Uuid,
+        now_total_minutes: i64,
+    ) -> Result<Vec<ScheduledEventRecord>> {
+        let rows = sqlx::query(
+            "UPDATE scheduled_events SET completed = TRUE
+             WHERE campaign_id = $1 AND completed = FALSE AND due_total_minutes <= $2
+             RETURNING id, campaign_id, due_total_minutes, due_label, kind, title, payload, completed",
+        )
+        .bind(campaign_id)
+        .bind(now_total_minutes)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(ScheduledEventRecord {
+                    id: r.try_get("id")?,
+                    campaign_id: r.try_get("campaign_id")?,
+                    due_total_minutes: r.try_get("due_total_minutes")?,
+                    due_label: r.try_get("due_label")?,
+                    kind: r.try_get("kind")?,
+                    title: r.try_get("title")?,
+                    payload: r.try_get("payload")?,
+                    completed: r.try_get("completed")?,
+                })
+            })
+            .collect()
     }
 }

@@ -80,7 +80,7 @@ export interface Character {
 
 export interface CharacterRow {
   character: Character;
-  equipment: unknown[];
+  equipment: Array<Record<string, unknown>>;
 }
 
 export interface ValidationIssue {
@@ -89,10 +89,20 @@ export interface ValidationIssue {
   message: string;
 }
 
+export interface CargoLot {
+  d66?: number;
+  name: string;
+  tons: number;
+  purchase_price_cr?: number;
+  bought_at?: string;
+}
+
 export interface ShipRecord {
   id: string;
+  campaign_id?: string;
   name: string;
   class_name: string;
+  owner_account_id?: string | null;
   spec: {
     tonnage: number;
     tl: number;
@@ -109,6 +119,8 @@ export interface ShipRecord {
     low_berths: number;
     cargo_capacity_tons: number;
     purchase_price_cr: number;
+    weapons?: Array<{ name: string; mount: string; count: number; power: number; tonnage: number }>;
+    [key: string]: unknown;
   };
   validation: {
     valid: boolean;
@@ -128,6 +140,8 @@ export interface ShipRecord {
   fuel_refined: number;
   fuel_unrefined: number;
   crits: Array<{ name?: string; effect?: string; date?: string }>;
+  cargo: CargoLot[];
+  passengers: Array<Record<string, unknown>>;
   mortgage?: {
     active: boolean;
     monthly_payment_cr: number;
@@ -137,6 +151,7 @@ export interface ShipRecord {
     arrears_cr: number;
   } | null;
   skipped_maintenance_periods: number;
+  last_annual_overhaul_year?: number;
   docked_system_name: string;
 }
 
@@ -157,6 +172,111 @@ export interface TransactionRecord {
   category: string;
   description: string;
   counterparty: string;
+}
+
+export interface ScheduledEventRecord {
+  id: string;
+  campaign_id: string;
+  due_total_minutes: number;
+  due_label: string;
+  kind: string;
+  title: string;
+  payload: Record<string, unknown>;
+  completed: boolean;
+}
+
+export interface CombatRecord {
+  id: string;
+  campaign_id: string;
+  kind: "personal" | "space";
+  status: string;
+  round: number;
+  phase: string;
+  state: Record<string, unknown>;
+}
+
+export interface SectorRecord {
+  id: string;
+  name: string;
+  abbreviation: string;
+  sector_x: number;
+  sector_y: number;
+  system_count: number;
+}
+
+export interface SystemRecord {
+  id: string;
+  sector_id: string;
+  sector_name: string;
+  hex: string;
+  name: string;
+  uwp: string;
+  starport: string;
+  tech_level: number;
+  law_level: number;
+  trade_codes: string[];
+  bases: string[];
+  allegiance: string;
+  travel_zone: string;
+  gas_giants: number;
+  global_x: number;
+  global_y: number;
+  metadata: Record<string, unknown>;
+}
+
+export interface ItemRecord {
+  id: string;
+  pack_id: string;
+  category: string;
+  name: string;
+  tl: number;
+  cost_cr: number;
+  mass_kg: number;
+  law_restriction: number;
+  stats: Record<string, unknown>;
+  tags: string[];
+}
+
+export interface LifepathLogEntry {
+  term: number;
+  age: number;
+  career: string;
+  qualified: boolean;
+  survived: boolean;
+  advanced: boolean;
+  rank: number;
+  skills_gained: string[];
+  event: string;
+  aging_note?: string | null;
+}
+
+export interface LifepathSession {
+  id: string;
+  name: string;
+  species: string;
+  age: number;
+  terms_completed: number;
+  upp: Upp;
+  skills: Record<string, number>;
+  current_career?: string | null;
+  current_rank: number;
+  benefit_rolls_earned: number;
+  cash_cr: number;
+  ship_shares: number;
+  career_ship_benefits: number;
+  pension_cr: number;
+  allies: string[];
+  rivals: string[];
+  mustered_out: boolean;
+  log: LifepathLogEntry[];
+}
+
+export interface CrewCandidate {
+  role: string;
+  career: string;
+  terms: number;
+  asking_salary_cr: number;
+  character: Character;
 }
 
 export interface MessageRecord {
@@ -183,6 +303,10 @@ export interface CampaignSnapshot {
     output_tokens: number;
     cache_read_tokens: number;
   };
+  active_personal_combat?: CombatRecord | null;
+  active_space_combat?: CombatRecord | null;
+  pending_events?: ScheduledEventRecord[];
+  pack_stats?: { sectors: number; items: number };
 }
 
 export type TurnEvent =
@@ -231,6 +355,8 @@ export const api = {
     }),
   getSnapshot: (id: string) => req<CampaignSnapshot>(`/api/campaigns/${id}/snapshot`),
   listMessages: (id: string) => req<{ messages: MessageRecord[] }>(`/api/campaigns/${id}/messages`),
+
+  // Characters & Lifepath Chargen
   createCharacter: (id: string, body: Record<string, unknown>) =>
     req<{ character: CharacterRow }>(`/api/campaigns/${id}/characters`, {
       method: "POST",
@@ -246,8 +372,131 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ skill, allow_general_xp: true }),
     }),
+  chargenStart: (name: string, species = "Human", background_skills: string[] = []) =>
+    req<{ session: LifepathSession }>("/api/chargen/start", {
+      method: "POST",
+      body: JSON.stringify({ name, species, background_skills }),
+    }),
+  chargenTerm: (session: LifepathSession, career: string, prefer_specialist: boolean) =>
+    req<{ session: LifepathSession; entry: LifepathLogEntry }>("/api/chargen/term", {
+      method: "POST",
+      body: JSON.stringify({ session, career, prefer_specialist }),
+    }),
+  chargenMuster: (session: LifepathSession, cash_rolls: number) =>
+    req<{ session: LifepathSession }>("/api/chargen/muster", {
+      method: "POST",
+      body: JSON.stringify({ session, cash_rolls }),
+    }),
+  chargenCommit: (
+    id: string,
+    session: LifepathSession,
+    kind: "player" | "crew" | "npc",
+    salary_cr: number,
+    station?: string,
+    deposit_cash_account_id?: string
+  ) =>
+    req<{ character: CharacterRow }>(`/api/campaigns/${id}/chargen/commit`, {
+      method: "POST",
+      body: JSON.stringify({ session, kind, salary_cr, station, deposit_cash_account_id }),
+    }),
+
+  // Ships
+  updateShip: (id: string, shipId: string, ship: ShipRecord) =>
+    req<{ ship: ShipRecord }>(`/api/campaigns/${id}/ships/${shipId}`, {
+      method: "PATCH",
+      body: JSON.stringify(ship),
+    }),
+
+  // Universe & Jump
+  listSectors: () => req<{ sectors: SectorRecord[] }>("/api/universe/sectors"),
+  listSectorSystems: (sectorId: string) =>
+    req<{ systems: SystemRecord[] }>(`/api/universe/sectors/${sectorId}/systems`),
+  searchSystems: (q: string, tradeCode?: string, limit = 40) => {
+    const p = new URLSearchParams();
+    if (q) p.set("q", q);
+    if (tradeCode) p.set("trade_code", tradeCode);
+    p.set("limit", String(limit));
+    return req<{ systems: SystemRecord[] }>(`/api/universe/systems/search?${p.toString()}`);
+  },
+  planRoute: (from_system: string, to_system: string, jump_rating: number, avoid_red_zones = true, require_refuel = true) =>
+    req<{ found: boolean; jump_rating: number; route?: { total_jumps: number; total_parsecs: number; legs: Array<{ from: { name: string; hex: string }; to: { name: string; hex: string; uwp: string }; parsecs: number; refuel_options: string[] }> } }>("/api/universe/route", {
+      method: "POST",
+      body: JSON.stringify({ from_system, to_system, jump_rating, avoid_red_zones, require_refuel }),
+    }),
+  executeJump: (id: string, to_system: string, ship_id?: string) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/jump`, {
+      method: "POST",
+      body: JSON.stringify({ to_system, ship_id }),
+    }),
+
+  // Items & CSC 2023 Shop
+  searchItems: (q: string, category?: string, maxTl?: number, limit = 80) => {
+    const p = new URLSearchParams();
+    if (q) p.set("q", q);
+    if (category) p.set("category", category);
+    if (maxTl !== undefined) p.set("max_tl", String(maxTl));
+    p.set("limit", String(limit));
+    return req<{ items: ItemRecord[] }>(`/api/items?${p.toString()}`);
+  },
+  shopAvailability: (id: string, body: Record<string, unknown>) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/shop/availability`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  shopPurchase: (id: string, body: Record<string, unknown>) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/shop/purchase`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // Trade
+  tradeMarket: (id: string, body: Record<string, unknown>) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/trade/market`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  tradeBuy: (id: string, body: Record<string, unknown>) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/trade/buy`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  tradeSell: (id: string, body: Record<string, unknown>) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/trade/sell`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // Crew Hiring Hall
+  hiringHall: (id: string, roles: string[] = []) =>
+    req<{ system: string; candidates: CrewCandidate[] }>(`/api/campaigns/${id}/crew/hiring-hall`, {
+      method: "POST",
+      body: JSON.stringify({ roles }),
+    }),
+  hireCrew: (id: string, body: Record<string, unknown>) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/crew/hire`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // Combat (Personal & Space)
+  personalCombat: (id: string, body: Record<string, unknown>) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/combat/personal`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  spaceCombat: (id: string, body: Record<string, unknown>) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/combat/space`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // Time, Events, Finances, Dice, Sensors
   advanceTime: (id: string, body: Record<string, unknown>) =>
     req(`/api/campaigns/${id}/time/advance`, { method: "POST", body: JSON.stringify(body) }),
+  createEvent: (id: string, body: Record<string, unknown>) =>
+    req(`/api/campaigns/${id}/events`, { method: "POST", body: JSON.stringify(body) }),
+  createTransaction: (id: string, body: Record<string, unknown>) =>
+    req(`/api/campaigns/${id}/transactions`, { method: "POST", body: JSON.stringify(body) }),
   transferFunds: (id: string, fromId: string, toId: string, amountCr: number, description: string) =>
     req(`/api/campaigns/${id}/accounts/transfer`, {
       method: "POST",
@@ -268,6 +517,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  reloadPacks: () => req<Record<string, unknown>>("/api/packs/reload", { method: "POST" }),
+
   async streamChat(id: string, message: string, onEvent: (ev: TurnEvent) => void): Promise<void> {
     const res = await fetch(`/api/campaigns/${id}/chat`, {
       method: "POST",
