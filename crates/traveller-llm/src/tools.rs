@@ -49,7 +49,7 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
         }),
         json!({
             "name": "sensor_check",
-            "description": "Resolve a High Guard 2024 sensor detection or stealthed re-acquisition check using exact observer sensor grade, TL difference, target emissions (M-Drive thrust, power plant, active sensors, transponder/comms), and target stealth/armor modifiers.",
+            "description": "Resolve a High Guard 2024 sensor detection or stealthed re-acquisition check using exact observer sensor grade, TL difference, target emissions (M-Drive thrust, power plant, active sensors, transponder/comms), and target stealth/armor modifiers. IMPORTANT: always pass target_stealth_armor_dm (e.g. -2, -4, -6) whenever the target has stealth coating, stealth hull, or stealth armor.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -74,7 +74,7 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
         }),
         json!({
             "name": "advance_time",
-            "description": "Advance the Imperial Calendar (DDD-YYYY HH:MM) by minutes/hours/days or execute a 1-week Jump (148 + 6D6 hours). Automatically processes 28-day Maintenance Periods: ship mortgages, 0.1%/yr maintenance, life support, crew salaries, and Poor Maintenance critical hit checks if skipped.",
+            "description": "Advance the Imperial Calendar (DDD-YYYY HH:MM) by minutes/hours/days or execute a 1-week Jump (148 + 6D6 hours). When a 28-day Maintenance Period passes and pay_maintenance_periods=true, this tool AUTOMATICALLY debits ship mortgages, 0.1%/yr maintenance, life support, and crew salaries from the Company account — NEVER call record_transaction again for those bills.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -88,7 +88,7 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
         }),
         json!({
             "name": "record_transaction",
-            "description": "Debit or credit a Personal or Company account and record a ledger transaction.",
+            "description": "Debit or credit a Personal or Company account and record a ledger transaction. Do NOT call this for 28-day Maintenance Periods (mortgage/maintenance/life support/salaries) that were already paid automatically by advance_time.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -465,6 +465,8 @@ pub async fn execute_tool(
                                 billing_events.push(json!({
                                     "ship": ship.name,
                                     "paid": true,
+                                    "already_debited_from_company_account": true,
+                                    "note": "Already posted to ledger and deducted from Company account. Do NOT call record_transaction again.",
                                     "total_cr": costs.total_cr,
                                     "balance_after_cr": tx.balance_after_cr
                                 }));

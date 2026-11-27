@@ -190,6 +190,7 @@ export type TurnEvent =
   | { type: "tool_call"; id: string; name: string; input: Record<string, unknown> }
   | { type: "tool_result"; id: string; name: string; result: string; is_error: boolean }
   | { type: "state_changed" }
+  | { type: "clear_draft" }
   | { type: "delta"; text: string }
   | { type: "done"; message_id: number; input_tokens: number; output_tokens: number; cache_read_tokens: number }
   | { type: "error"; message: string };

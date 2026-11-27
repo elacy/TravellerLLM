@@ -41,6 +41,7 @@ pub enum TurnEvent {
     ToolCall { id: String, name: String, input: Value },
     ToolResult { id: String, name: String, result: String, is_error: bool },
     StateChanged,
+    ClearDraft,
     Delta { text: String },
     Done {
         message_id: i64,
@@ -275,6 +276,12 @@ impl Orchestrator {
             if tool_uses.is_empty() || wrap_up {
                 final_text = round_text;
                 break;
+            }
+
+            // Clear any pre-tool scratch text streamed during this tool round so the
+            // frontend only displays the final Referee response cleanly.
+            if !round_text.is_empty() {
+                let _ = tx.send(TurnEvent::ClearDraft).await;
             }
 
             // Execute each tool call deterministically in Rust

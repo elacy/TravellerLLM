@@ -155,6 +155,7 @@ export default function App() {
     try {
       await api.streamChat(activeId, text, (ev: TurnEvent) => {
         if (ev.type === "status") setStatusChip(ev.message);
+        else if (ev.type === "clear_draft") setStreamText("");
         else if (ev.type === "delta") setStreamText((prev) => prev + ev.text);
         else if (ev.type === "tool_call") {
           setLiveTools((prev) => [...prev, { id: ev.id, name: ev.name, input: ev.input }]);
