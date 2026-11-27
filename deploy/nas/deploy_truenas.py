@@ -32,9 +32,10 @@ WS_URL = os.environ.get("TRUENAS_URL", "wss://nas.lacy.ie:443/websocket")
 KEY = os.environ.get("TRUENAS_API_KEY", "").strip()
 PG_PASS = os.environ.get("TRAVELLERLLM_PG_PASSWORD", "").strip()
 LITELLM_KEY = os.environ.get("LITELLM_API_KEY", "").strip()
+HINDSIGHT_KEY = os.environ.get("HINDSIGHT_API_KEY", "").strip()
 PROXY_SECRET = os.environ.get("AUTH_PROXY_SECRET", "").strip()
-REFEREE_MODEL = os.environ.get("REFEREE_MODEL", "deepseek/deepseek-chat")
-WORKER_MODEL = os.environ.get("WORKER_MODEL", "deepseek/deepseek-v4.1-flash-1017")
+REFEREE_MODEL = os.environ.get("REFEREE_MODEL", "openrouter/deepseek/deepseek-v4-pro")
+WORKER_MODEL = os.environ.get("WORKER_MODEL", "openrouter/deepseek/deepseek-v4.1-flash")
 
 if not KEY or not PG_PASS or not LITELLM_KEY:
     sys.exit("ERROR: set TRUENAS_API_KEY, TRAVELLERLLM_PG_PASSWORD, and LITELLM_API_KEY")
@@ -115,6 +116,7 @@ def build_compose(pinned_image: str) -> dict:
                     "REFEREE_MODEL": REFEREE_MODEL,
                     "WORKER_MODEL": WORKER_MODEL,
                     "HINDSIGHT_BASE_URL": "http://10.233.12.5:8888",
+                    "HINDSIGHT_API_KEY": HINDSIGHT_KEY,
                     "HINDSIGHT_ENABLED": "true",
                 },
                 "ports": [{"published": HOST_PORT, "target": 3080}],

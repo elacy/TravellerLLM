@@ -35,10 +35,11 @@ services:
       AUTH_LOGOUT_URL: /outpost.goauthentik.io/sign_out
       LITELLM_BASE_URL: http://10.233.12.5:4000
       LITELLM_API_KEY: ${LITELLM_API_KEY:?set LITELLM_API_KEY}
-      REFEREE_MODEL: ${REFEREE_MODEL:-deepseek/deepseek-chat}
-      WORKER_MODEL: ${WORKER_MODEL:-deepseek/deepseek-v4.1-flash-1017}
-      SUMMARIZER_FALLBACK_MODEL: ${SUMMARIZER_FALLBACK_MODEL:-z-ai/glm-5.3-flash}
+      REFEREE_MODEL: ${REFEREE_MODEL:-openrouter/deepseek/deepseek-v4-pro}
+      WORKER_MODEL: ${WORKER_MODEL:-openrouter/deepseek/deepseek-v4.1-flash}
+      SUMMARIZER_FALLBACK_MODEL: ${SUMMARIZER_FALLBACK_MODEL:-openrouter/deepseek/deepseek-v4-flash}
       HINDSIGHT_BASE_URL: http://10.233.12.5:8888
+      HINDSIGHT_API_KEY: ${HINDSIGHT_API_KEY:-}
       HINDSIGHT_ENABLED: "true"
     ports:
       - published: 3080
