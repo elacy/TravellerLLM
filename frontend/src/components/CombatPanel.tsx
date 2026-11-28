@@ -346,7 +346,14 @@ export function CombatPanel({ campaignId, snapshot, onRefresh, onError }: Props)
                   >
                     {inSystemTargets.map((v) => (
                       <option key={v.id} value={v.id}>
-                        {v.name} — {v.ship_class} ({v.tonnage}t, {v.disposition}, {v.orbit_location})
+                        {v.display_name}
+                        {v.ship_class ? ` — ${v.ship_class}` : " — Unidentified Hull"}
+                        {v.tonnage ? ` (${v.tonnage}t)` : ""} · {v.orbit_location}
+                        {v.observed_status === "hostile"
+                          ? " [HOSTILE]"
+                          : !v.transponder_active
+                          ? " [NO TRANSPONDER]"
+                          : ""}
                       </option>
                     ))}
                   </select>

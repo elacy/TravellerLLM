@@ -18,7 +18,9 @@ use traveller_rules::commerce::{check_item_availability, AvailabilityInput, Lega
 use traveller_rules::crew::generate_hiring_hall;
 use traveller_rules::dice::{resolve_task, roll_d66, roll_nd6, Difficulty, ModifierItem, RollMode};
 use traveller_rules::finance::AccountKind;
-use traveller_rules::sensors::{resolve_sensor_detection, SensorContext, SensorDetectionInput};
+use traveller_rules::sensors::{
+    resolve_sensor_detection, DetectionLevel, SensorContext, SensorDetectionInput,
+};
 use traveller_rules::ship::{
     berthing_extra_day_rate, calculate_accrued_berthing_fee, calculate_refuel_quote,
     compute_running_costs, fleet_max_jump_rating, jump_fuel_for_distance, roll_berthing_fee,
@@ -113,7 +115,7 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
         }),
         json!({
             "name": "system_traffic",
-            "description": "Inspect or interact with starships currently in the campaign's star system: list all ships in-system, sweep/refresh system traffic, hail a vessel over comms, run a High Guard sensor scan against a specific vessel's emissions/stealth, engage a vessel in High Guard Space Combat, or update its disposition/status.",
+            "description": "Inspect or interact with starships currently in the campaign's star system with MgT2e High Guard fog-of-war: list detected ships, run an active High Guard sensor sweep (`scan_system`) to spot undetected transponder-dark vessels, hail a detected vessel over comms, run a focused sensor scan (`sensor_scan`) on a detected vessel, engage a detected vessel in Space Combat, or update vessel status / reveal intel (`captain_known`, `hostility_observed`, `detected`, `observed_status`).",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -121,7 +123,12 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
                     "vessel_id": {"type": "string", "description": "UUID of the in-system vessel for hail/sensor_scan/engage/update_status."},
                     "message": {"type": "string", "description": "Optional comms message when hailing a ship."},
                     "disposition": {"type": "string", "enum": ["friendly", "neutral", "cautious", "hostile", "distress"]},
-                    "status": {"type": "string", "enum": ["in_system", "docked", "departed", "boarded", "destroyed"]},
+                    "status": {"type": "string", "enum": ["in_system", "in_combat", "docked", "departed", "boarded", "destroyed"]},
+                    "detected": {"type": "boolean", "description": "Set true when a previously undetected dark ship breaks silence or becomes visible."},
+                    "detection_level": {"type": "string", "enum": ["minimal", "transponder", "limited", "full", "pinpoint_lock"]},
+                    "captain_known": {"type": "boolean", "description": "Set true ONLY when the ship broadcasts or introduces its captain on comms."},
+                    "hostility_observed": {"type": "boolean", "description": "Set true ONLY when the ship threatens, locks weapons, or opens fire on the player."},
+                    "observed_status": {"type": "string", "enum": ["transponder_active", "running_dark", "distress_beacon", "comms_open", "weapons_hot", "hostile", "destroyed"]},
                     "range_band": {"type": "string", "enum": ["adjacent", "close", "short", "medium", "long", "very_long", "distant"], "default": "long"}
                 },
                 "required": ["action"]
@@ -748,6 +755,10 @@ pub async fn execute_tool(
                     let stored_ships = db
                         .replace_system_ships(campaign_id, &dest.name, &traffic_report.vessels)
                         .await?;
+                    let visible_ships: Vec<_> = stored_ships
+                        .iter()
+                        .filter_map(|s| s.to_player_view())
+                        .collect();
 
                     Ok(ToolExecutionResult {
                         output_json: serde_json::to_string(&json!({
@@ -758,9 +769,9 @@ pub async fn execute_tool(
                             "fuel_burned_tons": fuel_burned_total,
                             "fleet_fuel_log": fleet_fuel_log,
                             "time_advance": time_json,
-                            "in_system_ship_count": stored_ships.len(),
+                            "in_system_ship_count": visible_ships.len(),
                             "traffic_summary": traffic_report.summary,
-                            "in_system_ships": stored_ships
+                            "in_system_ships": visible_ships
                         }))?,
                         state_changed: true,
                     })
@@ -1539,12 +1550,34 @@ pub async fn execute_tool(
                             .await?;
                         let target_vessel = in_system
                             .iter()
-                            .find(|v| v.status != "destroyed" && v.disposition == "hostile")
-                            .or_else(|| in_system.iter().find(|v| v.status != "destroyed"))
+                            .find(|v| v.detected && v.status != "destroyed" && v.hostility_observed)
+                            .or_else(|| {
+                                in_system
+                                    .iter()
+                                    .find(|v| v.detected && v.status != "destroyed")
+                            })
                             .cloned()
                             .context(
-                                "No target ship specified and no vessels are currently in-system to engage. Select an in-system contact or pass explicit ships.",
+                                "No target ship specified and no detected vessels are currently in-system to engage. Run a Sensor Sweep or select a detected contact.",
                             )?;
+                        let _ = db
+                            .update_system_ship_intel(
+                                campaign_id,
+                                target_vessel.id,
+                                Some("hostile"),
+                                Some("in_combat"),
+                                None,
+                                Some(true),
+                                None,
+                                None,
+                                Some(true),
+                                Some("hostile"),
+                            )
+                            .await;
+                        let target_display_name = target_vessel
+                            .to_player_view()
+                            .map(|p| p.display_name)
+                            .unwrap_or_else(|| target_vessel.name.clone());
 
                         for s in db.list_ships(campaign_id).await? {
                             ships_list.push(SpaceCombatShip {
@@ -1574,7 +1607,7 @@ pub async fn execute_tool(
                         }
                         ships_list.push(SpaceCombatShip {
                             ship_id: target_vessel.id,
-                            name: target_vessel.name,
+                            name: target_display_name,
                             side: "hostile".into(),
                             tonnage: target_vessel.tonnage.max(0) as u32,
                             tl: target_vessel.tl.max(0) as u8,
@@ -2225,6 +2258,51 @@ pub async fn execute_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("list");
 
+            // Compute best fleet sensor operator (Electronics (Sensors) + EDU DM) and flagship sensor suite
+            let compute_fleet_sensor_profile = |chars: &[traveller_db::CharacterRow],
+                                                ships: &[traveller_db::ShipRecord]|
+             -> (i32, i32, SensorGrade, u8, bool) {
+                let mut best_edu_dm = 0;
+                let mut best_skill = -3;
+                let mut best_total = -99;
+                for row in chars {
+                    if !matches!(row.character.kind, CharacterKind::Player | CharacterKind::Crew) {
+                        continue;
+                    }
+                    let edu_dm = row.character.upp_current.dm(Characteristic::Edu);
+                    let sk = row
+                        .character
+                        .raw_skill_level("Electronics (Sensors)")
+                        .or_else(|| row.character.raw_skill_level("Electronics (sensors)"))
+                        .or_else(|| row.character.raw_skill_level("Electronics"))
+                        .unwrap_or(-3);
+                    if edu_dm + sk > best_total {
+                        best_total = edu_dm + sk;
+                        best_edu_dm = edu_dm;
+                        best_skill = sk;
+                    }
+                }
+                if best_total == -99 {
+                    best_edu_dm = 0;
+                    best_skill = 0;
+                }
+                let (grade, tl, ext) = ships
+                    .first()
+                    .map(|s| (s.spec.sensor_grade, s.spec.tl, s.spec.extended_sensor_array))
+                    .unwrap_or((SensorGrade::Civilian, 12, false));
+                (best_edu_dm, best_skill, grade, tl, ext)
+            };
+
+            let detection_level_str = |lvl: DetectionLevel| -> &'static str {
+                match lvl {
+                    DetectionLevel::Undetected => "undetected",
+                    DetectionLevel::Minimal => "minimal",
+                    DetectionLevel::Limited => "limited",
+                    DetectionLevel::Full => "full",
+                    DetectionLevel::PinpointLock => "pinpoint_lock",
+                }
+            };
+
             match action {
                 "list" => {
                     let mut ships = db
@@ -2255,45 +2333,150 @@ pub async fn execute_tool(
                             )
                             .await?;
                     }
+                    let visible: Vec<_> = ships.iter().filter_map(|s| s.to_player_view()).collect();
                     Ok(ToolExecutionResult {
                         output_json: serde_json::to_string(&json!({
                             "system": camp.current_system_name,
-                            "in_system_ship_count": ships.len(),
-                            "ships": ships
+                            "in_system_ship_count": visible.len(),
+                            "ships": visible
                         }))?,
                         state_changed: false,
                     })
                 }
                 "scan_system" => {
-                    let sys_rec = db.get_system_by_name(&camp.current_system_name).await?;
-                    let uwp = parse_uwp(&camp.current_system_uwp)
-                        .unwrap_or_else(|_| parse_uwp("C555555-9").expect("valid uwp"));
-                    let (bases, zone) = sys_rec
-                        .map(|s| (s.bases, s.travel_zone))
-                        .unwrap_or_else(|| (vec![], "Green".to_string()));
-                    let report = {
-                        let mut r = rng();
-                        generate_system_traffic(
-                            &mut r,
-                            &camp.current_system_name,
-                            &uwp,
-                            &bases,
-                            &zone,
+                    // Active High Guard 2024 System-Wide Sensor Sweep:
+                    // Ensures system traffic exists, then runs sensor detection checks against
+                    // any currently UNDETECTED transponder-dark vessels! Never reveals how many
+                    // undetected vessels remain if a sweep misses them.
+                    let mut ships = db
+                        .list_system_ships(campaign_id, &camp.current_system_name)
+                        .await?;
+                    if ships.is_empty() {
+                        let sys_rec = db.get_system_by_name(&camp.current_system_name).await?;
+                        let uwp = parse_uwp(&camp.current_system_uwp)
+                            .unwrap_or_else(|_| parse_uwp("C555555-9").expect("valid uwp"));
+                        let (bases, zone) = sys_rec
+                            .map(|s| (s.bases, s.travel_zone))
+                            .unwrap_or_else(|| (vec![], "Green".to_string()));
+                        let report = {
+                            let mut r = rng();
+                            generate_system_traffic(
+                                &mut r,
+                                &camp.current_system_name,
+                                &uwp,
+                                &bases,
+                                &zone,
+                            )
+                        };
+                        ships = db
+                            .replace_system_ships(
+                                campaign_id,
+                                &camp.current_system_name,
+                                &report.vessels,
+                            )
+                            .await?;
+                    }
+
+                    let chars = db.list_characters(campaign_id).await?;
+                    let player_ships = db.list_ships(campaign_id).await?;
+                    let (edu_dm, sensors_skill, obs_grade, obs_tl, ext_array) =
+                        compute_fleet_sensor_profile(&chars, &player_ships);
+
+                    let mut newly_detected = 0usize;
+                    let mut updated_ships = Vec::with_capacity(ships.len());
+                    for v in ships {
+                        if v.detected {
+                            updated_ships.push(v);
+                            continue;
+                        }
+                        let det = {
+                            let mut r = rng();
+                            resolve_sensor_detection(
+                                &mut r,
+                                &SensorDetectionInput {
+                                    context: SensorContext::SpaceInitialDetection,
+                                    operator_edu_dm: edu_dm,
+                                    operator_sensors_skill: sensors_skill,
+                                    augment_or_software_dm: 0,
+                                    observer_sensor_grade: obs_grade,
+                                    observer_tl: obs_tl,
+                                    observer_extended_array: ext_array,
+                                    observer_active_sensors: true,
+                                    target_tl: v.tl.max(0) as u8,
+                                    target_active_sensors: false,
+                                    target_thrust_applied: 0,
+                                    target_power_plant_active: true,
+                                    target_transponder_or_comms: false,
+                                    target_stealth_armor_dm: i32::from(v.stealth_dm),
+                                    target_fired_weapons: false,
+                                    target_crit_damage_severity: if v.hull_current < v.hull_max {
+                                        1
+                                    } else {
+                                        0
+                                    },
+                                    // Wide-area system sweep penalty (-2 DM at system-scale distances)
+                                    situational_dm: -2,
+                                    roll_mode: RollMode::Normal,
+                                },
+                            )
+                        };
+                        // Wide-area sweep spots a dark ship on Effect >= -1 (Minimal at -1, Limited/Full/Lock on 0+)
+                        if det.roll.effect >= -1 {
+                            let lvl_str = detection_level_str(det.detection_level);
+                            let saved = db
+                                .update_system_ship_intel(
+                                    campaign_id,
+                                    v.id,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(true),
+                                    Some(lvl_str),
+                                    None,
+                                    None,
+                                    Some("running_dark"),
+                                )
+                                .await?
+                                .unwrap_or(v);
+                            newly_detected += 1;
+                            updated_ships.push(saved);
+                        } else {
+                            updated_ships.push(v);
+                        }
+                    }
+
+                    let visible: Vec<_> = updated_ships
+                        .iter()
+                        .filter_map(|s| s.to_player_view())
+                        .collect();
+                    let dark_visible = visible.iter().filter(|s| !s.transponder_active).count();
+                    let summary = if newly_detected > 0 {
+                        format!(
+                            "Active sensor sweep of {} ({:?} sensors, operator DM {:+}): spotted {} previously undetected transponder-dark contact(s)! Total {} contact(s) on scope ({} running dark).",
+                            camp.current_system_name,
+                            obs_grade,
+                            edu_dm + sensors_skill,
+                            newly_detected,
+                            visible.len(),
+                            dark_visible
+                        )
+                    } else {
+                        format!(
+                            "Active sensor sweep of {} ({:?} sensors, operator DM {:+}): {} contact(s) on scope; no additional silent contacts detected.",
+                            camp.current_system_name,
+                            obs_grade,
+                            edu_dm + sensors_skill,
+                            visible.len()
                         )
                     };
-                    let ships = db
-                        .replace_system_ships(
-                            campaign_id,
-                            &camp.current_system_name,
-                            &report.vessels,
-                        )
-                        .await?;
+
                     Ok(ToolExecutionResult {
                         output_json: serde_json::to_string(&json!({
                             "system": camp.current_system_name,
-                            "in_system_ship_count": ships.len(),
-                            "summary": report.summary,
-                            "ships": ships
+                            "in_system_ship_count": visible.len(),
+                            "newly_detected_count": newly_detected,
+                            "summary": summary,
+                            "ships": visible
                         }))?,
                         state_changed: true,
                     })
@@ -2305,6 +2488,13 @@ pub async fn execute_tool(
                             .and_then(|v| v.as_str())
                             .context("vessel_id required")?,
                     )?;
+                    let current = db
+                        .get_system_ship(campaign_id, vessel_id)
+                        .await?
+                        .context("In-system vessel not found")?;
+                    if !current.detected {
+                        anyhow::bail!("Cannot hail an undetected contact — run a Sensor Sweep first.");
+                    }
                     let msg = input
                         .get("message")
                         .and_then(|v| v.as_str())
@@ -2315,20 +2505,41 @@ pub async fn execute_tool(
                         "from": "player",
                         "message": msg
                     });
+                    // Do NOT leak hidden captain_name or disposition on hail!
+                    // Only mark comms_open if transponder-active and not already hostile/distress.
+                    let next_obs = if current.hostility_observed || current.observed_status == "distress_beacon" {
+                        None
+                    } else if current.transponder_active {
+                        Some("comms_open")
+                    } else {
+                        None
+                    };
                     let vessel = db
-                        .update_system_ship(campaign_id, vessel_id, disp, None, Some(entry))
+                        .update_system_ship_intel(
+                            campaign_id,
+                            vessel_id,
+                            disp,
+                            None,
+                            Some(entry),
+                            None,
+                            None,
+                            None,
+                            None,
+                            next_obs,
+                        )
                         .await?
                         .context("In-system vessel not found")?;
+                    let view = vessel
+                        .to_player_view()
+                        .context("Vessel is not visible on sensors")?;
                     Ok(ToolExecutionResult {
                         output_json: serde_json::to_string(&json!({
-                            "hailed": vessel.name,
-                            "captain": vessel.captain_name,
-                            "faction": vessel.faction,
-                            "disposition": vessel.disposition,
-                            "orbit": vessel.orbit_location,
-                            "transponder_active": vessel.transponder_active,
-                            "cargo_hint": vessel.cargo_hint,
-                            "vessel": vessel
+                            "hailed": view.display_name,
+                            "orbit": view.orbit_location,
+                            "transponder_active": view.transponder_active,
+                            "observed_status": view.observed_status,
+                            "captain_name": view.captain_name,
+                            "vessel": view
                         }))?,
                         state_changed: true,
                     })
@@ -2344,23 +2555,25 @@ pub async fn execute_tool(
                         .get_system_ship(campaign_id, vessel_id)
                         .await?
                         .context("In-system vessel not found")?;
+                    if !vessel.detected {
+                        anyhow::bail!("Cannot focus-scan an undetected contact — run a system Sensor Sweep first.");
+                    }
+                    let chars = db.list_characters(campaign_id).await?;
                     let player_ships = db.list_ships(campaign_id).await?;
-                    let (obs_grade, obs_tl) = player_ships
-                        .first()
-                        .map(|s| (s.spec.sensor_grade, s.spec.tl))
-                        .unwrap_or((SensorGrade::Civilian, 12));
+                    let (edu_dm, sensors_skill, obs_grade, obs_tl, ext_array) =
+                        compute_fleet_sensor_profile(&chars, &player_ships);
                     let det = {
                         let mut r = rng();
                         resolve_sensor_detection(
                             &mut r,
                             &SensorDetectionInput {
                                 context: SensorContext::SpaceInitialDetection,
-                                operator_edu_dm: 1,
-                                operator_sensors_skill: 1,
+                                operator_edu_dm: edu_dm,
+                                operator_sensors_skill: sensors_skill,
                                 augment_or_software_dm: 0,
                                 observer_sensor_grade: obs_grade,
                                 observer_tl: obs_tl,
-                                observer_extended_array: false,
+                                observer_extended_array: ext_array,
                                 observer_active_sensors: true,
                                 target_tl: vessel.tl.max(0) as u8,
                                 target_active_sensors: vessel.transponder_active,
@@ -2368,32 +2581,69 @@ pub async fn execute_tool(
                                 target_power_plant_active: true,
                                 target_transponder_or_comms: vessel.transponder_active,
                                 target_stealth_armor_dm: i32::from(vessel.stealth_dm),
-                                target_fired_weapons: false,
+                                target_fired_weapons: vessel.hostility_observed,
                                 target_crit_damage_severity: if vessel.hull_current < vessel.hull_max { 1 } else { 0 },
                                 situational_dm: 0,
                                 roll_mode: RollMode::Normal,
                             },
                         )
                     };
+                    let new_level_str = detection_level_str(det.detection_level);
+                    let updated = if det.detection_level != DetectionLevel::Undetected {
+                        db.update_system_ship_intel(
+                            campaign_id,
+                            vessel_id,
+                            None,
+                            None,
+                            None,
+                            Some(true),
+                            Some(new_level_str),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await?
+                        .unwrap_or(vessel)
+                    } else {
+                        vessel
+                    };
+                    let view = updated
+                        .to_player_view()
+                        .context("Vessel is not visible on sensors")?;
+                    let revealed = match det.detection_level {
+                        DetectionLevel::Full | DetectionLevel::PinpointLock => json!({
+                            "level": new_level_str,
+                            "ship_class": view.ship_class,
+                            "tonnage": view.tonnage,
+                            "hull": format!("{}/{}", updated.hull_current, updated.hull_max),
+                            "armor": updated.armor,
+                            "thrust": updated.thrust,
+                            "jump_rating": updated.jump_rating,
+                            "stealth_dm": updated.stealth_dm,
+                            "sensor_notes": updated.cargo_hint
+                        }),
+                        DetectionLevel::Limited => json!({
+                            "level": new_level_str,
+                            "ship_class": view.ship_class,
+                            "tonnage": view.tonnage,
+                            "thrust": updated.thrust,
+                            "jump_rating": updated.jump_rating,
+                            "note": "Limited return — drive emissions & hull profile resolved; armor/internal bays masked."
+                        }),
+                        _ => json!({
+                            "level": new_level_str,
+                            "note": "Minimal return — target signature too faint or stealthed for hull/drive breakdown."
+                        }),
+                    };
                     Ok(ToolExecutionResult {
                         output_json: serde_json::to_string(&json!({
-                            "target": vessel.name,
-                            "ship_class": vessel.ship_class,
+                            "target": view.display_name,
+                            "ship_class": view.ship_class,
                             "sensor_detection": det,
-                            "revealed": if det.roll.success {
-                                json!({
-                                    "tonnage": vessel.tonnage,
-                                    "hull": format!("{}/{}", vessel.hull_current, vessel.hull_max),
-                                    "armor": vessel.armor,
-                                    "thrust": vessel.thrust,
-                                    "stealth_dm": vessel.stealth_dm,
-                                    "cargo_hint": vessel.cargo_hint
-                                })
-                            } else {
-                                json!({"note": "Target signature too faint / stealthed for detailed scan."})
-                            }
+                            "revealed": revealed,
+                            "vessel": view
                         }))?,
-                        state_changed: false,
+                        state_changed: true,
                     })
                 }
                 "engage" => {
@@ -2403,10 +2653,32 @@ pub async fn execute_tool(
                             .and_then(|v| v.as_str())
                             .context("vessel_id required")?,
                     )?;
-                    let vessel = db
-                        .update_system_ship(campaign_id, vessel_id, Some("hostile"), None, None)
+                    let current = db
+                        .get_system_ship(campaign_id, vessel_id)
                         .await?
                         .context("In-system vessel not found")?;
+                    if !current.detected {
+                        anyhow::bail!("Cannot engage an undetected contact — spot it on sensors first.");
+                    }
+                    let vessel = db
+                        .update_system_ship_intel(
+                            campaign_id,
+                            vessel_id,
+                            Some("hostile"),
+                            Some("in_combat"),
+                            None,
+                            Some(true),
+                            None,
+                            None,
+                            Some(true),
+                            Some("hostile"),
+                        )
+                        .await?
+                        .context("In-system vessel not found")?;
+                    let combat_name = vessel
+                        .to_player_view()
+                        .map(|p| p.display_name)
+                        .unwrap_or_else(|| vessel.name.clone());
                     let mut player_ships = db.list_ships(campaign_id).await?;
                     for ps_mut in &mut player_ships {
                         if ps_mut.is_docked {
@@ -2439,7 +2711,7 @@ pub async fn execute_tool(
                             },
                             {
                                 "ship_id": vessel.id.to_string(),
-                                "name": vessel.name,
+                                "name": combat_name,
                                 "side": "hostile",
                                 "tonnage": vessel.tonnage,
                                 "tl": vessel.tl,
@@ -2462,17 +2734,22 @@ pub async fn execute_tool(
                             .context("vessel_id required")?,
                     )?;
                     let vessel = db
-                        .update_system_ship(
+                        .update_system_ship_intel(
                             campaign_id,
                             vessel_id,
                             input.get("disposition").and_then(|v| v.as_str()),
                             input.get("status").and_then(|v| v.as_str()),
                             None,
+                            input.get("detected").and_then(|v| v.as_bool()),
+                            input.get("detection_level").and_then(|v| v.as_str()),
+                            input.get("captain_known").and_then(|v| v.as_bool()),
+                            input.get("hostility_observed").and_then(|v| v.as_bool()),
+                            input.get("observed_status").and_then(|v| v.as_str()),
                         )
                         .await?
                         .context("In-system vessel not found")?;
                     Ok(ToolExecutionResult {
-                        output_json: serde_json::to_string(&json!({ "vessel": vessel }))?,
+                        output_json: serde_json::to_string(&json!({ "vessel": vessel.to_player_view() }))?,
                         state_changed: true,
                     })
                 }

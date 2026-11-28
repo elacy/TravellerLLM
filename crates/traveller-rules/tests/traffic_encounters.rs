@@ -30,7 +30,8 @@ fn system_traffic_scales_with_starport_bases_and_travel_zones() {
     let frontier_report = generate_system_traffic(&mut rng, "Forboldn", &frontier, &[], "Green");
     assert!(frontier_report.ship_count <= 3);
 
-    // 3. Red Zone interdicted world includes hostile naval patrol enforcement
+    // 3. Red Zone interdicted world includes hostile naval patrol enforcement,
+    //    but its arrival summary NEVER leaks hidden hostility or dark-ship counts!
     let red_world = parse_uwp("C555555-9").unwrap();
     let red_report = generate_system_traffic(&mut rng, "Interdict", &red_world, &[], "Red");
     assert!((1..=3).contains(&red_report.ship_count));
@@ -38,4 +39,9 @@ fn system_traffic_scales_with_starport_bases_and_travel_zones() {
         .vessels
         .iter()
         .any(|v| v.disposition == "hostile"));
+    assert!(
+        !red_report.summary.to_lowercase().contains("hostile"),
+        "Passive arrival summary must not leak hidden hostile disposition: {}",
+        red_report.summary
+    );
 }

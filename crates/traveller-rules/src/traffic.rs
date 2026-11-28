@@ -434,30 +434,27 @@ pub fn generate_system_traffic<R: Rng + ?Sized>(
     }
 
     let ship_count = vessels.len();
-    let summary = if ship_count == 0 {
-        format!("Sensors sweep {system_name} [{}]: space is empty (0 vessels detected).", uwp.raw)
+    let transponder_count = vessels.iter().filter(|v| v.transponder_active).count();
+    let distress_count = vessels
+        .iter()
+        .filter(|v| v.transponder_active && v.disposition == "distress")
+        .count();
+    // Fog-of-war safe arrival summary: ONLY reports passive transponder contacts & distress beacons,
+    // never spoiling undetected transponder-dark vessels or secret hostile dispositions!
+    let summary = if transponder_count == 0 {
+        format!(
+            "Passive traffic scope in {system_name} [{}]: no active transponders detected. Run an active Sensor Sweep to check for silent contacts.",
+            uwp.raw
+        )
     } else {
-        let dark_count = vessels.iter().filter(|v| !v.transponder_active).count();
-        let hostile_count = vessels.iter().filter(|v| v.disposition == "hostile").count();
-        let distress_count = vessels.iter().filter(|v| v.disposition == "distress").count();
         let mut s = format!(
-            "Sensors sweep {system_name} [{}]: {ship_count} ship(s) detected in-system",
+            "Passive traffic scope in {system_name} [{}]: {transponder_count} transponder contact(s) on scope",
             uwp.raw
         );
-        let mut notes = Vec::new();
-        if dark_count > 0 {
-            notes.push(format!("{dark_count} running transponder-dark"));
-        }
-        if hostile_count > 0 {
-            notes.push(format!("{hostile_count} potentially hostile"));
-        }
         if distress_count > 0 {
-            notes.push(format!("{distress_count} broadcasting distress"));
+            s.push_str(&format!(" ({distress_count} broadcasting distress beacon)"));
         }
-        if !notes.is_empty() {
-            s.push_str(&format!(" ({})", notes.join(", ")));
-        }
-        s.push('.');
+        s.push_str(". Run an active Sensor Sweep to check for transponder-dark ships.");
         s
     };
 

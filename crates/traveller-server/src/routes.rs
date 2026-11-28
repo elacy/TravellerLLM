@@ -328,9 +328,13 @@ async fn get_campaign_snapshot(
             system_ships = inserted;
         }
     }
+    let visible_system_ships: Vec<_> = system_ships
+        .iter()
+        .filter_map(|s| s.to_player_view())
+        .collect();
     let sector_count = st.db.count_sectors().await.unwrap_or(0);
     let item_count = st.db.count_items().await.unwrap_or(0);
-    let system_ship_count = system_ships.len();
+    let system_ship_count = visible_system_ships.len();
 
     // Compute fleet-wide metrics: lowest Jump rating, max Broker/Steward (incl. robots & Neural Jacks),
     // and total 4-week Maintenance Period running costs across all fleet ships + crew salaries.
@@ -402,7 +406,7 @@ async fn get_campaign_snapshot(
         "active_space_combat": active_space_combat,
         "pending_events": pending_events,
         "loaded_modules": loaded_modules,
-        "system_ships": system_ships,
+        "system_ships": visible_system_ships,
         "system_ship_count": system_ship_count,
         "fleet_max_jump": fleet_max_jump,
         "fleet_broker": fleet_broker,

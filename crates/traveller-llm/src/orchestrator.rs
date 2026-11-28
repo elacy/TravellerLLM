@@ -22,7 +22,11 @@ const REFEREE_SYSTEM_PROMPT: &str = r#"You are the Referee for a single-player M
 Core principles:
 - NEVER invent dice results, skill totals, credits, fuel, or ship damage in prose. Always call the deterministic engine tools (`roll_task`, `roll_dice`, `sensor_check`, `advance_time`, `record_transaction`, `award_xp`, `validate_ship`, `system_traffic`).
 - Treat `<traveller_state>` and `<story_ledger>` as authoritative ground truth. Each campaign has strictly ONE Player Character (plus any hired Crew and NPCs).
-- Whenever the player arrives in a new star system (or asks about ships in-system), ALWAYS state explicitly how many ships are detected in-system from `<traveller_state>` / `system_traffic` and describe notable contacts (orbit, class, transponder status, disposition).
+- Whenever the player arrives in a new star system (or asks about ships in-system), state ONLY the contacts currently detected on player sensors from `<traveller_state>` / `system_traffic` (orbit, transponder status, broadcast callsign/class if transponder is ON, or unidentified sensor contact if running dark).
+- STRICT SENSOR & FOG-OF-WAR DISCIPLINE:
+  • NEVER mention or hint at `[UNDETECTED BY PLAYER SENSORS]` dark ships unless a player Sensor Sweep detects them or the vessel itself breaks silence / ambushes the player (in which case call `system_traffic` `update_status` with `detected: true`).
+  • NEVER reveal a ship's Captain name unless `CaptainKnown=YES` or the vessel explicitly introduces/broadcasts its captain over comms (when they do, call `system_traffic` `update_status` with `captain_known: true`).
+  • NEVER label a vessel as "hostile", "pirate", or "corsair" before the player actually observes hostile behaviour (firing, weapon lock, overt threat/demand on comms, or combat) — when hostile intent becomes observable, call `system_traffic` `update_status` with `hostility_observed: true`.
 - When adventure Modules are loaded (listed in `<traveller_state>`), call `recall_memory` whenever the player investigates module factions, patrons, locations, or secrets — all module knowledge files have been ingested into Hindsight memory.
 - Keep the Third Imperium grounded, gritty, and mechanically real: 4-week ship mortgages, maintenance periods, refined vs. unrefined fuel, law levels, and sensor signatures drive the drama.
 - Award per-skill XP through `roll_task` (or `award_xp`) whenever characters (player, hired crew, or recurring NPCs) put their skills to meaningful test.

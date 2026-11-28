@@ -154,13 +154,14 @@ export function StarMapPanel({
 
   async function handleHailVessel(v: SystemShipRecord) {
     try {
+      const desc = v.ship_class ? `${v.display_name} (${v.ship_class})` : v.display_name;
       await api.interactVessel(campaignId, v.id, {
         action: "hail",
-        message: `Hailing ${v.name} (${v.ship_class}) in ${v.orbit_location}.`,
+        message: `Hailing ${desc} in ${v.orbit_location}.`,
       });
       await onRefresh();
       await onSendChat(
-        `I open hailing frequencies to ${v.name} (${v.ship_class}, captain ${v.captain_name}, ${v.faction}) currently at ${v.orbit_location} in ${snapshot.campaign.current_system_name}. "Vessel ${v.name}, this is ${snapshot.ships[0]?.name ?? "our ship"}, requesting comms — what's your status and business in system?"`
+        `I open hailing frequencies to ${desc} currently at ${v.orbit_location} in ${snapshot.campaign.current_system_name}. "${v.display_name}, this is ${snapshot.ships[0]?.name ?? "our ship"}, requesting comms — please identify yourselves and state your business in system."`
       );
     } catch (e) {
       onError((e as Error).message);
@@ -175,10 +176,15 @@ export function StarMapPanel({
         roll?: { total?: number; target?: number; effect?: number; success?: boolean };
       };
       const rev = res.revealed as Record<string, unknown>;
-      const txt = det?.roll?.success
-        ? `Scan ${det.detection_level?.toUpperCase()} (rolled ${det.roll.total}/${det.roll.target}, Eff +${det.roll.effect}): Hull ${rev?.hull ?? "?"}, Armor ${rev?.armor ?? "?"}, M-${rev?.thrust ?? "?"}, Stealth ${rev?.stealth_dm ?? 0}. ${rev?.cargo_hint ?? ""}`
-        : `Scan FAILED (rolled ${det?.roll?.total ?? "?"}/${det?.roll?.target ?? "?"}) — ${rev?.note ?? "signature masked."}`;
+      const lvl = det?.detection_level ?? "minimal";
+      const txt =
+        lvl === "full" || lvl === "pinpoint_lock"
+          ? `Scan ${lvl.toUpperCase()} (rolled ${det?.roll?.total}/${det?.roll?.target}, Eff +${det?.roll?.effect}): ${rev?.ship_class ?? "Unknown"} (${rev?.tonnage ?? "?"}t) · Hull ${rev?.hull ?? "?"} · Armor ${rev?.armor ?? "?"} · M-${rev?.thrust ?? "?"} · Stealth ${rev?.stealth_dm ?? 0}. ${rev?.sensor_notes ?? ""}`
+          : lvl === "limited"
+          ? `Scan LIMITED (rolled ${det?.roll?.total}/${det?.roll?.target}, Eff ${det?.roll?.effect}): ${rev?.ship_class ?? "Unknown"} (~${rev?.tonnage ?? "?"}t) · M-${rev?.thrust ?? "?"} / J-${rev?.jump_rating ?? "?"}. ${rev?.note ?? ""}`
+          : `Scan ${lvl.toUpperCase()} (rolled ${det?.roll?.total ?? "?"}/${det?.roll?.target ?? "?"}) — ${rev?.note ?? "signature masked."}`;
       setVesselScanMap((prev) => ({ ...prev, [v.id]: txt }));
+      await onRefresh();
     } catch (e) {
       onError((e as Error).message);
     }
@@ -335,25 +341,27 @@ export function StarMapPanel({
         </div>
       )}
 
-      {/* In-System Starship Traffic & Ship Interactions */}
+      {/* In-System Starship Traffic & Ship Interactions (Fog-of-War Safe) */}
       <div className="bg-slate-900 border border-cyan-900/70 rounded p-2.5 space-y-2">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           <div className="font-semibold text-cyan-300 flex items-center gap-1.5">
-            <Radar className="w-3.5 h-3.5" /> Ships in {snapshot.campaign.current_system_name} (
+            <Radar className="w-3.5 h-3.5" /> Contacts in {snapshot.campaign.current_system_name} (
             {systemShips.length} detected)
           </div>
           <button
             disabled={scanningTraffic}
+            title="Run an active High Guard sensor sweep to detect silent / transponder-dark vessels"
             onClick={handleRefreshTraffic}
-            className="bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded px-2 py-0.5 text-[10px] flex items-center gap-1"
+            className="bg-cyan-900/70 hover:bg-cyan-800 border border-cyan-700/70 text-cyan-100 rounded px-2 py-0.5 text-[10px] flex items-center gap-1 shrink-0"
           >
-            <RefreshCw className={`w-3 h-3 ${scanningTraffic ? "animate-spin" : ""}`} /> Sweep
+            <RefreshCw className={`w-3 h-3 ${scanningTraffic ? "animate-spin" : ""}`} /> Sensor Sweep
           </button>
         </div>
 
         {systemShips.length === 0 ? (
           <div className="text-[11px] text-slate-500">
-            Sensors report empty space (0 vessels in system).
+            No transponders or sensor contacts on scope. Click <strong>Sensor Sweep</strong> to check
+            for silent ships.
           </div>
         ) : (
           <div className="max-h-56 overflow-y-auto space-y-1.5">
@@ -365,41 +373,80 @@ export function StarMapPanel({
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="font-semibold text-slate-100 truncate">
-                      {v.name}{" "}
+                      {v.display_name}{" "}
                       <span className="text-[10px] font-normal text-slate-400">
-                        ({v.ship_class}, {v.tonnage}t)
+                        {v.ship_class
+                          ? `(${v.ship_class}${v.tonnage ? `, ${v.tonnage}t` : ""})`
+                          : "(Unidentified Hull)"}
                       </span>
                     </div>
                     <div className="text-[10px] text-slate-400">
-                      {v.orbit_location} · {v.faction} · {v.captain_name}
+                      {v.orbit_location}
+                      {v.faction ? ` · ${v.faction}` : ""}
+                      {v.captain_name ? ` · ${v.captain_name}` : ""}
                     </div>
+                    {(v.thrust != null || v.hull_max != null) && (
+                      <div className="text-[10px] text-cyan-300/90 font-mono">
+                        {v.hull_max != null && `Hull ${v.hull_current}/${v.hull_max}`}
+                        {v.armor != null && ` · Armor ${v.armor}`}
+                        {v.thrust != null && ` · M-${v.thrust}`}
+                        {v.jump_rating != null && ` / J-${v.jump_rating}`}
+                        {v.stealth_dm != null && v.stealth_dm !== 0 && ` · Stealth ${v.stealth_dm}`}
+                      </div>
+                    )}
                   </div>
-                  <div className="flex items-center gap-1 shrink-0">
+                  <div className="flex flex-wrap items-center justify-end gap-1 shrink-0">
                     {!v.transponder_active && (
-                      <span className="px-1 py-0.5 rounded bg-purple-950 text-purple-300 text-[9px] font-mono">
-                        DARK
+                      <span
+                        title="No IFF transponder broadcast — spotted via active sensors"
+                        className="px-1 py-0.5 rounded bg-purple-950 border border-purple-800/70 text-purple-200 text-[9px] font-mono"
+                      >
+                        NO XPDR
                       </span>
                     )}
-                    <span
-                      className={`px-1.5 py-0.5 rounded text-[9px] uppercase font-semibold ${
-                        v.disposition === "hostile"
-                          ? "bg-red-950 text-red-300"
-                          : v.disposition === "distress"
-                          ? "bg-amber-950 text-amber-300"
-                          : v.disposition === "friendly"
-                          ? "bg-emerald-950 text-emerald-300"
-                          : "bg-slate-800 text-slate-300"
-                      }`}
-                    >
-                      {v.disposition}
-                    </span>
+                    {(v.detection_level === "limited" ||
+                      v.detection_level === "full" ||
+                      v.detection_level === "pinpoint_lock") && (
+                      <span className="px-1 py-0.5 rounded bg-cyan-950 text-cyan-300 text-[9px] font-mono uppercase">
+                        {v.detection_level === "pinpoint_lock" ? "LOCK" : v.detection_level}
+                      </span>
+                    )}
+                    {v.observed_status === "hostile" && (
+                      <span className="px-1.5 py-0.5 rounded text-[9px] uppercase font-semibold bg-red-950 text-red-300">
+                        HOSTILE
+                      </span>
+                    )}
+                    {v.observed_status === "weapons_hot" && (
+                      <span className="px-1.5 py-0.5 rounded text-[9px] uppercase font-semibold bg-red-950 text-red-300">
+                        WEAPONS HOT
+                      </span>
+                    )}
+                    {v.observed_status === "distress_beacon" && (
+                      <span className="px-1.5 py-0.5 rounded text-[9px] uppercase font-semibold bg-amber-950 text-amber-300">
+                        DISTRESS
+                      </span>
+                    )}
+                    {v.observed_status === "comms_open" && (
+                      <span className="px-1.5 py-0.5 rounded text-[9px] uppercase font-semibold bg-emerald-950 text-emerald-300">
+                        COMMS
+                      </span>
+                    )}
+                    {v.observed_status === "destroyed" && (
+                      <span className="px-1.5 py-0.5 rounded text-[9px] uppercase font-semibold bg-slate-800 text-slate-400">
+                        DESTROYED
+                      </span>
+                    )}
                   </div>
                 </div>
 
                 <div className="flex gap-1 pt-0.5">
                   <button
                     disabled={v.status === "destroyed"}
-                    title={v.status === "destroyed" ? "Vessel is destroyed" : `Open comms with ${v.name}`}
+                    title={
+                      v.status === "destroyed"
+                        ? "Vessel is destroyed"
+                        : `Open comms with ${v.display_name}`
+                    }
                     onClick={() => handleHailVessel(v)}
                     className="flex-1 bg-cyan-900/70 hover:bg-cyan-800 disabled:opacity-35 disabled:cursor-not-allowed text-cyan-100 rounded py-0.5 text-[10px] flex items-center justify-center gap-1"
                   >
@@ -407,6 +454,7 @@ export function StarMapPanel({
                   </button>
                   <button
                     onClick={() => handleScanVessel(v)}
+                    title="Focus active sensors to resolve hull, drive, armor, and internal bay signatures"
                     className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded py-0.5 text-[10px] flex items-center justify-center gap-1"
                   >
                     <Radar className="w-3 h-3" /> Sensor Scan
@@ -418,7 +466,7 @@ export function StarMapPanel({
                         ? "Vessel is destroyed"
                         : spaceCombatActive
                         ? "Space combat is already active — resolve or end it in the Combat tab"
-                        : `Engage ${v.name} in High Guard space combat`
+                        : `Engage ${v.display_name} in High Guard space combat`
                     }
                     onClick={() => handleEngageVessel(v)}
                     className="bg-red-900/70 hover:bg-red-800 disabled:opacity-35 disabled:cursor-not-allowed text-red-100 rounded px-2 py-0.5 text-[10px] flex items-center justify-center gap-1"

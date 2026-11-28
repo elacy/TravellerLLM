@@ -1047,35 +1047,56 @@ impl Db {
         let traffic = self
             .list_system_ships(campaign_id, &campaign.current_system_name)
             .await?;
+        let visible_count = traffic.iter().filter(|v| v.detected).count();
+        let hidden_count = traffic.len().saturating_sub(visible_count);
         out.push_str(&format!(
-            "\n## Ships Currently In System ({} vessel(s) in {})\n",
-            traffic.len(),
+            "\n## Ships Currently In System ({visible_count} detected on player scope, {hidden_count} UNDETECTED dark contacts in {})\n",
             campaign.current_system_name
         ));
         if traffic.is_empty() {
-            out.push_str("- No ships currently detected (call `system_traffic` with `scan_system` to sweep).\n");
+            out.push_str("- No ships currently in-system.\n");
         } else {
             for v in &traffic {
-                out.push_str(&format!(
-                    "- {} ({}, {}t, TL{}, Hull {}/{}, Armor {}, M-{}, Stealth DM {}, id: {}): Orbit: {} | Disposition: {} | Transponder: {} | Captain: {} ({}) | Status: {} | Hint: {}\n",
-                    v.name,
-                    v.ship_class,
-                    v.tonnage,
-                    v.tl,
-                    v.hull_current,
-                    v.hull_max,
-                    v.armor,
-                    v.thrust,
-                    v.stealth_dm,
-                    v.id,
-                    v.orbit_location,
-                    v.disposition,
-                    if v.transponder_active { "ON" } else { "DARK" },
-                    v.captain_name,
-                    v.faction,
-                    v.status,
-                    v.cargo_hint
-                ));
+                if !v.detected {
+                    out.push_str(&format!(
+                        "- [UNDETECTED BY PLAYER SENSORS — DO NOT MENTION UNTIL SPOTTED BY SENSOR SWEEP OR BREAKS SILENCE] {} ({}, {}t, Stealth DM {}, Transponder DARK, id: {}) | GM SECRET: Orbit: {}, True Disposition: {}, Captain: {} ({}), Hint: {}\n",
+                        v.name,
+                        v.ship_class,
+                        v.tonnage,
+                        v.stealth_dm,
+                        v.id,
+                        v.orbit_location,
+                        v.disposition,
+                        v.captain_name,
+                        v.faction,
+                        v.cargo_hint
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "- {} (id: {}) | PLAYER KNOWS: Transponder={}, Scan={}, ObservedStatus={}, Orbit={}, CaptainKnown={} | GM SECRET (DO NOT LEAK UNLESS DISCOVERED): TrueName={}, Class={}, {}t, TL{}, Hull {}/{}, Armor {}, M-{}, Stealth {}, TrueDisposition={}, Captain={} ({}), Status={}, Hint={}\n",
+                        v.to_player_view().map(|p| p.display_name).unwrap_or_else(|| v.name.clone()),
+                        v.id,
+                        if v.transponder_active { "ON" } else { "DARK" },
+                        v.detection_level,
+                        v.observed_status,
+                        v.orbit_location,
+                        if v.captain_known { "YES" } else { "NO (DO NOT SAY CAPTAIN NAME)" },
+                        v.name,
+                        v.ship_class,
+                        v.tonnage,
+                        v.tl,
+                        v.hull_current,
+                        v.hull_max,
+                        v.armor,
+                        v.thrust,
+                        v.stealth_dm,
+                        v.disposition,
+                        v.captain_name,
+                        v.faction,
+                        v.status,
+                        v.cargo_hint
+                    ));
+                }
             }
         }
 
@@ -1677,13 +1698,34 @@ impl Db {
 
         let mut out = Vec::with_capacity(vessels.len());
         for v in vessels {
+            // Fog-of-war defaults:
+            // - Only transponder-active ships are detected on arrival; dark ships start UNDETECTED!
+            // - Captain names are hidden until broadcast/identified on comms.
+            // - Hidden disposition is NEVER marked hostile until hostile action is observed.
+            let detected = v.transponder_active;
+            let detection_level = if v.transponder_active {
+                "transponder".to_string()
+            } else {
+                "undetected".to_string()
+            };
+            let captain_known = false;
+            let hostility_observed = false;
+            let observed_status = if v.disposition == "distress" && v.transponder_active {
+                "distress_beacon".to_string()
+            } else if v.transponder_active {
+                "transponder_active".to_string()
+            } else {
+                "running_dark".to_string()
+            };
+
             sqlx::query(
                 "INSERT INTO system_ships
                     (id, campaign_id, system_name, name, ship_class, role, tonnage, tl,
                      hull_max, hull_current, armor, thrust, jump_rating, sensor_grade,
                      stealth_dm, transponder_active, disposition, orbit_location,
-                     captain_name, faction, cargo_hint)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)",
+                     captain_name, faction, cargo_hint,
+                     detected, detection_level, captain_known, hostility_observed, observed_status)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)",
             )
             .bind(v.id)
             .bind(campaign_id)
@@ -1706,6 +1748,11 @@ impl Db {
             .bind(&v.captain_name)
             .bind(&v.faction)
             .bind(&v.cargo_hint)
+            .bind(detected)
+            .bind(&detection_level)
+            .bind(captain_known)
+            .bind(hostility_observed)
+            .bind(&observed_status)
             .execute(&mut *tx)
             .await?;
 
@@ -1733,6 +1780,11 @@ impl Db {
                 cargo_hint: v.cargo_hint.clone(),
                 comms_log: vec![],
                 status: "in_system".to_string(),
+                detected,
+                detection_level,
+                captain_known,
+                hostility_observed,
+                observed_status,
             });
         }
         tx.commit().await?;
@@ -1748,7 +1800,8 @@ impl Db {
             "SELECT id, campaign_id, system_name, name, ship_class, role, tonnage, tl,
                     hull_max, hull_current, armor, thrust, jump_rating, sensor_grade,
                     stealth_dm, transponder_active, disposition, orbit_location,
-                    captain_name, faction, cargo_hint, comms_log, status
+                    captain_name, faction, cargo_hint, comms_log, status,
+                    detected, detection_level, captain_known, hostility_observed, observed_status
              FROM system_ships
              WHERE campaign_id = $1 AND LOWER(system_name) = LOWER($2) AND status <> 'departed'
              ORDER BY created_at ASC",
@@ -1770,7 +1823,8 @@ impl Db {
             "SELECT id, campaign_id, system_name, name, ship_class, role, tonnage, tl,
                     hull_max, hull_current, armor, thrust, jump_rating, sensor_grade,
                     stealth_dm, transponder_active, disposition, orbit_location,
-                    captain_name, faction, cargo_hint, comms_log, status
+                    captain_name, faction, cargo_hint, comms_log, status,
+                    detected, detection_level, captain_known, hostility_observed, observed_status
              FROM system_ships WHERE campaign_id = $1 AND id = $2",
         )
         .bind(campaign_id)
@@ -1788,6 +1842,35 @@ impl Db {
         status: Option<&str>,
         comms_entry: Option<Value>,
     ) -> Result<Option<SystemShipRecord>> {
+        self.update_system_ship_intel(
+            campaign_id,
+            vessel_id,
+            disposition,
+            status,
+            comms_entry,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_system_ship_intel(
+        &self,
+        campaign_id: Uuid,
+        vessel_id: Uuid,
+        disposition: Option<&str>,
+        status: Option<&str>,
+        comms_entry: Option<Value>,
+        detected: Option<bool>,
+        detection_level: Option<&str>,
+        captain_known: Option<bool>,
+        hostility_observed: Option<bool>,
+        observed_status: Option<&str>,
+    ) -> Result<Option<SystemShipRecord>> {
         let Some(mut ship) = self.get_system_ship(campaign_id, vessel_id).await? else {
             return Ok(None);
         };
@@ -1800,9 +1883,32 @@ impl Db {
         if let Some(entry) = comms_entry {
             ship.comms_log.push(entry);
         }
+        if let Some(det) = detected {
+            ship.detected = ship.detected || det;
+        }
+        if let Some(lvl) = detection_level
+            && crate::models::detection_level_rank(lvl)
+                > crate::models::detection_level_rank(&ship.detection_level)
+        {
+            ship.detection_level = lvl.to_string();
+        }
+        if let Some(ck) = captain_known {
+            ship.captain_known = ship.captain_known || ck;
+        }
+        if let Some(ho) = hostility_observed {
+            ship.hostility_observed = ship.hostility_observed || ho;
+            if ship.hostility_observed {
+                ship.observed_status = "hostile".to_string();
+            }
+        }
+        if let Some(os) = observed_status {
+            ship.observed_status = os.to_string();
+        }
         sqlx::query(
             "UPDATE system_ships
-             SET disposition = $3, status = $4, comms_log = $5, updated_at = NOW()
+             SET disposition = $3, status = $4, comms_log = $5,
+                 detected = $6, detection_level = $7, captain_known = $8,
+                 hostility_observed = $9, observed_status = $10, updated_at = NOW()
              WHERE campaign_id = $1 AND id = $2",
         )
         .bind(campaign_id)
@@ -1810,6 +1916,11 @@ impl Db {
         .bind(&ship.disposition)
         .bind(&ship.status)
         .bind(serde_json::to_value(&ship.comms_log)?)
+        .bind(ship.detected)
+        .bind(&ship.detection_level)
+        .bind(ship.captain_known)
+        .bind(ship.hostility_observed)
+        .bind(&ship.observed_status)
         .execute(&self.pool)
         .await?;
         Ok(Some(ship))
@@ -1840,6 +1951,11 @@ impl Db {
             cargo_hint: r.try_get("cargo_hint")?,
             comms_log: serde_json::from_value(r.try_get("comms_log")?)?,
             status: r.try_get("status")?,
+            detected: r.try_get("detected")?,
+            detection_level: r.try_get("detection_level")?,
+            captain_known: r.try_get("captain_known")?,
+            hostility_observed: r.try_get("hostility_observed")?,
+            observed_status: r.try_get("observed_status")?,
         })
     }
 }

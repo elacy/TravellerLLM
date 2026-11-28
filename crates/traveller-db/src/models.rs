@@ -366,11 +366,175 @@ pub struct SystemShipRecord {
     pub sensor_grade: String,
     pub stealth_dm: i16,
     pub transponder_active: bool,
+    /// GM-only true disposition (NEVER sent raw to the player API/UI!).
     pub disposition: String,
     pub orbit_location: String,
+    /// GM-only captain name (only exposed to player when `captain_known == true`).
     pub captain_name: String,
     pub faction: String,
     pub cargo_hint: String,
     pub comms_log: Vec<Value>,
     pub status: String,
+    /// Whether the player's sensors/passive scope have spotted this vessel.
+    #[serde(default = "default_true_db")]
+    pub detected: bool,
+    /// Highest achieved sensor knowledge: "undetected" | "transponder" | "minimal" | "limited" | "full" | "pinpoint_lock"
+    #[serde(default = "default_detection_level")]
+    pub detection_level: String,
+    /// Whether the captain's name has been broadcast or revealed on comms.
+    #[serde(default)]
+    pub captain_known: bool,
+    /// Whether hostile action (firing, weapon lock/combat, pirate threat) has actually been observed.
+    #[serde(default)]
+    pub hostility_observed: bool,
+    /// Player-observable status: "transponder_active" | "running_dark" | "distress_beacon" | "comms_open" | "weapons_hot" | "hostile" | "destroyed"
+    #[serde(default = "default_observed_status")]
+    pub observed_status: String,
+}
+
+fn default_true_db() -> bool {
+    true
+}
+
+fn default_detection_level() -> String {
+    "transponder".to_string()
+}
+
+fn default_observed_status() -> String {
+    "transponder_active".to_string()
+}
+
+/// Fog-of-war redacted view of an in-system vessel returned to the player client.
+/// Never leaks undetected ships, hidden `disposition`, unbroadcast `captain_name`, or unscanned specs!
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerVisibleSystemShip {
+    pub id: Uuid,
+    pub campaign_id: Uuid,
+    pub system_name: String,
+    pub display_name: String,
+    pub ship_class: Option<String>,
+    pub tonnage: Option<i32>,
+    pub tl: Option<i16>,
+    pub hull_max: Option<i32>,
+    pub hull_current: Option<i32>,
+    pub armor: Option<i32>,
+    pub thrust: Option<i16>,
+    pub jump_rating: Option<i16>,
+    pub sensor_grade: Option<String>,
+    pub stealth_dm: Option<i16>,
+    pub transponder_active: bool,
+    pub orbit_location: String,
+    pub captain_name: Option<String>,
+    pub faction: Option<String>,
+    pub sensor_notes: Option<String>,
+    pub detection_level: String,
+    pub hostility_observed: bool,
+    pub observed_status: String,
+    pub comms_log: Vec<Value>,
+    pub status: String,
+}
+
+pub fn detection_level_rank(level: &str) -> u8 {
+    match level {
+        "undetected" => 0,
+        "minimal" => 1,
+        "transponder" => 2,
+        "limited" => 3,
+        "full" => 4,
+        "pinpoint_lock" => 5,
+        _ => 1,
+    }
+}
+
+impl SystemShipRecord {
+    /// Short stable sensor track ID (e.g. `A3F2`) used for unidentified dark contacts.
+    pub fn track_code(&self) -> String {
+        let hex = self.id.simple().to_string();
+        hex[..4].to_uppercase()
+    }
+
+    /// Project this vessel into what the player's ship sensors and comms have actually observed.
+    /// Returns `None` if the vessel is still undetected (e.g. transponder-dark and not yet spotted).
+    pub fn to_player_view(&self) -> Option<PlayerVisibleSystemShip> {
+        if !self.detected {
+            return None;
+        }
+        let rank = detection_level_rank(&self.detection_level);
+        let has_limited = rank >= detection_level_rank("limited");
+        let has_full = rank >= detection_level_rank("full");
+
+        let display_name = if self.transponder_active {
+            self.name.clone()
+        } else if has_limited {
+            format!("Unidentified ~{}t Contact [{}]", self.tonnage, self.track_code())
+        } else {
+            format!("Unidentified Contact [{}]", self.track_code())
+        };
+
+        let ship_class = if self.transponder_active || has_limited {
+            Some(self.ship_class.clone())
+        } else {
+            None
+        };
+        let tonnage = if self.transponder_active || has_limited {
+            Some(self.tonnage)
+        } else {
+            None
+        };
+        let faction = if self.transponder_active || self.captain_known {
+            Some(self.faction.clone())
+        } else {
+            None
+        };
+        let captain_name = if self.captain_known {
+            Some(self.captain_name.clone())
+        } else {
+            None
+        };
+
+        let observed_status = if self.status == "destroyed" {
+            "destroyed".to_string()
+        } else if self.hostility_observed || self.status == "in_combat" {
+            "hostile".to_string()
+        } else if self.observed_status == "hostile" && !self.hostility_observed {
+            if self.transponder_active {
+                "transponder_active".to_string()
+            } else {
+                "running_dark".to_string()
+            }
+        } else {
+            self.observed_status.clone()
+        };
+
+        Some(PlayerVisibleSystemShip {
+            id: self.id,
+            campaign_id: self.campaign_id,
+            system_name: self.system_name.clone(),
+            display_name,
+            ship_class,
+            tonnage,
+            tl: if has_full { Some(self.tl) } else { None },
+            hull_max: if has_full { Some(self.hull_max) } else { None },
+            hull_current: if has_full { Some(self.hull_current) } else { None },
+            armor: if has_full { Some(self.armor) } else { None },
+            thrust: if has_limited { Some(self.thrust) } else { None },
+            jump_rating: if has_limited { Some(self.jump_rating) } else { None },
+            sensor_grade: if has_full { Some(self.sensor_grade.clone()) } else { None },
+            stealth_dm: if has_full { Some(self.stealth_dm) } else { None },
+            transponder_active: self.transponder_active,
+            orbit_location: self.orbit_location.clone(),
+            captain_name,
+            faction,
+            sensor_notes: if has_full {
+                Some(self.cargo_hint.clone())
+            } else {
+                None
+            },
+            detection_level: self.detection_level.clone(),
+            hostility_observed: self.hostility_observed || self.status == "in_combat",
+            observed_status,
+            comms_log: self.comms_log.clone(),
+            status: self.status.clone(),
+        })
+    }
 }
