@@ -114,6 +114,41 @@ export function FinancesCrewPanel({ campaignId, snapshot, onRefresh, onError }: 
     }
   }
 
+  const companyAccount =
+    snapshot.accounts.find((a) => a.kind === "company") ?? snapshot.accounts[0];
+  const companyBalance = companyAccount?.balance_cr ?? 0;
+  const maintTotal = snapshot.fleet_running_costs?.total_cr ?? 0;
+  const canPayMaintenance = maintTotal > 0 && companyBalance >= maintTotal;
+
+  const effFromId = fromAcc || snapshot.accounts[0]?.id || "";
+  const effToId = toAcc || snapshot.accounts[1]?.id || snapshot.accounts[0]?.id || "";
+  const srcAccount = snapshot.accounts.find((a) => a.id === effFromId);
+  const transferInvalid =
+    !effFromId ||
+    !effToId ||
+    effFromId === effToId ||
+    transferCr <= 0 ||
+    (srcAccount ? srcAccount.balance_cr < transferCr : true);
+  const transferDisabledReason = !effFromId || !effToId || effFromId === effToId
+    ? "Choose two different accounts"
+    : transferCr <= 0
+    ? "Enter an amount greater than Cr0"
+    : srcAccount && srcAccount.balance_cr < transferCr
+    ? `Insufficient balance in ${srcAccount.name} (have ${formatCr(srcAccount.balance_cr)})`
+    : `Transfer ${formatCr(transferCr)}`;
+
+  const effTxAccId = txAcc || snapshot.accounts[0]?.id || "";
+  const txInvalid = !effTxAccId || txAmount === 0 || !txDesc.trim();
+  const txDisabledReason = !effTxAccId
+    ? "No account available"
+    : txAmount === 0
+    ? "Amount must be non-zero (+ deposit or - expense)"
+    : !txDesc.trim()
+    ? "Enter a description"
+    : "Post ledger transaction";
+
+  const eventInvalid = !evTitle.trim() || evDays < 1;
+
   return (
     <div className="space-y-3 text-xs">
       <div className="grid grid-cols-3 gap-1">
@@ -198,8 +233,16 @@ export function FinancesCrewPanel({ campaignId, snapshot, onRefresh, onError }: 
                 </div>
               </div>
               <button
+                disabled={!canPayMaintenance}
+                title={
+                  maintTotal <= 0
+                    ? "No fleet running costs currently due"
+                    : !canPayMaintenance
+                    ? `Insufficient Company funds (need ${formatCr(maintTotal)}, have ${formatCr(companyBalance)})`
+                    : `Pay ${formatCr(maintTotal)} from Company account`
+                }
                 onClick={handlePayMaintenance}
-                className="w-full bg-amber-700 hover:bg-amber-600 text-white font-semibold rounded py-1 text-[11px]"
+                className="w-full bg-amber-700 hover:bg-amber-600 disabled:opacity-35 disabled:cursor-not-allowed text-white font-semibold rounded py-1 text-[11px]"
               >
                 Pay Mortgage, Maintenance & Crew Salaries Now
               </button>
@@ -249,8 +292,10 @@ export function FinancesCrewPanel({ campaignId, snapshot, onRefresh, onError }: 
                   onChange={(e) => setTransferDesc(e.target.value)}
                 />
                 <button
+                  disabled={transferInvalid}
+                  title={transferDisabledReason}
                   onClick={handleTransfer}
-                  className="bg-cyan-700 hover:bg-cyan-600 text-white rounded px-2.5 py-1"
+                  className="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-35 disabled:cursor-not-allowed text-white rounded px-2.5 py-1"
                 >
                   Move
                 </button>
@@ -294,8 +339,10 @@ export function FinancesCrewPanel({ campaignId, snapshot, onRefresh, onError }: 
                 onChange={(e) => setTxDesc(e.target.value)}
               />
               <button
+                disabled={txInvalid}
+                title={txDisabledReason}
                 onClick={handleManualTx}
-                className="bg-emerald-700 hover:bg-emerald-600 text-white rounded px-2.5 py-1"
+                className="bg-emerald-700 hover:bg-emerald-600 disabled:opacity-35 disabled:cursor-not-allowed text-white rounded px-2.5 py-1"
               >
                 Post
               </button>
@@ -417,8 +464,10 @@ export function FinancesCrewPanel({ campaignId, snapshot, onRefresh, onError }: 
                 d
               </label>
               <button
+                disabled={eventInvalid}
+                title={eventInvalid ? "Enter an event title and at least 1 day" : "Schedule event"}
                 onClick={handleCreateEvent}
-                className="bg-amber-600 hover:bg-amber-500 text-slate-950 font-semibold rounded px-2.5 py-1 flex items-center gap-1"
+                className="bg-amber-600 hover:bg-amber-500 disabled:opacity-35 disabled:cursor-not-allowed text-slate-950 font-semibold rounded px-2.5 py-1 flex items-center gap-1"
               >
                 <Plus className="w-3.5 h-3.5" /> Add
               </button>

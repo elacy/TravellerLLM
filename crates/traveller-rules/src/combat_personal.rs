@@ -94,6 +94,8 @@ pub struct PersonalCombatant {
     pub dex_cur: i32,
     #[serde(default = "default_stat")]
     pub end_cur: i32,
+    #[serde(default)]
+    pub action_used_this_round: bool,
 }
 
 fn default_range_band() -> PersonalRangeBand {
@@ -187,6 +189,16 @@ pub fn resolve_personal_attack<R: Rng + ?Sized>(
         .position(|c| c.character_id == input.defender_id)
         .ok_or_else(|| anyhow::anyhow!("Defender not in combat"))?;
 
+    if !state.combatants[atk_idx].conscious || !state.combatants[atk_idx].alive {
+        anyhow::bail!("{} is incapacitated and cannot attack.", state.combatants[atk_idx].name);
+    }
+    if state.combatants[atk_idx].action_used_this_round {
+        anyhow::bail!(
+            "{} has already used their Significant Action this round — advance to Next Round.",
+            state.combatants[atk_idx].name
+        );
+    }
+
     let weapon = state.combatants[atk_idx].weapon.clone();
     let rounds_fired = if input.burst_mode && weapon.auto_rating > 0 {
         u32::from(weapon.auto_rating)
@@ -199,6 +211,7 @@ pub fn resolve_personal_attack<R: Rng + ?Sized>(
         anyhow::bail!("Out of ammunition in {} — reload required!", weapon.name);
     }
     state.combatants[atk_idx].weapon.magazine_current -= rounds_fired;
+    state.combatants[atk_idx].action_used_this_round = true;
     let ammo_remaining = state.combatants[atk_idx].weapon.magazine_current;
 
     let mut mods = if let Some(ch) = attacker_char {
@@ -350,6 +363,7 @@ pub fn next_personal_round(state: &mut PersonalCombatState) {
             c.initiative -= c.next_round_init_penalty;
             c.next_round_init_penalty = 0;
         }
+        c.action_used_this_round = false;
     }
     state.combatants.sort_by_key(|a| std::cmp::Reverse(a.initiative));
     state.log.push(format!("--- Round {} ---", state.round));
@@ -392,6 +406,9 @@ pub fn execute_personal_ai_turn<R: Rng + ?Sized>(
         let Some(h_idx) = state.combatants.iter().position(|c| c.character_id == hid) else {
             continue;
         };
+        if state.combatants[h_idx].action_used_this_round {
+            continue;
+        }
         let h_name = state.combatants[h_idx].name.clone();
 
         // 1. Reload if out of ammo
@@ -400,6 +417,7 @@ pub fn execute_personal_ai_turn<R: Rng + ?Sized>(
         {
             let max_m = state.combatants[h_idx].weapon.magazine_max;
             state.combatants[h_idx].weapon.magazine_current = max_m;
+            state.combatants[h_idx].action_used_this_round = true;
             let detail = format!("{h_name} dives behind cover and reloads ({max_m} rounds).");
             state.combatants[h_idx].cover_dm = state.combatants[h_idx].cover_dm.min(-2);
             state.log.push(detail.clone());

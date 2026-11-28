@@ -191,6 +191,16 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
   }
 
   const ship = snapshot.ships[0];
+  const cargoUsedTons = (ship?.cargo ?? []).reduce((sum, lot) => sum + (lot.tons || 0), 0);
+  const cargoMaxTons = ship?.spec.cargo_capacity_tons ?? 0;
+  const freeCargoTons = Math.max(0, cargoMaxTons - cargoUsedTons);
+  const companyAccount =
+    snapshot.accounts.find((a) => a.kind === "company") ?? snapshot.accounts[0];
+  const companyBalance = companyAccount?.balance_cr ?? 0;
+  const selectedAccount =
+    snapshot.accounts.find((a) => a.id === selectedAccountId) ?? snapshot.accounts[0];
+  const selectedBalance = selectedAccount?.balance_cr ?? 0;
+
   const freightLots = (market?.freight as Array<{ lot_type: string; tons: number; payout_cr: number }>) || [];
   const pax = market?.passengers as
     | {
@@ -306,8 +316,10 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
                 Include Black Market Speculative Goods
               </label>
               <button
+                disabled={!destSystem.trim()}
+                title={!destSystem.trim() ? "Enter a destination world first" : "Roll MgT2e freight, passengers & speculative goods"}
                 onClick={generateMarket}
-                className="bg-cyan-700 hover:bg-cyan-600 text-white rounded px-3 py-1 font-medium"
+                className="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-35 disabled:cursor-not-allowed text-white rounded px-3 py-1 font-medium"
               >
                 Roll World Market
               </button>
@@ -401,11 +413,28 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
               )}
 
               <div className="bg-slate-900 border border-slate-800 rounded p-2.5 space-y-1.5">
-                <div className="font-semibold text-slate-200">
-                  Speculative Trade Goods ({specGoods.length})
+                <div className="font-semibold text-slate-200 flex items-center justify-between gap-2">
+                  <span>Speculative Trade Goods ({specGoods.length})</span>
+                  <span className="text-[10px] font-mono text-slate-400">
+                    Hold free: <span className={freeCargoTons > 0 ? "text-cyan-300" : "text-red-400"}>{freeCargoTons}t</span>/{cargoMaxTons}t · Co: {formatCr(companyBalance)}
+                  </span>
                 </div>
                 <div className="max-h-60 overflow-y-auto divide-y divide-slate-800">
-                  {specGoods.map((g) => (
+                  {specGoods.map((g) => {
+                    const reqTons = Math.min(g.tons_available, Math.max(1, buyTons[g.d66] ?? Math.min(5, g.tons_available)));
+                    const lotCost = reqTons * g.unit_price_cr;
+                    const noShip = !ship;
+                    const noSpace = reqTons > freeCargoTons;
+                    const noFunds = companyBalance < lotCost;
+                    const buyDisabled = noShip || noSpace || noFunds || g.tons_available <= 0;
+                    const buyReason = noShip
+                      ? "No ship in fleet to load cargo"
+                      : noSpace
+                      ? `Not enough free cargo space (need ${reqTons}t, only ${freeCargoTons}t free)`
+                      : noFunds
+                      ? `Insufficient Company funds (need ${formatCr(lotCost)}, have ${formatCr(companyBalance)})`
+                      : `Buy ${reqTons}t for ${formatCr(lotCost)}`;
+                    return (
                     <div key={g.d66} className="py-1.5 flex items-center justify-between gap-2">
                       <div className="min-w-0">
                         <div className="font-medium text-slate-100 truncate">
@@ -428,14 +457,17 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
                           }
                         />
                         <button
+                          disabled={buyDisabled}
+                          title={buyReason}
                           onClick={() => handleBuySpeculative(g)}
-                          className="bg-cyan-700 hover:bg-cyan-600 text-white rounded px-2 py-0.5"
+                          className="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-35 disabled:cursor-not-allowed text-white rounded px-2 py-0.5"
                         >
                           Buy
                         </button>
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             </div>
@@ -563,6 +595,18 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
                 .map(([k, v]) => `${k}: ${v}`)
                 .join(" · ");
 
+              const unitPrice = av?.final_unit_price_cr ?? item.cost_cr;
+              const unavailableHere = av !== undefined && av.available === false;
+              const cantAfford = !selectedAccount || selectedBalance < unitPrice;
+              const shopBuyDisabled = unavailableHere || cantAfford;
+              const shopBuyReason = unavailableHere
+                ? "Item unavailable on this world (availability check failed)"
+                : !selectedAccount
+                ? "Select an account to pay from"
+                : cantAfford
+                ? `Insufficient funds in ${selectedAccount.name} (need ${formatCr(unitPrice)}, have ${formatCr(selectedBalance)})`
+                : `Purchase for ${formatCr(unitPrice)}`;
+
               return (
                 <div
                   key={item.id}
@@ -590,8 +634,10 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
                         Check Avail
                       </button>
                       <button
+                        disabled={shopBuyDisabled}
+                        title={shopBuyReason}
                         onClick={() => purchaseItem(item)}
-                        className="bg-emerald-700 hover:bg-emerald-600 text-white rounded px-2 py-1 text-[10px]"
+                        className="bg-emerald-700 hover:bg-emerald-600 disabled:opacity-35 disabled:cursor-not-allowed text-white rounded px-2 py-1 text-[10px]"
                       >
                         Buy
                       </button>

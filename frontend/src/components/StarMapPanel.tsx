@@ -195,6 +195,91 @@ export function StarMapPanel({
   }
 
   const systemShips = snapshot.system_ships ?? [];
+  const fleetMaxJump =
+    snapshot.fleet_max_jump ||
+    (snapshot.ships.length > 0
+      ? Math.min(...snapshot.ships.map((s) => s.spec.jump_rating))
+      : 0);
+  const spaceCombatActive = Boolean(snapshot.active_space_combat);
+
+  function hexDistance(x1: number, y1: number, x2: number, y2: number): number {
+    const q1 = x1;
+    const r1 = y1 - Math.floor((x1 - (x1 & 1)) / 2);
+    const s1 = -q1 - r1;
+    const q2 = x2;
+    const r2 = y2 - Math.floor((x2 - (x2 & 1)) / 2);
+    const s2 = -q2 - r2;
+    return (Math.abs(q1 - q2) + Math.abs(r1 - r2) + Math.abs(s1 - s2)) / 2;
+  }
+
+  function fleetHasFuelForParsecs(parsecs: number): { ok: boolean; reason?: string } {
+    if (snapshot.ships.length === 0) return { ok: false, reason: "No ship in fleet" };
+    for (const s of snapshot.ships) {
+      const needed = Math.ceil(s.spec.tonnage * 0.1 * parsecs);
+      const totalFuel = (s.fuel_refined ?? 0) + (s.fuel_unrefined ?? 0);
+      if (totalFuel < needed) {
+        return {
+          ok: false,
+          reason: `${s.name} needs ${needed}t jump fuel for ${parsecs}pc (has ${totalFuel}t)`,
+        };
+      }
+    }
+    return { ok: true };
+  }
+
+  const currentSysCoords = useMemo(() => {
+    if (
+      snapshot.current_system_info &&
+      typeof snapshot.current_system_info.global_x === "number" &&
+      typeof snapshot.current_system_info.global_y === "number"
+    ) {
+      return {
+        x: snapshot.current_system_info.global_x,
+        y: snapshot.current_system_info.global_y,
+      };
+    }
+    const found = systems.find(
+      (s) => s.name.toLowerCase() === snapshot.campaign.current_system_name.toLowerCase()
+    );
+    return found ? { x: found.global_x, y: found.global_y } : null;
+  }, [snapshot.current_system_info, snapshot.campaign.current_system_name, systems]);
+
+  const selectedIsCurrent = Boolean(
+    selectedSystem &&
+      selectedSystem.name.toLowerCase() === snapshot.campaign.current_system_name.toLowerCase()
+  );
+  const selectedDistance =
+    selectedSystem && currentSysCoords
+      ? hexDistance(
+          currentSysCoords.x,
+          currentSysCoords.y,
+          selectedSystem.global_x,
+          selectedSystem.global_y
+        )
+      : null;
+  const selectedFuelCheck =
+    selectedDistance !== null && selectedDistance > 0
+      ? fleetHasFuelForParsecs(selectedDistance)
+      : { ok: false, reason: "Select another system to jump to" };
+  const jumpDisabled =
+    jumping ||
+    !selectedSystem ||
+    selectedIsCurrent ||
+    snapshot.ships.length === 0 ||
+    fleetMaxJump <= 0 ||
+    (selectedDistance !== null && selectedDistance > fleetMaxJump) ||
+    !selectedFuelCheck.ok;
+  const jumpDisabledReason = jumping
+    ? "Jump in progress…"
+    : !selectedSystem || selectedIsCurrent
+    ? "Already in this system"
+    : snapshot.ships.length === 0
+    ? "No ship in fleet"
+    : selectedDistance !== null && selectedDistance > fleetMaxJump
+    ? `${selectedSystem.name} is ${selectedDistance}pc away — exceeds fleet max Jump-${fleetMaxJump}`
+    : !selectedFuelCheck.ok
+    ? selectedFuelCheck.reason ?? "Insufficient jump fuel"
+    : `Execute Jump-${selectedDistance ?? "?"} to ${selectedSystem.name}`;
 
   // SVG Hex coordinates for a 32x40 Traveller sector
   const hexSize = 11;
@@ -313,8 +398,10 @@ export function StarMapPanel({
 
                 <div className="flex gap-1 pt-0.5">
                   <button
+                    disabled={v.status === "destroyed"}
+                    title={v.status === "destroyed" ? "Vessel is destroyed" : `Open comms with ${v.name}`}
                     onClick={() => handleHailVessel(v)}
-                    className="flex-1 bg-cyan-900/70 hover:bg-cyan-800 text-cyan-100 rounded py-0.5 text-[10px] flex items-center justify-center gap-1"
+                    className="flex-1 bg-cyan-900/70 hover:bg-cyan-800 disabled:opacity-35 disabled:cursor-not-allowed text-cyan-100 rounded py-0.5 text-[10px] flex items-center justify-center gap-1"
                   >
                     <Radio className="w-3 h-3" /> Hail / Talk
                   </button>
@@ -325,8 +412,16 @@ export function StarMapPanel({
                     <Radar className="w-3 h-3" /> Sensor Scan
                   </button>
                   <button
+                    disabled={spaceCombatActive || v.status === "destroyed"}
+                    title={
+                      v.status === "destroyed"
+                        ? "Vessel is destroyed"
+                        : spaceCombatActive
+                        ? "Space combat is already active — resolve or end it in the Combat tab"
+                        : `Engage ${v.name} in High Guard space combat`
+                    }
                     onClick={() => handleEngageVessel(v)}
-                    className="bg-red-900/70 hover:bg-red-800 text-red-100 rounded px-2 py-0.5 text-[10px] flex items-center justify-center gap-1"
+                    className="bg-red-900/70 hover:bg-red-800 disabled:opacity-35 disabled:cursor-not-allowed text-red-100 rounded px-2 py-0.5 text-[10px] flex items-center justify-center gap-1"
                   >
                     <Crosshair className="w-3 h-3" /> Engage
                   </button>
@@ -525,6 +620,19 @@ export function StarMapPanel({
             <span className="px-1.5 py-0.5 rounded bg-slate-800 text-amber-300">
               GG: {selectedSystem.gas_giants}
             </span>
+            {selectedDistance !== null && (
+              <span
+                className={`px-1.5 py-0.5 rounded font-mono ${
+                  selectedIsCurrent
+                    ? "bg-emerald-950 text-emerald-300"
+                    : selectedDistance <= fleetMaxJump
+                    ? "bg-cyan-950 text-cyan-300"
+                    : "bg-red-950 text-red-300"
+                }`}
+              >
+                {selectedIsCurrent ? "CURRENT" : `${selectedDistance} pc (Fleet J-${fleetMaxJump})`}
+              </span>
+            )}
             {selectedSystem.trade_codes.map((tc) => (
               <span key={tc} className="px-1.5 py-0.5 rounded bg-cyan-950 text-cyan-300">
                 {tc}
@@ -533,15 +641,18 @@ export function StarMapPanel({
           </div>
           <div className="flex gap-2 pt-1">
             <button
+              disabled={selectedIsCurrent}
+              title={selectedIsCurrent ? "Already in this system" : `Plot A* route to ${selectedSystem.name}`}
               onClick={() => handlePlanRoute(selectedSystem.name)}
-              className="flex-1 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded py-1 flex items-center justify-center gap-1"
+              className="flex-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-35 disabled:cursor-not-allowed border border-slate-600 rounded py-1 flex items-center justify-center gap-1"
             >
               <Navigation className="w-3 h-3 text-cyan-400" /> Plot Route
             </button>
             <button
-              disabled={jumping}
+              disabled={jumpDisabled}
+              title={jumpDisabledReason}
               onClick={() => handleJump(selectedSystem.name)}
-              className="flex-1 bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 text-white rounded py-1 flex items-center justify-center gap-1 font-medium"
+              className="flex-1 bg-cyan-700 hover:bg-cyan-600 disabled:opacity-35 disabled:cursor-not-allowed text-white rounded py-1 flex items-center justify-center gap-1 font-medium"
             >
               <Sparkles className="w-3 h-3" /> {jumping ? "Jumping…" : "Execute Jump"}
             </button>
@@ -571,8 +682,10 @@ export function StarMapPanel({
             />
           </label>
           <button
+            disabled={!routeDest.trim()}
+            title={!routeDest.trim() ? "Enter a destination system name" : "Plot A* jump route"}
             onClick={() => handlePlanRoute()}
-            className="bg-cyan-700 hover:bg-cyan-600 text-white rounded px-2.5 py-1"
+            className="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-35 disabled:cursor-not-allowed text-white rounded px-2.5 py-1"
           >
             Plot
           </button>
@@ -604,7 +717,21 @@ export function StarMapPanel({
                   {routeResult.route.total_jumps} jump(s) · {routeResult.route.total_parsecs}{" "}
                   parsec(s)
                 </div>
-                {routeResult.route.legs.map((leg, i) => (
+                {routeResult.route.legs.map((leg, i) => {
+                  const legFromHere =
+                    leg.from.name.toLowerCase() ===
+                    snapshot.campaign.current_system_name.toLowerCase();
+                  const legFuel = fleetHasFuelForParsecs(leg.parsecs);
+                  const legDisabled =
+                    jumping || !legFromHere || leg.parsecs > fleetMaxJump || !legFuel.ok;
+                  const legTitle = !legFromHere
+                    ? `Must be in ${leg.from.name} first before jumping this leg`
+                    : leg.parsecs > fleetMaxJump
+                    ? `${leg.parsecs}pc exceeds fleet max Jump-${fleetMaxJump}`
+                    : !legFuel.ok
+                    ? legFuel.reason ?? "Insufficient jump fuel"
+                    : `Execute Jump-${leg.parsecs} to ${leg.to.name}`;
+                  return (
                   <div
                     key={i}
                     className="flex items-center justify-between text-[11px] border-t border-slate-800 pt-1"
@@ -615,14 +742,16 @@ export function StarMapPanel({
                       <span className="text-slate-500">({leg.parsecs}pc)</span>
                     </span>
                     <button
-                      disabled={jumping}
+                      disabled={legDisabled}
+                      title={legTitle}
                       onClick={() => handleJump(leg.to.name)}
-                      className="text-cyan-400 hover:text-cyan-300 underline"
+                      className="text-cyan-400 hover:text-cyan-300 disabled:opacity-35 disabled:cursor-not-allowed disabled:no-underline underline"
                     >
                       Jump Leg
                     </button>
                   </div>
-                ))}
+                  );
+                })}
               </>
             )}
           </div>

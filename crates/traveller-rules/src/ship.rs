@@ -688,6 +688,299 @@ pub fn roll_berthing_fee<R: Rng + ?Sized>(
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefitLineItem {
+    pub item: String,
+    pub cost_cr: i64,
+    pub requires_shipyard: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefitQuote {
+    pub allowed: bool,
+    pub block_reason: Option<String>,
+    pub has_changes: bool,
+    pub total_cost_cr: i64,
+    pub days_required: u32,
+    pub items: Vec<RefitLineItem>,
+}
+
+fn sensor_base_cost_cr(g: SensorGrade) -> i64 {
+    match g {
+        SensorGrade::Basic => 0,
+        SensorGrade::Civilian => 3_000_000,
+        SensorGrade::Military => 4_100_000,
+        SensorGrade::Improved => 4_300_000,
+        SensorGrade::Advanced => 5_300_000,
+    }
+}
+
+fn stealth_cost_cr(tonnage: u32, stealth_dm: i32) -> i64 {
+    let t = i64::from(tonnage);
+    match stealth_dm {
+        d if d <= -6 => t * 500_000,
+        d if d <= -4 => t * 200_000,
+        d if d <= -2 => t * 100_000,
+        _ => 0,
+    }
+}
+
+/// Core 2022 / High Guard 2024 Shipyard Refit & Repair Cost Calculator.
+/// Prevents free ship alterations: calculates exact itemized Cr costs, enforces Starport A/B shipyard
+/// requirements for major refits (Starport C for minor hull repair), and checks world Tech Level.
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_refit_cost(
+    current: &ShipSpec,
+    current_hull: i32,
+    current_crits: usize,
+    proposed: &ShipSpec,
+    proposed_hull: i32,
+    proposed_crits: usize,
+    starport: char,
+    world_tl: u8,
+) -> RefitQuote {
+    let mut items = Vec::new();
+    let mut needs_shipyard = false;
+    let mut needs_repair_yard = false;
+    let mut days = 0u32;
+
+    if proposed.tonnage != current.tonnage {
+        return RefitQuote {
+            allowed: false,
+            block_reason: Some("Hull tonnage cannot be changed via refit — buy or build a new hull at a Class A shipyard.".into()),
+            has_changes: true,
+            total_cost_cr: 0,
+            days_required: 0,
+            items,
+        };
+    }
+
+    if proposed.tl > current.tl && proposed.tl > world_tl {
+        return RefitQuote {
+            allowed: false,
+            block_reason: Some(format!(
+                "Cannot upgrade ship to TL{} here (world is only TL{}).",
+                proposed.tl, world_tl
+            )),
+            has_changes: true,
+            total_cost_cr: 0,
+            days_required: 0,
+            items,
+        };
+    }
+
+    // 1. Hull Damage Repair (Core 2022 p. 175: Cr100,000 per Hull point at shipyard)
+    if proposed_hull > current_hull {
+        let pts = i64::from(proposed_hull - current_hull);
+        let cost = pts * 100_000;
+        items.push(RefitLineItem {
+            item: format!("Hull repair (+{pts} Hull points)"),
+            cost_cr: cost,
+            requires_shipyard: false,
+        });
+        needs_repair_yard = true;
+        days += ((pts as u32) / 10).max(1);
+    }
+
+    // 2. Critical Hit Repairs (Cr250,000 per crit)
+    if proposed_crits < current_crits {
+        let fixed = (current_crits - proposed_crits) as i64;
+        items.push(RefitLineItem {
+            item: format!("Critical system repair ({fixed} crit(s))"),
+            cost_cr: fixed * 250_000,
+            requires_shipyard: false,
+        });
+        needs_repair_yard = true;
+        days += fixed as u32 * 2;
+    }
+
+    // 3. Hull Max / Structural Upgrade
+    if proposed.hull_points_max > current.hull_points_max {
+        let delta = i64::from(proposed.hull_points_max - current.hull_points_max);
+        items.push(RefitLineItem {
+            item: format!("Reinforced hull structure (+{delta} max Hull)"),
+            cost_cr: delta * 150_000,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 14;
+    }
+
+    // 4. Armor Rating Upgrade (High Guard: ~Cr500k per armor point per 100t)
+    if proposed.armor_rating != current.armor_rating {
+        let delta = i64::from((proposed.armor_rating - current.armor_rating).abs());
+        let cost = if proposed.armor_rating > current.armor_rating {
+            delta * 500_000 * i64::from((proposed.tonnage / 100).max(1))
+        } else {
+            delta * 50_000 // stripping armor labor
+        };
+        items.push(RefitLineItem {
+            item: format!("Armor refit ({} → {})", current.armor_rating, proposed.armor_rating),
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 7;
+    }
+
+    // 5. M-Drive Thrust Refit (Core/HG: MCr2 per drive ton, ~1% hull per thrust)
+    if proposed.thrust != current.thrust {
+        let delta = i64::from(proposed.thrust.abs_diff(current.thrust));
+        let drive_tons = (f64::from(proposed.tonnage) * 0.01 * delta as f64).max(1.0);
+        let cost = if proposed.thrust > current.thrust {
+            (drive_tons * 2_000_000.0).round() as i64
+        } else {
+            250_000
+        };
+        items.push(RefitLineItem {
+            item: format!("M-Drive refit (M-{} → M-{})", current.thrust, proposed.thrust),
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 14;
+    }
+
+    // 6. J-Drive Jump Rating Refit (Core/HG: MCr1.5 per drive ton, ~2.5% hull per jump + 5t)
+    if proposed.jump_rating != current.jump_rating {
+        let delta = i64::from(proposed.jump_rating.abs_diff(current.jump_rating));
+        let drive_tons = (f64::from(proposed.tonnage) * 0.025 * delta as f64 + 5.0).max(5.0);
+        let cost = if proposed.jump_rating > current.jump_rating {
+            (drive_tons * 1_500_000.0).round() as i64
+        } else {
+            500_000
+        };
+        items.push(RefitLineItem {
+            item: format!("J-Drive refit (J-{} → J-{})", current.jump_rating, proposed.jump_rating),
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 21;
+    }
+
+    // 7. Power Plant Refit
+    if proposed.power_plant_output != current.power_plant_output {
+        let delta = i64::from((proposed.power_plant_output - current.power_plant_output).abs());
+        let cost = if proposed.power_plant_output > current.power_plant_output {
+            delta * 100_000
+        } else {
+            100_000
+        };
+        items.push(RefitLineItem {
+            item: format!(
+                "Power Plant refit ({} → {} Power)",
+                current.power_plant_output, proposed.power_plant_output
+            ),
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 10;
+    }
+
+    // 8. Sensor Suite Upgrade
+    if proposed.sensor_grade != current.sensor_grade {
+        let old_c = sensor_base_cost_cr(current.sensor_grade);
+        let new_c = sensor_base_cost_cr(proposed.sensor_grade);
+        let cost = (new_c - old_c / 2).max(250_000);
+        items.push(RefitLineItem {
+            item: format!("Sensor suite refit ({:?} → {:?})", current.sensor_grade, proposed.sensor_grade),
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 5;
+    }
+
+    // 9. Stealth Coating (High Guard 2024)
+    if proposed.stealth_dm != current.stealth_dm {
+        let old_c = stealth_cost_cr(current.tonnage, current.stealth_dm);
+        let new_c = stealth_cost_cr(proposed.tonnage, proposed.stealth_dm);
+        let cost = (new_c - old_c).max(100_000);
+        items.push(RefitLineItem {
+            item: format!("Stealth coating refit (DM {} → DM {})", current.stealth_dm, proposed.stealth_dm),
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 7;
+    }
+
+    // 10. Staterooms / Low Berths / Fuel Tankage / Cargo Reconfiguration
+    if proposed.staterooms != current.staterooms {
+        let delta = i64::from(proposed.staterooms.abs_diff(current.staterooms));
+        let cost = if proposed.staterooms > current.staterooms {
+            delta * 500_000
+        } else {
+            delta * 50_000
+        };
+        items.push(RefitLineItem {
+            item: format!("Stateroom refit ({} → {})", current.staterooms, proposed.staterooms),
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 4;
+    }
+    if (proposed.fuel_capacity_tons - current.fuel_capacity_tons).abs() > 0.1 {
+        let delta = (proposed.fuel_capacity_tons - current.fuel_capacity_tons).abs();
+        items.push(RefitLineItem {
+            item: format!(
+                "Fuel tankage rework ({:.1}t → {:.1}t)",
+                current.fuel_capacity_tons, proposed.fuel_capacity_tons
+            ),
+            cost_cr: (delta * 50_000.0).round() as i64,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 3;
+    }
+    if (proposed.cargo_capacity_tons - current.cargo_capacity_tons).abs() > 0.1 {
+        let delta = (proposed.cargo_capacity_tons - current.cargo_capacity_tons).abs();
+        items.push(RefitLineItem {
+            item: format!(
+                "Cargo bay rework ({:.1}t → {:.1}t)",
+                current.cargo_capacity_tons, proposed.cargo_capacity_tons
+            ),
+            cost_cr: (delta * 25_000.0).round() as i64,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 2;
+    }
+
+    let has_changes = !items.is_empty();
+    let total_cost_cr: i64 = items.iter().map(|i| i.cost_cr).sum();
+
+    let (allowed, block_reason) = if needs_shipyard && !matches!(starport, 'A' | 'B') {
+        (
+            false,
+            Some(format!(
+                "Major ship refits require a Class A or B Starport shipyard (current starport is Class {starport})."
+            )),
+        )
+    } else if needs_repair_yard && !matches!(starport, 'A' | 'B' | 'C') {
+        (
+            false,
+            Some(format!(
+                "Hull and critical repairs require at least a Class C Starport (current starport is Class {starport})."
+            )),
+        )
+    } else {
+        (true, None)
+    };
+
+    RefitQuote {
+        allowed,
+        block_reason,
+        has_changes,
+        total_cost_cr,
+        days_required: days,
+        items,
+    }
+}
+
 /// Standard Type-A Free Trader (200 tons, J-1, M-1) starter ship template.
 pub fn sample_free_trader() -> ShipSpec {
     ShipSpec {

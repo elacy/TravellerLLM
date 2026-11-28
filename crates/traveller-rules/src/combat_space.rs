@@ -245,6 +245,20 @@ pub struct SpaceCombatShip {
     pub initiative: i32,
     #[serde(default)]
     pub last_ten_pct_threshold: i32,
+    #[serde(default)]
+    pub maneuver_used: bool,
+    #[serde(default)]
+    pub weapons_fired_this_round: u32,
+    #[serde(default = "default_max_weapons")]
+    pub max_weapons_per_round: u32,
+    #[serde(default)]
+    pub sensor_action_used: bool,
+    #[serde(default)]
+    pub missiles_launched_this_round: bool,
+}
+
+fn default_max_weapons() -> u32 {
+    1
 }
 
 fn default_tonnage() -> u32 {
@@ -290,6 +304,13 @@ pub fn start_space_combat<R: Rng + ?Sized>(
         s.initiative = i32::from(d[0]) + i32::from(d[1]) + i32::from(s.thrust_max) + t_dm;
         s.thrust_remaining = s.thrust_max;
         s.last_ten_pct_threshold = 0;
+        s.maneuver_used = false;
+        s.weapons_fired_this_round = 0;
+        if s.max_weapons_per_round == 0 {
+            s.max_weapons_per_round = (s.tonnage / 200).max(1);
+        }
+        s.sensor_action_used = false;
+        s.missiles_launched_this_round = false;
     }
     ships.sort_by_key(|a| std::cmp::Reverse(a.initiative));
     SpaceCombatState {
@@ -320,6 +341,13 @@ pub fn allocate_maneuver_thrust<R: Rng + ?Sized>(
         .position(|s| s.ship_id == ship_id)
         .ok_or_else(|| anyhow::anyhow!("Ship not found in combat"))?;
 
+    if state.ships[idx].maneuver_used {
+        anyhow::bail!(
+            "{} has already completed its Maneuver Step allocation this round — advance to Next Round.",
+            state.ships[idx].name
+        );
+    }
+
     let needed = thrust_to_range.unsigned_abs() as u8
         + thrust_to_evade
         + if aid_gunners { 1 } else { 0 };
@@ -331,6 +359,7 @@ pub fn allocate_maneuver_thrust<R: Rng + ?Sized>(
         );
     }
     state.ships[idx].thrust_remaining -= needed;
+    state.ships[idx].maneuver_used = true;
 
     // Evasive action: Pilot skill per thrust spent (Core p. 171)
     if thrust_to_evade > 0 {
@@ -464,6 +493,16 @@ pub fn resolve_space_attack<R: Rng + ?Sized>(
         .iter()
         .position(|s| s.ship_id == input.target_ship_id)
         .ok_or_else(|| anyhow::anyhow!("Target ship not found"))?;
+
+    let max_shots = state.ships[atk_idx].max_weapons_per_round.max(1);
+    if state.ships[atk_idx].weapons_fired_this_round >= max_shots {
+        anyhow::bail!(
+            "{} has already fired all {} weapon mount(s) this round — advance to Next Round.",
+            state.ships[atk_idx].name,
+            max_shots
+        );
+    }
+    state.ships[atk_idx].weapons_fired_this_round += 1;
 
     let mut mods = vec![
         ModifierItem { label: "Gunner skill".into(), value: input.gunner_skill },
@@ -611,7 +650,16 @@ pub fn launch_missile_salvo(
     target_ship_id: Uuid,
     count: u32,
     smart_tl: u8,
-) -> MissileSalvo {
+) -> anyhow::Result<MissileSalvo> {
+    if let Some(ship) = state.ships.iter_mut().find(|s| s.ship_id == attacker_ship_id) {
+        if ship.missiles_launched_this_round {
+            anyhow::bail!(
+                "{} has already launched a missile salvo this round — advance to Next Round.",
+                ship.name
+            );
+        }
+        ship.missiles_launched_this_round = true;
+    }
     let salvo = MissileSalvo {
         id: Uuid::new_v4(),
         attacker_ship_id,
@@ -627,7 +675,7 @@ pub fn launch_missile_salvo(
         "Missile salvo ({count} missiles, TL{smart_tl}) launched — impact in {} round(s).",
         salvo.rounds_to_impact
     ));
-    salvo
+    Ok(salvo)
 }
 
 /// Electronic Warfare vs. incoming missile salvo (Core p. 173: Difficult 10+ Electronics/sensors
@@ -687,6 +735,13 @@ pub fn acquire_sensor_lock<R: Rng + ?Sized>(
         .iter_mut()
         .find(|s| s.ship_id == ship_id)
         .ok_or_else(|| anyhow::anyhow!("Ship not found"))?;
+    if ship.sensor_action_used {
+        anyhow::bail!(
+            "{} has already used its Sensor action this round — advance to Next Round.",
+            ship.name
+        );
+    }
+    ship.sensor_action_used = true;
     let roll = resolve_task(
         rng,
         RollMode::Normal,
@@ -755,6 +810,10 @@ pub fn advance_space_round<R: Rng + ?Sized>(rng: &mut R, state: &mut SpaceCombat
         s.thrust_remaining = s.thrust_max;
         s.evasive_dm = 0;
         s.aid_gunners_dm = 0;
+        s.maneuver_used = false;
+        s.weapons_fired_this_round = 0;
+        s.sensor_action_used = false;
+        s.missiles_launched_this_round = false;
     }
     events.push(format!("--- Space Combat Round {} (Maneuver Step) ---", state.round));
     state.log.extend(events.clone());
@@ -899,11 +958,12 @@ pub fn execute_space_ai_turn<R: Rng + ?Sized>(
 
         if use_missiles {
             let count = if ship.tonnage >= 400 { 4 } else { 2 };
-            let salvo = launch_missile_salvo(state, hid, target_id, count, ship.tl);
-            ship_actions.push(format!(
-                "Launched {count}x Smart TL{} missiles (impact in {} rd(s))",
-                ship.tl, salvo.rounds_to_impact
-            ));
+            if let Ok(salvo) = launch_missile_salvo(state, hid, target_id, count, ship.tl) {
+                ship_actions.push(format!(
+                    "Launched {count}x Smart TL{} missiles (impact in {} rd(s))",
+                    ship.tl, salvo.rounds_to_impact
+                ));
+            }
         } else {
             let linked = if ship.tonnage >= 400 { 3 } else { 2 };
             let weapon = if matches!(state.range_band, SpaceRangeBand::Adjacent | SpaceRangeBand::Close | SpaceRangeBand::Short) {

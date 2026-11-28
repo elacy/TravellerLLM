@@ -1231,6 +1231,7 @@ pub async fn execute_tool(
                                 str_cur: c.upp_current.str_val,
                                 dex_cur: c.upp_current.dex_val,
                                 end_cur: c.upp_current.end_val,
+                                action_used_this_round: false,
                             });
                         }
                     }
@@ -1406,6 +1407,22 @@ pub async fn execute_tool(
                             vec![]
                         };
                     if ships_list.is_empty() {
+                        let camp = db
+                            .get_campaign(campaign_id)
+                            .await?
+                            .context("Campaign not found")?;
+                        let in_system = db
+                            .list_system_ships(campaign_id, &camp.current_system_name)
+                            .await?;
+                        let target_vessel = in_system
+                            .iter()
+                            .find(|v| v.status != "destroyed" && v.disposition == "hostile")
+                            .or_else(|| in_system.iter().find(|v| v.status != "destroyed"))
+                            .cloned()
+                            .context(
+                                "No target ship specified and no vessels are currently in-system to engage. Select an in-system contact or pass explicit ships.",
+                            )?;
+
                         for s in db.list_ships(campaign_id).await? {
                             ships_list.push(SpaceCombatShip {
                                 ship_id: s.id,
@@ -1425,26 +1442,36 @@ pub async fn execute_tool(
                                 crits: Default::default(),
                                 initiative: 0,
                                 last_ten_pct_threshold: 0,
+                                maneuver_used: false,
+                                weapons_fired_this_round: 0,
+                                max_weapons_per_round: (s.spec.tonnage / 200).max(1),
+                                sensor_action_used: false,
+                                missiles_launched_this_round: false,
                             });
                         }
                         ships_list.push(SpaceCombatShip {
-                            ship_id: Uuid::new_v4(),
-                            name: "Corsair Raider".into(),
+                            ship_id: target_vessel.id,
+                            name: target_vessel.name,
                             side: "hostile".into(),
-                            tonnage: 400,
-                            tl: 12,
-                            hull_max: 160,
-                            hull_current: 160,
-                            armor: 4,
-                            thrust_max: 3,
-                            thrust_remaining: 3,
+                            tonnage: target_vessel.tonnage.max(0) as u32,
+                            tl: target_vessel.tl.max(0) as u8,
+                            hull_max: target_vessel.hull_max,
+                            hull_current: target_vessel.hull_current,
+                            armor: target_vessel.armor,
+                            thrust_max: target_vessel.thrust.max(0) as u8,
+                            thrust_remaining: target_vessel.thrust.max(0) as u8,
                             evasive_dm: 0,
                             aid_gunners_dm: 0,
-                            power_available: 160,
+                            power_available: (target_vessel.tonnage / 2).max(60),
                             sensor_lock_targets: vec![],
                             crits: Default::default(),
                             initiative: 0,
                             last_ten_pct_threshold: 0,
+                            maneuver_used: false,
+                            weapons_fired_this_round: 0,
+                            max_weapons_per_round: ((target_vessel.tonnage.max(0) as u32) / 200).max(1),
+                            sensor_action_used: false,
+                            missiles_launched_this_round: false,
                         });
                     }
                     let state = {
@@ -1537,7 +1564,7 @@ pub async fn execute_tool(
                         tgt_id,
                         input.get("missile_count").and_then(|v| v.as_u64()).unwrap_or(3) as u32,
                         input.get("smart_tl").and_then(|v| v.as_u64()).unwrap_or(12) as u8,
-                    );
+                    )?;
                     let val = serde_json::to_value(&state)?;
                     db.upsert_combat(rec.id, campaign_id, "space", "active", state.round as i32, "attack", &val)
                         .await?;
@@ -2219,7 +2246,8 @@ pub async fn execute_tool(
                                 "hull_max": ps.map(|s| s.spec.hull_points_max).unwrap_or(80),
                                 "hull_current": ps.map(|s| s.hull_current).unwrap_or(80),
                                 "armor": ps.map(|s| s.spec.armor_rating).unwrap_or(4),
-                                "thrust_max": ps.map(|s| s.spec.thrust).unwrap_or(2)
+                                "thrust_max": ps.map(|s| s.spec.thrust).unwrap_or(2),
+                                "max_weapons_per_round": (ps.map(|s| s.spec.tonnage).unwrap_or(200) / 200).max(1)
                             },
                             {
                                 "ship_id": vessel.id.to_string(),
@@ -2230,7 +2258,8 @@ pub async fn execute_tool(
                                 "hull_max": vessel.hull_max,
                                 "hull_current": vessel.hull_current,
                                 "armor": vessel.armor,
-                                "thrust_max": vessel.thrust
+                                "thrust_max": vessel.thrust,
+                                "max_weapons_per_round": (vessel.tonnage / 200).max(1)
                             }
                         ]
                     });

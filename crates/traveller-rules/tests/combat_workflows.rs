@@ -72,6 +72,7 @@ fn personal_combat_tracks_ammo_reactions_initiative_penalty_armor_ap_and_casualt
             str_cur: 9,
             dex_cur: 10,
             end_cur: 9,
+            action_used_this_round: false,
         },
         PersonalCombatant {
             character_id: pirate_id,
@@ -100,6 +101,7 @@ fn personal_combat_tracks_ammo_reactions_initiative_penalty_armor_ap_and_casualt
             str_cur: 7,
             dex_cur: 7,
             end_cur: 7,
+            action_used_this_round: false,
         },
     ];
 
@@ -134,6 +136,25 @@ fn personal_combat_tracks_ammo_reactions_initiative_penalty_armor_ap_and_casualt
     assert_eq!(res.armor_applied, 1, "6 armor - AP 5 must yield 1 effective armor");
     assert!(res.net_damage > 0);
     assert!(res.end_lost > 0);
+
+    // Attempting a SECOND attack in the same 6-second round MUST be rejected!
+    let second_same_round = resolve_personal_attack(
+        &mut rng,
+        &mut state,
+        Some(&marine_char),
+        &PersonalAttackInput {
+            attacker_id: marine_id,
+            defender_id: pirate_id,
+            burst_mode: false,
+            reaction: ReactionKind::None,
+            defender_reaction_dm: 0,
+            extra_dm: 0,
+        },
+    );
+    assert!(
+        second_same_round.is_err(),
+        "Cannot take a second Significant Action in the same 6-second personal combat round"
+    );
 
     // Next round applies the Dive for Cover -2 initiative penalty
     next_personal_round(&mut state);
@@ -188,6 +209,11 @@ fn high_guard_space_combat_thrust_pool_sensor_lock_missiles_ew_and_critical_hits
             crits: BTreeMap::new(),
             initiative: 0,
             last_ten_pct_threshold: 0,
+            maneuver_used: false,
+            weapons_fired_this_round: 0,
+            max_weapons_per_round: 1,
+            sensor_action_used: false,
+            missiles_launched_this_round: false,
         },
         SpaceCombatShip {
             ship_id: corsair_id,
@@ -207,6 +233,11 @@ fn high_guard_space_combat_thrust_pool_sensor_lock_missiles_ew_and_critical_hits
             crits: BTreeMap::new(),
             initiative: 0,
             last_ten_pct_threshold: 0,
+            maneuver_used: false,
+            weapons_fired_this_round: 0,
+            max_weapons_per_round: 2,
+            sensor_action_used: false,
+            missiles_launched_this_round: false,
         },
     ];
 
@@ -276,8 +307,32 @@ fn high_guard_space_combat_thrust_pool_sensor_lock_missiles_ew_and_critical_hits
         "Effect 6+ or 10% hull loss must inflict High Guard Critical Hits"
     );
 
+    // Firing again in the same round after exhausting max_weapons_per_round (1) MUST be rejected!
+    let repeat_fire = resolve_space_attack(
+        &mut rng,
+        &mut state,
+        &SpaceWeaponAttackInput {
+            attacker_ship_id: trader_id,
+            target_ship_id: corsair_id,
+            weapon_name: "Triple Pulse Laser".into(),
+            linked_count: 3,
+            damage_dice: 2,
+            is_laser: true,
+            gunner_skill: 2,
+            gunner_dex_dm: 1,
+            fire_control_dm: 0,
+            sandcaster_count_defending: 0,
+            defender_gunner_skill: 0,
+            called_shot: None,
+        },
+    );
+    assert!(
+        repeat_fire.is_err(),
+        "Ship must not fire unlimited times in the same space combat round"
+    );
+
     // 4. Launch a 6-missile salvo from Medium range (2 rounds flight) and EW jam it
-    let salvo = launch_missile_salvo(&mut state, corsair_id, trader_id, 6, 12);
+    let salvo = launch_missile_salvo(&mut state, corsair_id, trader_id, 6, 12).unwrap();
     assert_eq!(salvo.rounds_to_impact, 2);
     let salvo_id = salvo.id;
 

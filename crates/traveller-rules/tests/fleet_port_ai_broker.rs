@@ -12,8 +12,8 @@ use traveller_rules::combat_space::{
     execute_space_ai_turn, start_space_combat, SpaceCombatShip, SpaceRangeBand,
 };
 use traveller_rules::ship::{
-    calculate_refuel_quote, fleet_max_jump_rating, jump_fuel_for_distance, roll_berthing_fee,
-    sample_free_trader, RefuelMode,
+    calculate_refuel_quote, calculate_refit_cost, fleet_max_jump_rating, jump_fuel_for_distance,
+    roll_berthing_fee, sample_free_trader, RefuelMode, SensorGrade,
 };
 use traveller_rules::trade::compute_fleet_max_broker;
 use traveller_rules::universe::{build_spatial_memory_scope, parse_uwp};
@@ -60,7 +60,17 @@ fn fleet_jump_limit_refueling_berthing_and_spatial_memory_tags() {
     let fee_e = roll_berthing_fee(&mut rng, 'E', 3);
     assert_eq!(fee_e.total_cr, 0);
 
-    // 4. Spatial & Polity Hindsight Memory Tags
+    // 4. Paid Shipyard Refit Cost & Starport Eligibility
+    let mut upgraded = free_trader.clone();
+    upgraded.armor_rating = 4; // +2 armor on 200t hull -> Cr2,000,000
+    upgraded.sensor_grade = SensorGrade::Military;
+    let quote_a = calculate_refit_cost(&free_trader, 70, 0, &upgraded, 80, 0, 'A', 12);
+    assert!(quote_a.allowed && quote_a.has_changes);
+    assert!(quote_a.total_cost_cr >= 3_000_000, "Refit must charge real Cr costs");
+    let quote_c = calculate_refit_cost(&free_trader, 70, 0, &upgraded, 80, 0, 'C', 12);
+    assert!(!quote_c.allowed, "Major drive/armor refits must be blocked at Starport C");
+
+    // 5. Spatial & Polity Hindsight Memory Tags
     let regina = parse_uwp("A788899-C").unwrap();
     let scope = build_spatial_memory_scope("Regina", Some("Spinward Marches"), &regina, "Im");
     assert!(scope.local_tags.contains(&"system:regina".to_string()));
@@ -175,6 +185,11 @@ fn combat_enemy_ai_autonomously_fights_back_in_space_and_personal_combat() {
                 crits: BTreeMap::new(),
                 initiative: 0,
                 last_ten_pct_threshold: 0,
+                maneuver_used: false,
+                weapons_fired_this_round: 0,
+                max_weapons_per_round: 1,
+                sensor_action_used: false,
+                missiles_launched_this_round: false,
             },
             SpaceCombatShip {
                 ship_id: corsair_id,
@@ -194,6 +209,11 @@ fn combat_enemy_ai_autonomously_fights_back_in_space_and_personal_combat() {
                 crits: BTreeMap::new(),
                 initiative: 0,
                 last_ten_pct_threshold: 0,
+                maneuver_used: false,
+                weapons_fired_this_round: 0,
+                max_weapons_per_round: 2,
+                sensor_action_used: false,
+                missiles_launched_this_round: false,
             },
         ],
         0,
@@ -235,6 +255,7 @@ fn combat_enemy_ai_autonomously_fights_back_in_space_and_personal_combat() {
                 str_cur: 8,
                 dex_cur: 8,
                 end_cur: 8,
+                action_used_this_round: false,
             },
             PersonalCombatant {
                 character_id: Uuid::new_v4(),
@@ -263,6 +284,7 @@ fn combat_enemy_ai_autonomously_fights_back_in_space_and_personal_combat() {
                 str_cur: 7,
                 dex_cur: 7,
                 end_cur: 7,
+                action_used_this_round: false,
             },
             PersonalCombatant {
                 character_id: Uuid::new_v4(),
@@ -291,6 +313,7 @@ fn combat_enemy_ai_autonomously_fights_back_in_space_and_personal_combat() {
                 str_cur: 8,
                 dex_cur: 8,
                 end_cur: 8,
+                action_used_this_round: false,
             },
         ],
         0,

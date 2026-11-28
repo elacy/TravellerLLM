@@ -26,8 +26,8 @@ use traveller_rules::dice::{resolve_task, Difficulty, ModifierItem, RollMode};
 use traveller_rules::finance::AccountKind;
 use traveller_rules::sensors::{resolve_sensor_detection, SensorDetectionInput};
 use traveller_rules::ship::{
-    compute_running_costs, fleet_max_jump_rating, sample_free_trader, validate_ship, Mortgage,
-    ShipSpec,
+    calculate_refit_cost, compute_running_costs, fleet_max_jump_rating, sample_free_trader,
+    validate_ship, Mortgage, ShipSpec,
 };
 use traveller_rules::trade::compute_fleet_max_broker;
 use traveller_rules::traffic::generate_system_traffic;
@@ -86,6 +86,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/campaigns/{id}/ships/{ship_id}/validate",
             post(validate_ship_handler),
+        )
+        .route(
+            "/api/campaigns/{id}/ships/{ship_id}/refit-quote",
+            post(refit_quote_handler),
         )
         .route(
             "/api/campaigns/{id}/ships/{ship_id}/refuel",
@@ -351,8 +355,28 @@ async fn get_campaign_snapshot(
         "total_cr": total_mortgage_cr + total_maintenance_cr + total_life_support_cr + crew_salaries_cr
     });
 
+    let cur_sys_rec = st
+        .db
+        .get_system_by_name(&camp.current_system_name)
+        .await
+        .ok()
+        .flatten();
+    let cur_uwp = parse_uwp(&camp.current_system_uwp).ok();
+    let current_system_info = json!({
+        "name": camp.current_system_name,
+        "uwp": camp.current_system_uwp,
+        "starport": cur_uwp.as_ref().map(|u| u.starport.to_string()).unwrap_or_else(|| "A".into()),
+        "tech_level": cur_uwp.as_ref().map(|u| u.tech_level).unwrap_or(12),
+        "law_level": cur_uwp.as_ref().map(|u| u.law_level).unwrap_or(5),
+        "trade_codes": cur_uwp.as_ref().map(|u| u.trade_codes.clone()).unwrap_or_default(),
+        "gas_giants": cur_sys_rec.as_ref().map(|s| s.gas_giants).unwrap_or(1),
+        "global_x": cur_sys_rec.as_ref().map(|s| s.global_x),
+        "global_y": cur_sys_rec.as_ref().map(|s| s.global_y)
+    });
+
     Ok(Json(json!({
         "campaign": camp,
+        "current_system_info": current_system_info,
         "characters": characters,
         "ships": ships,
         "accounts": accounts,
@@ -538,16 +562,140 @@ async fn create_ship(
     Ok(Json(json!({ "ship": ship })))
 }
 
+async fn refit_quote_handler(
+    State(st): State<AppState>,
+    Path((id, ship_id)): Path<(Uuid, Uuid)>,
+    Json(proposed): Json<ShipRecord>,
+) -> Result<Json<Value>, ApiError> {
+    let camp = st
+        .db
+        .get_campaign(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Campaign not found"))?;
+    let existing = st
+        .db
+        .list_ships(id)
+        .await?
+        .into_iter()
+        .find(|s| s.id == ship_id)
+        .ok_or_else(|| anyhow::anyhow!("Ship not found"))?;
+    let uwp = parse_uwp(&camp.current_system_uwp)
+        .unwrap_or_else(|_| parse_uwp("A788899-C").expect("valid uwp"));
+    let quote = calculate_refit_cost(
+        &existing.spec,
+        existing.hull_current,
+        existing.crits.len(),
+        &proposed.spec,
+        proposed.hull_current,
+        proposed.crits.len(),
+        uwp.starport,
+        uwp.tech_level,
+    );
+    let validation = validate_ship(&proposed.spec);
+    Ok(Json(json!({ "quote": quote, "validation": validation })))
+}
+
 async fn update_ship(
     State(st): State<AppState>,
     Path((id, ship_id)): Path<(Uuid, Uuid)>,
     Json(mut ship): Json<ShipRecord>,
 ) -> Result<Json<Value>, ApiError> {
+    let camp = st
+        .db
+        .get_campaign(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Campaign not found"))?;
+    let existing = st
+        .db
+        .list_ships(id)
+        .await?
+        .into_iter()
+        .find(|s| s.id == ship_id)
+        .ok_or_else(|| anyhow::anyhow!("Ship not found"))?;
+
+    // Preserve authoritative fields that cannot be freely edited via refit
     ship.campaign_id = id;
     ship.id = ship_id;
+    ship.fuel_refined = existing.fuel_refined;
+    ship.fuel_unrefined = existing.fuel_unrefined;
+    ship.cargo = existing.cargo.clone();
+    ship.mortgage = existing.mortgage.clone();
+
+    let uwp = parse_uwp(&camp.current_system_uwp)
+        .unwrap_or_else(|_| parse_uwp("A788899-C").expect("valid uwp"));
+    let quote = calculate_refit_cost(
+        &existing.spec,
+        existing.hull_current,
+        existing.crits.len(),
+        &ship.spec,
+        ship.hull_current,
+        ship.crits.len(),
+        uwp.starport,
+        uwp.tech_level,
+    );
+    if !quote.allowed {
+        return Err(anyhow::anyhow!(
+            "{}",
+            quote
+                .block_reason
+                .unwrap_or_else(|| "Refit not allowed at this starport".into())
+        )
+        .into());
+    }
+    if !quote.has_changes {
+        return Err(anyhow::anyhow!("No ship refit or repair changes to apply.").into());
+    }
+
     ship.validation = validate_ship(&ship.spec);
+    if !ship.validation.valid {
+        return Err(anyhow::anyhow!(
+            "Proposed refit fails High Guard ship validation ({}).",
+            ship.validation
+                .issues
+                .iter()
+                .map(|i| i.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+        .into());
+    }
+
+    if quote.total_cost_cr > 0 {
+        let accounts = st.db.list_accounts(id).await?;
+        let company = accounts
+            .iter()
+            .find(|a| a.kind == AccountKind::Company)
+            .or_else(|| accounts.first())
+            .ok_or_else(|| anyhow::anyhow!("Company account not found"))?;
+        if company.balance_cr + company.credit_limit_cr < quote.total_cost_cr {
+            return Err(anyhow::anyhow!(
+                "Insufficient funds for shipyard refit: need Cr{}, Company account only has Cr{}.",
+                quote.total_cost_cr,
+                company.balance_cr
+            )
+            .into());
+        }
+        let summary = quote
+            .items
+            .iter()
+            .map(|i| i.item.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        st.db
+            .post_transaction(
+                id,
+                company.id,
+                &camp.date.format_date_only(),
+                -quote.total_cost_cr,
+                "shipyard_refit",
+                &format!("Shipyard refit for {}: {summary}", ship.name),
+                &format!("{} Shipyard", camp.current_system_name),
+            )
+            .await?;
+    }
+
     st.db.save_ship(&ship).await?;
-    Ok(Json(json!({ "ship": ship })))
+    Ok(Json(json!({ "ship": ship, "quote": quote })))
 }
 
 async fn validate_ship_handler(

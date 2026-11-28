@@ -379,8 +379,36 @@ export interface FleetRunningCosts {
   total_cr: number;
 }
 
+export interface CurrentSystemInfo {
+  name: string;
+  uwp: string;
+  starport: string;
+  tech_level: number;
+  law_level: number;
+  trade_codes: string[];
+  gas_giants: number;
+  global_x?: number | null;
+  global_y?: number | null;
+}
+
+export interface RefitLineItem {
+  item: string;
+  cost_cr: number;
+  requires_shipyard: boolean;
+}
+
+export interface RefitQuote {
+  allowed: boolean;
+  block_reason?: string | null;
+  has_changes: boolean;
+  total_cost_cr: number;
+  days_required: number;
+  items: RefitLineItem[];
+}
+
 export interface CampaignSnapshot {
   campaign: Campaign;
+  current_system_info?: CurrentSystemInfo;
   characters: CharacterRow[];
   ships: ShipRecord[];
   accounts: AccountRecord[];
@@ -546,9 +574,17 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  // Ships & Port Ops (Refuel, Docking Fees, Maintenance)
+  // Ships & Port Ops (Refuel, Docking Fees, Maintenance, Paid Refits)
+  refitQuote: (id: string, shipId: string, ship: ShipRecord) =>
+    req<{ quote: RefitQuote; validation: ShipRecord["validation"] }>(
+      `/api/campaigns/${id}/ships/${shipId}/refit-quote`,
+      {
+        method: "POST",
+        body: JSON.stringify(ship),
+      }
+    ),
   updateShip: (id: string, shipId: string, ship: ShipRecord) =>
-    req<{ ship: ShipRecord }>(`/api/campaigns/${id}/ships/${shipId}`, {
+    req<{ ship: ShipRecord; quote?: RefitQuote }>(`/api/campaigns/${id}/ships/${shipId}`, {
       method: "PATCH",
       body: JSON.stringify(ship),
     }),
