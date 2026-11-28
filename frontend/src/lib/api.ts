@@ -327,9 +327,18 @@ export interface CareerOption {
   has_ship_benefit: boolean;
 }
 
+export interface SkillPackageOption {
+  id: string;
+  name: string;
+  description: string;
+  skills: string[];
+}
+
 export interface ChargenOptions {
   species: SpeciesOption[];
   background_skills: string[];
+  university_skills: string[];
+  skill_packages: SkillPackageOption[];
   careers: CareerOption[];
 }
 
@@ -338,6 +347,17 @@ export interface LifepathSession {
   name: string;
   species: string;
   species_traits?: string;
+  stage?:
+    | "assign_stats"
+    | "background_skills"
+    | "pre_career"
+    | "choose_career"
+    | "failed_qualification"
+    | "muster_out"
+    | "skill_package"
+    | "ready";
+  rolled_pool?: number[];
+  stats_locked?: boolean;
   age: number;
   terms_completed: number;
   upp: Upp;
@@ -346,7 +366,15 @@ export interface LifepathSession {
   background_skills_chosen?: boolean;
   pre_career_done?: boolean;
   pre_career_note?: string | null;
+  auto_qualify_career?: string | null;
+  auto_commission_career?: string | null;
   qualification_bonus_dm?: number;
+  draft_used?: boolean;
+  is_officer?: boolean;
+  must_leave_career?: boolean;
+  must_stay_career?: boolean;
+  terms_in_current_career?: number;
+  careers_entered?: string[];
   current_career?: string | null;
   current_assignment?: string | null;
   current_rank: number;
@@ -355,6 +383,8 @@ export interface LifepathSession {
   ship_shares: number;
   career_ship_benefits: number;
   pension_cr: number;
+  material_benefits?: string[];
+  skill_package_applied?: boolean;
   allies: string[];
   rivals: string[];
   mustered_out: boolean;
@@ -601,37 +631,73 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ skill, allow_general_xp: true }),
     }),
+  spendCharXp: (id: string, charId: string, characteristic: "STR" | "DEX" | "END" | "INT" | "EDU") =>
+    req(`/api/campaigns/${id}/characters/${charId}/spend-xp`, {
+      method: "POST",
+      body: JSON.stringify({ characteristic, allow_general_xp: true }),
+    }),
   chargenOptions: () => req<ChargenOptions>("/api/chargen/options"),
   chargenStart: (name: string, species = "Human (Imperial)", background_skills: string[] = []) =>
     req<{ session: LifepathSession }>("/api/chargen/start", {
       method: "POST",
       body: JSON.stringify({ name, species, background_skills }),
     }),
+  chargenAssignStats: (session: LifepathSession, ordered_pool: number[], lock = false) =>
+    req<{ session: LifepathSession }>("/api/chargen/assign-stats", {
+      method: "POST",
+      body: JSON.stringify({ session, ordered_pool, lock }),
+    }),
   chargenBackground: (session: LifepathSession, background_skills: string[]) =>
     req<{ session: LifepathSession }>("/api/chargen/background", {
       method: "POST",
       body: JSON.stringify({ session, background_skills }),
     }),
-  chargenPreCareer: (session: LifepathSession, choice: "none" | "university" | "military_academy") =>
+  chargenPreCareer: (
+    session: LifepathSession,
+    choice: "none" | "university" | "military_academy",
+    opts?: {
+      uni_skill_0?: string;
+      uni_skill_1?: string;
+      academy_branch?: "army" | "marine" | "navy";
+      academy_focus_skills?: string[];
+    }
+  ) =>
     req<{ session: LifepathSession; note: string }>("/api/chargen/pre-career", {
       method: "POST",
-      body: JSON.stringify({ session, choice }),
+      body: JSON.stringify({ session, choice, ...(opts ?? {}) }),
     }),
   chargenTerm: (
     session: LifepathSession,
     career: string,
     prefer_specialist: boolean,
     assignment?: string,
-    skill_table?: "service" | "specialist" | "personal" | "advanced_edu"
+    skill_table?: "service" | "specialist" | "personal" | "advanced_edu" | "officer",
+    opts?: {
+      basic_training_skill?: string;
+      attempt_commission?: boolean;
+      fallback_on_fail?: "draft" | "drifter";
+    }
   ) =>
     req<{ session: LifepathSession; entry: LifepathLogEntry }>("/api/chargen/term", {
       method: "POST",
-      body: JSON.stringify({ session, career, prefer_specialist, assignment, skill_table }),
+      body: JSON.stringify({
+        session,
+        career,
+        prefer_specialist,
+        assignment,
+        skill_table,
+        ...(opts ?? {}),
+      }),
     }),
   chargenMuster: (session: LifepathSession, cash_rolls: number) =>
     req<{ session: LifepathSession }>("/api/chargen/muster", {
       method: "POST",
       body: JSON.stringify({ session, cash_rolls }),
+    }),
+  chargenSkillPackage: (session: LifepathSession, chosen_skills: string[]) =>
+    req<{ session: LifepathSession }>("/api/chargen/skill-package", {
+      method: "POST",
+      body: JSON.stringify({ session, chosen_skills }),
     }),
   chargenCommit: (
     id: string,

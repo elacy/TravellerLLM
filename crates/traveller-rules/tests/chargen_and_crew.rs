@@ -2,9 +2,10 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use traveller_rules::character::CharacterKind;
 use traveller_rules::chargen::{
-    all_background_skills, all_careers, all_species, finalize_lifepath_character, muster_out,
-    run_lifepath_term, run_lifepath_term_detailed, run_pre_career, set_background_skills,
-    start_lifepath, Career, PreCareerChoice, SkillTableChoice,
+    all_background_skills, all_careers, all_skill_packages, all_species, all_university_skills,
+    apply_skill_package, assign_characteristics, finalize_lifepath_character, muster_out,
+    run_lifepath_term, run_lifepath_term_full, run_pre_career_detailed, set_background_skills,
+    start_lifepath, Career, MilitaryBranch, PreCareerChoice, SkillTableChoice,
 };
 use traveller_rules::crew::{generate_hiring_hall, standard_crew_salary};
 use traveller_rules::universe::parse_uwp;
@@ -125,6 +126,8 @@ fn species_catalog_background_skills_pre_career_and_detailed_terms() {
     let mut rng = StdRng::seed_from_u64(777);
     assert!(all_species().len() >= 10, "Must expose full Charted Space species list");
     assert!(all_background_skills().len() >= 15);
+    assert!(all_university_skills().len() >= 15);
+    assert!(all_skill_packages().len() >= 4);
     assert_eq!(all_careers().len(), 12);
 
     // Zhodani rolls PSI; Aslan gets STR+2/DEX-2 and traits
@@ -132,25 +135,69 @@ fn species_catalog_background_skills_pre_career_and_detailed_terms() {
     assert!(zho.upp.psi_val.is_some());
     let mut aslan = start_lifepath(&mut rng, "Htyowao".into(), "Aslan".into(), vec![]);
     assert!(aslan.species_traits.contains("dewclaw"));
+    assert_eq!(aslan.rolled_pool.len(), 6);
 
-    // Choosing custom background skills before Term 1 replaces defaults
+    // Reject forged non-permutation stat assignment; allow genuine permutation
+    assert!(assign_characteristics(&mut aslan, vec![12, 12, 12, 12, 12, 12], false).is_err());
+    let mut reversed = aslan.rolled_pool.clone();
+    reversed.reverse();
+    assign_characteristics(&mut aslan, reversed, true).expect("valid permutation must succeed");
+    assert!(aslan.stats_locked);
+
+    // Choosing custom background skills before Pre-Career replaces defaults
     set_background_skills(&mut aslan, vec!["Pilot (Spacecraft)".into(), "Broker".into()]);
     assert!(aslan.background_skills_chosen);
     assert_eq!(aslan.skills.get("Broker"), Some(&0));
 
-    // Pre-career education works before Term 1
-    let note = run_pre_career(&mut rng, &mut aslan, PreCareerChoice::University);
+    // Pre-career education works with player's chosen University skills
+    let note = run_pre_career_detailed(
+        &mut rng,
+        &mut aslan,
+        PreCareerChoice::University,
+        Some("Advocate".into()),
+        Some("Science (Physics)".into()),
+        None,
+        vec![],
+    );
     assert!(!note.is_empty());
     assert!(aslan.pre_career_done);
 
-    // Detailed career term with Assignment & Personal Development table
-    let entry = run_lifepath_term_detailed(
+    // Detailed career term with Assignment & Specialist table grants Level 1+ skills (NOT 0!)
+    let entry = run_lifepath_term_full(
         &mut rng,
         &mut aslan,
         Career::Merchant,
         Some("Free Trader".into()),
-        SkillTableChoice::Personal,
+        SkillTableChoice::Specialist,
+        None,
+        false,
+        Some("draft"),
     );
-    assert_eq!(entry.term, 1);
+    assert!(entry.term >= 1);
     assert!(!entry.skills_gained.is_empty());
+    assert!(
+        aslan.skills.values().any(|&lvl| lvl >= 1),
+        "Career term skill roll must grant Level 1+ skill, not all zeros: {:?}",
+        aslan.skills
+    );
+
+    // Military Academy branch test
+    let mut marine = start_lifepath(&mut rng, "Sgt. Rex".into(), "Human (Imperial)".into(), vec![]);
+    marine.upp.end_val = 12;
+    let m_note = run_pre_career_detailed(
+        &mut rng,
+        &mut marine,
+        PreCareerChoice::MilitaryAcademy,
+        None,
+        None,
+        Some(MilitaryBranch::Marine),
+        vec!["Gun Combat (Slug)".into(), "Vacc Suit".into(), "Tactics (Military)".into()],
+    );
+    assert!(m_note.contains("Marine Academy"));
+
+    // Starting Skill Package raises 2 skills to at least Level 1
+    apply_skill_package(&mut aslan, vec!["Astrogation".into(), "Medic".into()]);
+    assert!(aslan.skill_package_applied);
+    assert!(aslan.skills.get("Astrogation").copied().unwrap_or(0) >= 1);
+    assert!(aslan.skills.get("Medic").copied().unwrap_or(0) >= 1);
 }

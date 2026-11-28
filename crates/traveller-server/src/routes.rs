@@ -19,9 +19,10 @@ use traveller_llm::tools::execute_tool;
 use traveller_llm::TurnEvent;
 use traveller_rules::character::{Character, CharacterKind, Characteristic};
 use traveller_rules::chargen::{
-    all_background_skills, all_careers, all_species, finalize_lifepath_character, muster_out,
-    run_lifepath_term_detailed, run_pre_career, set_background_skills, start_lifepath, Career,
-    LifepathSession, PreCareerChoice, SkillTableChoice,
+    all_background_skills, all_careers, all_skill_packages, all_species, all_university_skills,
+    apply_skill_package, assign_characteristics, finalize_lifepath_character, muster_out,
+    run_lifepath_term_full, run_pre_career_detailed, set_background_skills, start_lifepath, Career,
+    LifepathSession, MilitaryBranch, PreCareerChoice, SkillTableChoice,
 };
 use traveller_rules::dice::{resolve_task, Difficulty, ModifierItem, RollMode};
 use traveller_rules::finance::AccountKind;
@@ -137,10 +138,12 @@ pub fn router(state: AppState) -> Router {
         // Interactive Lifepath Chargen & Starport Hiring Hall
         .route("/api/chargen/options", get(chargen_options))
         .route("/api/chargen/start", post(chargen_start))
+        .route("/api/chargen/assign-stats", post(chargen_assign_stats))
         .route("/api/chargen/background", post(chargen_background))
         .route("/api/chargen/pre-career", post(chargen_pre_career))
         .route("/api/chargen/term", post(chargen_term))
         .route("/api/chargen/muster", post(chargen_muster))
+        .route("/api/chargen/skill-package", post(chargen_skill_package))
         .route("/api/campaigns/{id}/chargen/commit", post(chargen_commit))
         .route("/api/campaigns/{id}/crew/hiring-hall", post(crew_hiring_hall))
         .route("/api/campaigns/{id}/crew/hire", post(crew_hire))
@@ -442,26 +445,54 @@ async fn update_character(
     State(st): State<AppState>,
     Extension(user): Extension<AuthUser>,
     Path((id, char_id)): Path<(Uuid, Uuid)>,
-    Json(mut body): Json<UpdateCharacterBody>,
+    Json(body): Json<UpdateCharacterBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let existing = st
+    let mut existing = st
         .db
         .get_character(id, char_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Character not found"))?;
-    body.character.id = char_id;
-    body.character.campaign_id = id;
-    let equip = body.equipment.unwrap_or(existing.equipment);
-    st.db.save_character(&body.character, &equip).await?;
+
+    // Strict XP anti-cheat: characteristics, skills, augments, and XP pools CANNOT be freely edited!
+    // Players must earn XP and spend it via POST /spend-xp, or purchase augments/gear in the Shop.
+    let mut ch = existing.character.clone();
+    if body.character.upp_max != ch.upp_max
+        || body.character.upp_current != ch.upp_current
+        || body.character.skills != ch.skills
+        || body.character.augments != ch.augments
+        || body.character.general_xp != ch.general_xp
+        || body.character.skill_xp != ch.skill_xp
+        || body.character.characteristic_xp != ch.characteristic_xp
+        || body
+            .equipment
+            .as_ref()
+            .is_some_and(|eq| eq != &existing.equipment)
+    {
+        return Err(anyhow::anyhow!(
+            "Characteristics, skills, augments, gear, and XP cannot be edited directly — earn and spend XP to upgrade skills/characteristics, or purchase gear/augments in the Item Market."
+        )
+        .into());
+    }
+
+    // Only allow safe non-progression metadata edits
+    if !body.character.name.trim().is_empty() {
+        ch.name = body.character.name.trim().to_string();
+    }
+    ch.assigned_station = body.character.assigned_station;
+    ch.assigned_ship_id = body.character.assigned_ship_id;
+    ch.notes = body.character.notes;
+    existing.character = ch.clone();
+
+    st.db.save_character(&ch, &existing.equipment).await?;
     st.db
         .log_audit(
             id,
             &user.username,
-            "edit_character",
-            json!({"id": char_id, "name": body.character.name}),
+            "edit_character_metadata",
+            json!({"id": char_id, "name": ch.name}),
         )
         .await?;
-    Ok(Json(json!({ "character": body.character, "equipment": equip })))
+    Ok(Json(json!({ "character": ch, "equipment": existing.equipment })))
 }
 
 async fn delete_character(
@@ -1168,6 +1199,8 @@ async fn chargen_options() -> Json<Value> {
     Json(json!({
         "species": all_species(),
         "background_skills": all_background_skills(),
+        "university_skills": all_university_skills(),
+        "skill_packages": all_skill_packages(),
         "careers": all_careers()
     }))
 }
@@ -1178,6 +1211,21 @@ async fn chargen_start(Json(body): Json<ChargenStartBody>) -> Result<Json<Value>
         start_lifepath(&mut r, body.name, body.species, body.background_skills)
     };
     Ok(Json(json!({ "session": session })))
+}
+
+#[derive(Deserialize)]
+struct ChargenAssignStatsBody {
+    session: LifepathSession,
+    ordered_pool: Vec<i32>,
+    #[serde(default)]
+    lock: bool,
+}
+
+async fn chargen_assign_stats(
+    Json(mut body): Json<ChargenAssignStatsBody>,
+) -> Result<Json<Value>, ApiError> {
+    assign_characteristics(&mut body.session, body.ordered_pool, body.lock)?;
+    Ok(Json(json!({ "session": body.session })))
 }
 
 #[derive(Deserialize)]
@@ -1197,6 +1245,14 @@ async fn chargen_background(
 struct ChargenPreCareerBody {
     session: LifepathSession,
     choice: PreCareerChoice,
+    #[serde(default)]
+    uni_skill_0: Option<String>,
+    #[serde(default)]
+    uni_skill_1: Option<String>,
+    #[serde(default)]
+    academy_branch: Option<MilitaryBranch>,
+    #[serde(default)]
+    academy_focus_skills: Vec<String>,
 }
 
 async fn chargen_pre_career(
@@ -1204,7 +1260,15 @@ async fn chargen_pre_career(
 ) -> Result<Json<Value>, ApiError> {
     let note = {
         let mut r = rng();
-        run_pre_career(&mut r, &mut body.session, body.choice)
+        run_pre_career_detailed(
+            &mut r,
+            &mut body.session,
+            body.choice,
+            body.uni_skill_0,
+            body.uni_skill_1,
+            body.academy_branch,
+            body.academy_focus_skills,
+        )
     };
     Ok(Json(json!({ "session": body.session, "note": note })))
 }
@@ -1219,6 +1283,12 @@ struct ChargenTermBody {
     assignment: Option<String>,
     #[serde(default)]
     skill_table: Option<SkillTableChoice>,
+    #[serde(default)]
+    basic_training_skill: Option<String>,
+    #[serde(default)]
+    attempt_commission: bool,
+    #[serde(default)]
+    fallback_on_fail: Option<String>,
 }
 
 async fn chargen_term(Json(mut body): Json<ChargenTermBody>) -> Result<Json<Value>, ApiError> {
@@ -1229,9 +1299,31 @@ async fn chargen_term(Json(mut body): Json<ChargenTermBody>) -> Result<Json<Valu
     });
     let entry = {
         let mut r = rng();
-        run_lifepath_term_detailed(&mut r, &mut body.session, body.career, body.assignment, table)
+        run_lifepath_term_full(
+            &mut r,
+            &mut body.session,
+            body.career,
+            body.assignment,
+            table,
+            body.basic_training_skill,
+            body.attempt_commission,
+            body.fallback_on_fail.as_deref(),
+        )
     };
     Ok(Json(json!({ "session": body.session, "entry": entry })))
+}
+
+#[derive(Deserialize)]
+struct ChargenSkillPackageBody {
+    session: LifepathSession,
+    chosen_skills: Vec<String>,
+}
+
+async fn chargen_skill_package(
+    Json(mut body): Json<ChargenSkillPackageBody>,
+) -> Result<Json<Value>, ApiError> {
+    apply_skill_package(&mut body.session, body.chosen_skills);
+    Ok(Json(json!({ "session": body.session })))
 }
 
 #[derive(Deserialize)]

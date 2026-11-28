@@ -1,8 +1,7 @@
 import { useEffect, useState } from "react";
-import { Cpu, Dice5, Edit3, Plus, Save, Sparkles, Trash2, UserPlus, X } from "lucide-react";
+import { ArrowUpCircle, Cpu, Dice5, Edit3, Plus, Save, Sparkles, Trash2, X } from "lucide-react";
 import {
   api,
-  Augment,
   CampaignSnapshot,
   CharacterRow,
   formatCr,
@@ -16,6 +15,55 @@ interface Props {
   initialMode?: "roster" | "lifepath";
   onRefresh: () => Promise<void>;
   onError: (msg: string) => void;
+}
+
+const LEARNABLE_SKILLS = [
+  "Admin",
+  "Advocate",
+  "Animals (Handling)",
+  "Astrogation",
+  "Athletics (Dexterity)",
+  "Athletics (Endurance)",
+  "Broker",
+  "Carouse",
+  "Deception",
+  "Diplomat",
+  "Drive (Wheel)",
+  "Electronics (comms)",
+  "Electronics (computers)",
+  "Electronics (sensors)",
+  "Engineer (J-Drive)",
+  "Engineer (M-Drive)",
+  "Engineer (Power)",
+  "Flyer (Grav)",
+  "Gambler",
+  "Gun Combat (Energy)",
+  "Gun Combat (Slug)",
+  "Gunner (Turret)",
+  "Investigate",
+  "Leadership",
+  "Mechanic",
+  "Medic",
+  "Melee (Blade)",
+  "Melee (Unarmed)",
+  "Navigation",
+  "Persuade",
+  "Pilot (Small Craft)",
+  "Pilot (Spacecraft)",
+  "Recon",
+  "Science (Physics)",
+  "Stealth",
+  "Steward",
+  "Streetwise",
+  "Survival",
+  "Tactics (Military)",
+  "Tactics (Naval)",
+  "Vacc Suit",
+];
+
+function charXpCost(stat: "STR" | "DEX" | "END" | "INT" | "EDU", newLevel: number): number {
+  const lvl = Math.max(1, newLevel);
+  return stat === "INT" || stat === "EDU" ? lvl * 2 : lvl;
 }
 
 export function CharactersPanel({
@@ -32,62 +80,29 @@ export function CharactersPanel({
     setMode(initialMode);
   }, [initialMode, campaignId]);
 
-  // Quick add (defaults to Crew/NPC once Player Character exists — strictly 1 Player per game)
-  const [newName, setNewName] = useState("");
-  const [newKind, setNewKind] = useState<"player" | "crew" | "npc">(
-    existingPlayer ? "crew" : "player"
-  );
-
-  useEffect(() => {
-    if (existingPlayer && newKind === "player") {
-      setNewKind("crew");
-    }
-  }, [existingPlayer, newKind]);
-
-  // Inline sheet editor state
+  // Safe non-cheat metadata editor (Name, Station, Notes only — stats/skills require XP!)
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [newSkillName, setNewSkillName] = useState("");
-  const [newSkillLevel, setNewSkillLevel] = useState(1);
-  const [newAugKind, setNewAugKind] = useState<
-    "neural_jack" | "wafer_jack" | "neural_link" | "skill_augmentation"
-  >("neural_jack");
-  const [newAugSkill, setNewAugSkill] = useState("Pilot (Spacecraft)");
-  const [newAugRating, setNewAugRating] = useState(2);
-
-  // Quick Task Roller
+  const [editName, setEditName] = useState("");
+  const [editStation, setEditStation] = useState("");
+  const [editNotes, setEditNotes] = useState("");
+  const [learnSkillMap, setLearnSkillMap] = useState<Record<string, string>>({});
   const [rollResult, setRollResult] = useState<string | null>(null);
 
-  async function handleQuickCreate() {
-    if (!newName.trim()) return;
-    try {
-      await api.createCharacter(campaignId, {
-        kind: existingPlayer && newKind === "player" ? "crew" : newKind,
-        name: newName.trim(),
-        species: "Human",
-        age: 30,
-        upp: { str_val: 7, dex_val: 8, end_val: 7, int_val: 9, edu_val: 8, soc_val: 7 },
-        skills: { "Pilot (Spacecraft)": 1, Astrogation: 1, "Electronics (sensors)": 1 },
-        augments: [
-          {
-            kind: "neural_jack",
-            tl: 13,
-            computer_rating: 2,
-            storage_bandwidth: 8,
-            loaded_expert: [{ skill: "Broker", rating: 2, active: true }],
-          },
-        ],
-        salary_cr: newKind === "crew" ? 4000 : 0,
-      });
-      setNewName("");
-      await onRefresh();
-    } catch (e) {
-      onError((e as Error).message);
-    }
+  function startMetaEdit(row: CharacterRow) {
+    setEditingId(row.character.id);
+    setEditName(row.character.name);
+    setEditStation(row.character.assigned_station ?? "");
+    setEditNotes(row.character.notes ?? "");
   }
 
-  async function saveRow(row: CharacterRow, updatedChar: CharacterRow["character"]) {
+  async function saveMetaEdit(row: CharacterRow) {
+    const ch = structuredClone(row.character);
+    if (editName.trim()) ch.name = editName.trim();
+    ch.assigned_station = editStation.trim() || null;
+    ch.notes = editNotes;
     try {
-      await api.updateCharacter(campaignId, updatedChar.id, updatedChar, row.equipment);
+      await api.updateCharacter(campaignId, ch.id, ch, row.equipment);
+      setEditingId(null);
       await onRefresh();
     } catch (e) {
       onError((e as Error).message);
@@ -105,73 +120,21 @@ export function CharactersPanel({
     }
   }
 
-  async function handleStatDelta(
-    row: CharacterRow,
-    key: keyof CharacterRow["character"]["upp_current"],
-    delta: number,
-    alsoMax = false
-  ) {
-    const ch = structuredClone(row.character);
-    const cur = (ch.upp_current[key] as number) ?? 7;
-    (ch.upp_current[key] as number) = Math.max(0, Math.min(18, cur + delta));
-    if (alsoMax) {
-      const mx = (ch.upp_max[key] as number) ?? 7;
-      (ch.upp_max[key] as number) = Math.max(1, Math.min(18, mx + delta));
-    }
-    await saveRow(row, ch);
-  }
-
-  async function handleAddSkill(row: CharacterRow) {
-    if (!newSkillName.trim()) return;
-    const ch = structuredClone(row.character);
-    ch.skills[newSkillName.trim()] = newSkillLevel;
-    setNewSkillName("");
-    await saveRow(row, ch);
-  }
-
-  async function handleRemoveSkill(row: CharacterRow, sk: string) {
-    const ch = structuredClone(row.character);
-    delete ch.skills[sk];
-    await saveRow(row, ch);
-  }
-
-  async function handleAddAugment(row: CharacterRow) {
-    const ch = structuredClone(row.character);
-    let aug: Augment;
-    if (newAugKind === "neural_jack") {
-      aug = {
-        kind: "neural_jack",
-        tl: 13,
-        computer_rating: 2,
-        storage_bandwidth: 8,
-        loaded_expert: [{ skill: newAugSkill, rating: newAugRating, active: true }],
-      };
-    } else if (newAugKind === "wafer_jack") {
-      aug = {
-        kind: "wafer_jack",
-        tl: 12,
-        computer_rating: 2,
-        storage_bandwidth: 4,
-        loaded_expert: [{ skill: newAugSkill, rating: newAugRating, active: true }],
-      };
-    } else if (newAugKind === "neural_link") {
-      aug = { kind: "neural_link", tl: 13 };
-    } else {
-      aug = { kind: "skill_augmentation", skill: newAugSkill };
-    }
-    ch.augments.push(aug);
-    await saveRow(row, ch);
-  }
-
-  async function handleRemoveAugment(row: CharacterRow, idx: number) {
-    const ch = structuredClone(row.character);
-    ch.augments.splice(idx, 1);
-    await saveRow(row, ch);
-  }
-
-  async function handleSpendXp(charId: string, skill: string) {
+  async function handleSpendSkillXp(charId: string, skill: string) {
     try {
       await api.spendXp(campaignId, charId, skill);
+      await onRefresh();
+    } catch (e) {
+      onError((e as Error).message);
+    }
+  }
+
+  async function handleSpendCharXp(
+    charId: string,
+    stat: "STR" | "DEX" | "END" | "INT" | "EDU"
+  ) {
+    try {
+      await api.spendCharXp(campaignId, charId, stat);
       await onRefresh();
     } catch (e) {
       onError((e as Error).message);
@@ -185,13 +148,13 @@ export function CharactersPanel({
         skill,
         characteristic: "INT",
         difficulty: "average",
-        award_activity_xp: true,
+        award_activity_xp: false,
       });
       const r = res.result as Record<string, unknown>;
       setRollResult(
         `${row.character.name} (${skill}): rolled ${r.total} vs ${r.target} (Effect ${r.effect}) — ${
           r.success ? "SUCCESS" : "FAILURE"
-        } (+1 XP)`
+        }`
       );
       await onRefresh();
     } catch (e) {
@@ -199,7 +162,6 @@ export function CharactersPanel({
     }
   }
 
-  // Sort strictly so the single Player Character is always rendered first
   const sortedChars = [...snapshot.characters].sort((a, b) => {
     const rank = (k: string) => (k === "player" ? 0 : k === "crew" ? 1 : 2);
     return rank(a.character.kind) - rank(b.character.kind);
@@ -267,46 +229,31 @@ export function CharactersPanel({
           onError={onError}
         />
       ) : (
-        <>
-          {/* Quick Character Creator (strictly enforces 1 Player Character) */}
-          <div className="flex gap-1.5">
-            <input
-              className="flex-1 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs"
-              placeholder={existingPlayer ? "Quick add Crew or NPC…" : "Quick add Player / Crew / NPC…"}
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-            />
-            <select
-              className="bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs"
-              value={newKind}
-              onChange={(e) => setNewKind(e.target.value as "player" | "crew" | "npc")}
-            >
-              {!existingPlayer && <option value="player">Player (1 max)</option>}
-              <option value="crew">Crew</option>
-              <option value="npc">NPC</option>
-            </select>
-            <button
-              onClick={handleQuickCreate}
-              className="bg-cyan-700 hover:bg-cyan-600 text-white rounded px-2.5 py-1 flex items-center gap-1"
-            >
-              <UserPlus className="w-3.5 h-3.5" /> Add
-            </button>
+        <div className="space-y-2.5">
+          <div className="text-[10px] text-slate-400 bg-slate-900/70 border border-slate-800 rounded px-2.5 py-1.5">
+            Progression is strictly XP-gated (Companion 2024): earn Activity XP from skill rolls &amp;
+            General XP from milestones to upgrade skills or characteristics. Hire crew in{" "}
+            <strong>Credits → Hiring Hall</strong> or buy cybernetics in <strong>Trade → Item Market</strong>.
           </div>
 
           {sortedChars.map((row) => {
             const c = row.character;
             const isPlayer = c.kind === "player";
             const isEditing = editingId === c.id;
+            const unlearned = LEARNABLE_SKILLS.filter((sk) => !(sk in c.skills));
+            const chosenNewSkill = learnSkillMap[c.id] || unlearned[0] || "";
+            const canLearnNew = c.general_xp >= 1 && Boolean(chosenNewSkill);
+
             return (
               <div
                 key={c.id}
-                className={`rounded p-2.5 space-y-2 border ${
+                className={`rounded-lg p-2.5 space-y-2.5 border ${
                   isPlayer
                     ? "bg-cyan-950/25 border-cyan-700/80"
                     : "bg-slate-900 border-slate-800"
                 }`}
               >
-                <div className="flex items-center justify-between">
+                <div className="flex items-start justify-between gap-2">
                   <div>
                     <span className="font-bold text-slate-100 text-sm">{c.name}</span>{" "}
                     <span
@@ -324,25 +271,27 @@ export function CharactersPanel({
                       <span className="ml-1 text-[10px] text-amber-300">[{c.assigned_station}]</span>
                     )}
                     <div className="text-[10px] text-slate-400">
-                      {c.species} · Age {c.age} · Gen XP: {c.general_xp}
+                      {c.species} · Age {c.age} ·{" "}
+                      <span className="text-amber-300 font-semibold">Gen XP: {c.general_xp}</span>
                       {c.salary_cr > 0 && ` · Salary: ${formatCr(c.salary_cr)}/4wk`}
                     </div>
                   </div>
                   <div className="flex items-center gap-1">
                     <button
-                      onClick={() => setEditingId(isEditing ? null : c.id)}
+                      onClick={() => (isEditing ? setEditingId(null) : startMetaEdit(row))}
+                      title="Edit name, ship station, or RP notes (stats/skills require XP)"
                       className={`px-2 py-1 rounded text-[11px] flex items-center gap-1 border ${
                         isEditing
                           ? "bg-amber-950 border-amber-600 text-amber-200"
                           : "bg-slate-800 border-slate-700 text-slate-300 hover:text-white"
                       }`}
                     >
-                      <Edit3 className="w-3 h-3" /> {isEditing ? "Done" : "Edit"}
+                      <Edit3 className="w-3 h-3" /> {isEditing ? "Cancel" : "Notes"}
                     </button>
-                    {isEditing && (
+                    {!isPlayer && (
                       <button
                         onClick={() => handleDeleteChar(c.id, c.name)}
-                        title="Delete character"
+                        title="Dismiss / remove Crew or NPC"
                         className="p-1 rounded bg-red-950/70 border border-red-800 text-red-300 hover:bg-red-900"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
@@ -351,127 +300,178 @@ export function CharactersPanel({
                   </div>
                 </div>
 
-                {/* UPP Row */}
+                {/* Safe Metadata Editor (no stat/skill/augment cheats!) */}
+                {isEditing && (
+                  <div className="bg-slate-950 border border-amber-800/70 rounded p-2 space-y-1.5">
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <input
+                        className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[11px]"
+                        placeholder="Character Name"
+                        value={editName}
+                        onChange={(e) => setEditName(e.target.value)}
+                      />
+                      <input
+                        className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[11px]"
+                        placeholder="Ship Station (e.g. Captain, Pilot)"
+                        value={editStation}
+                        onChange={(e) => setEditStation(e.target.value)}
+                      />
+                    </div>
+                    <textarea
+                      rows={2}
+                      className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[11px]"
+                      placeholder="Character notes, contacts, personal goals…"
+                      value={editNotes}
+                      onChange={(e) => setEditNotes(e.target.value)}
+                    />
+                    <button
+                      onClick={() => saveMetaEdit(row)}
+                      className="bg-emerald-700 hover:bg-emerald-600 text-white rounded px-3 py-1 text-[11px] font-medium flex items-center gap-1"
+                    >
+                      <Save className="w-3 h-3" /> Save Notes
+                    </button>
+                  </div>
+                )}
+
+                {/* UPP Characteristics Row (STRICTLY XP-GATED UPGRADES ONLY!) */}
                 <div className="grid grid-cols-6 gap-1 text-center font-mono">
                   {(
                     [
-                      ["STR", "str_val"],
-                      ["DEX", "dex_val"],
-                      ["END", "end_val"],
-                      ["INT", "int_val"],
-                      ["EDU", "edu_val"],
-                      ["SOC", "soc_val"],
+                      ["STR", "str_val", true],
+                      ["DEX", "dex_val", true],
+                      ["END", "end_val", true],
+                      ["INT", "int_val", true],
+                      ["EDU", "edu_val", true],
+                      ["SOC", "soc_val", false],
                     ] as const
-                  ).map(([lbl, key]) => {
+                  ).map(([lbl, key, trainable]) => {
                     const cur = c.upp_current[key] ?? 7;
                     const max = c.upp_max[key] ?? 7;
+                    const cost = trainable ? charXpCost(lbl, max + 1) : 0;
+                    const dedicated = c.characteristic_xp[lbl] ?? 0;
+                    const avail = dedicated + c.general_xp;
+                    const canTrain = trainable && avail >= cost && max < 15;
                     return (
-                      <div key={lbl} className="bg-slate-950 border border-slate-800 rounded p-1">
+                      <div key={lbl} className="bg-slate-950 border border-slate-800 rounded p-1 space-y-0.5">
                         <div className="text-[9px] text-slate-400">{lbl}</div>
                         <div className={cur < max ? "text-red-400 font-bold" : "text-cyan-300 font-bold"}>
                           {cur}/{max}
                         </div>
-                        <div className="flex justify-center gap-1 mt-0.5">
+                        {trainable ? (
                           <button
-                            onClick={() => handleStatDelta(row, key, -1, isEditing)}
-                            className="px-1 bg-slate-800 hover:bg-slate-700 rounded text-[10px]"
+                            disabled={!canTrain}
+                            title={
+                              max >= 15
+                                ? `${lbl} is already at maximum (15)`
+                                : canTrain
+                                ? `Spend ${cost} XP to permanently raise ${lbl} to ${max + 1} (have ${avail} XP)`
+                                : `Need ${cost} XP to raise ${lbl} to ${max + 1} (have ${avail} XP)`
+                            }
+                            onClick={() => handleSpendCharXp(c.id, lbl)}
+                            className="w-full py-0.5 rounded text-[9px] bg-emerald-800/80 hover:bg-emerald-700 disabled:bg-slate-900 disabled:text-slate-600 disabled:opacity-50 disabled:cursor-not-allowed text-emerald-100 flex items-center justify-center gap-0.5"
                           >
-                            -
+                            <ArrowUpCircle className="w-2.5 h-2.5" /> {cost}xp
                           </button>
-                          <button
-                            onClick={() => handleStatDelta(row, key, 1, isEditing)}
-                            className="px-1 bg-slate-800 hover:bg-slate-700 rounded text-[10px]"
+                        ) : (
+                          <div
+                            title="SOC cannot be trained with XP (Companion 2024 p. 43)"
+                            className="text-[8px] text-slate-600 py-0.5"
                           >
-                            +
-                          </button>
-                        </div>
+                            Fixed
+                          </div>
+                        )}
                       </div>
                     );
                   })}
                 </div>
 
-                {/* Skills + Per-Skill Activity XP */}
-                <div className="space-y-1">
+                {/* Skills + Per-Skill Activity XP Upgrades */}
+                <div className="space-y-1.5">
                   <div className="text-[10px] text-slate-400 uppercase tracking-wider">
-                    Skills & Per-Skill Activity XP (1/1/2/4/8/16/32)
+                    Skills &amp; Per-Skill XP (Costs: 1 / 1 / 2 / 4 / 8 / 16 / 32 XP)
                   </div>
                   <div className="flex flex-wrap gap-1">
                     {Object.entries(c.skills).map(([sk, lvl]) => {
                       const xp = c.skill_xp[sk] ?? 0;
                       const cost = skillUpgradeCost(lvl + 1);
-                      const canUpgrade = xp + c.general_xp >= cost;
+                      const avail = xp + c.general_xp;
+                      const canUpgrade = avail >= cost;
                       return (
                         <div
                           key={sk}
                           className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded px-1.5 py-0.5 text-[11px]"
                         >
                           <button
-                            title={`Roll ${sk} (+1 Activity XP)`}
+                            title={`Test roll ${sk} (earn XP through Referee play & combat)`}
                             onClick={() => handleQuickRoll(row, sk)}
                             className="hover:text-cyan-300 flex items-center gap-0.5"
                           >
                             <Dice5 className="w-3 h-3 text-slate-500" />
-                            <span>
+                            <span className={lvl >= 1 ? "text-slate-100 font-medium" : "text-slate-300"}>
                               {sk}-{lvl}
                             </span>
                           </button>
-                          <span className="text-[10px] text-amber-300">
-                            ({xp}/{cost}xp)
+                          <span className="text-[10px] text-amber-300 font-mono">
+                            ({xp}/{cost})
                           </span>
-                          {canUpgrade && (
-                            <button
-                              onClick={() => handleSpendXp(c.id, sk)}
-                              className="px-1 bg-emerald-700 hover:bg-emerald-600 text-white rounded text-[9px]"
-                            >
-                              ↑
-                            </button>
-                          )}
-                          {isEditing && (
-                            <button
-                              onClick={() => handleRemoveSkill(row, sk)}
-                              className="text-red-400 hover:text-red-300"
-                            >
-                              <X className="w-3 h-3" />
-                            </button>
-                          )}
+                          <button
+                            disabled={!canUpgrade}
+                            title={
+                              canUpgrade
+                                ? `Spend ${cost} XP to raise ${sk} to ${lvl + 1} (${xp} skill + ${c.general_xp} general XP)`
+                                : `Need ${cost} XP to upgrade ${sk} to ${lvl + 1} (have ${avail} XP)`
+                            }
+                            onClick={() => handleSpendSkillXp(c.id, sk)}
+                            className="px-1 bg-emerald-700 hover:bg-emerald-600 disabled:bg-slate-800 disabled:text-slate-600 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded text-[9px]"
+                          >
+                            ↑
+                          </button>
                         </div>
                       );
                     })}
                   </div>
 
-                  {isEditing && (
+                  {/* Learn a brand-new Skill at Level 0 (strictly requires 1 General XP!) */}
+                  {unlearned.length > 0 && (
                     <div className="flex gap-1 pt-1">
-                      <input
-                        className="flex-1 bg-slate-950 border border-slate-700 rounded px-2 py-0.5 text-[11px]"
-                        placeholder="Add skill (e.g. Gun Combat (Slug))"
-                        value={newSkillName}
-                        onChange={(e) => setNewSkillName(e.target.value)}
-                      />
-                      <input
-                        type="number"
-                        min={0}
-                        max={6}
-                        className="w-12 bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-center text-[11px]"
-                        value={newSkillLevel}
-                        onChange={(e) => setNewSkillLevel(Number(e.target.value))}
-                      />
-                      <button
-                        onClick={() => handleAddSkill(row)}
-                        className="bg-cyan-700 hover:bg-cyan-600 text-white rounded px-2 py-0.5 text-[11px] flex items-center gap-0.5"
+                      <select
+                        className="flex-1 bg-slate-950 border border-slate-800 rounded px-2 py-1 text-[11px]"
+                        value={chosenNewSkill}
+                        onChange={(e) =>
+                          setLearnSkillMap((prev) => ({ ...prev, [c.id]: e.target.value }))
+                        }
                       >
-                        <Plus className="w-3 h-3" /> Skill
+                        {unlearned.map((sk) => (
+                          <option key={sk} value={sk}>
+                            Learn {sk}-0 (1 Gen XP)
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        disabled={!canLearnNew}
+                        title={
+                          canLearnNew
+                            ? `Spend 1 General XP to learn ${chosenNewSkill}-0`
+                            : "Requires at least 1 General XP (earned from play/milestones)"
+                        }
+                        onClick={() => handleSpendSkillXp(c.id, chosenNewSkill)}
+                        className="bg-emerald-700 hover:bg-emerald-600 disabled:opacity-35 disabled:cursor-not-allowed text-white rounded px-2.5 py-1 text-[10px] font-medium flex items-center gap-1 shrink-0"
+                      >
+                        <Plus className="w-3 h-3" /> Learn (1 XP)
                       </button>
                     </div>
                   )}
                 </div>
 
-                {/* Neural Jack / Wafer Jack / Augments */}
+                {/* Neural Jack / Wafer Jack / Augments (Read-Only — bought in Shop!) */}
                 <div className="space-y-1">
                   <div className="text-[10px] text-slate-400 uppercase tracking-wider flex items-center gap-1">
-                    <Cpu className="w-3 h-3 text-purple-400" /> Augments & Neural/Wafer Jacks
+                    <Cpu className="w-3 h-3 text-purple-400" /> Augments &amp; Neural/Wafer Jacks
                   </div>
                   {c.augments.length === 0 ? (
-                    <div className="text-[11px] text-slate-500">No cybernetic augments installed.</div>
+                    <div className="text-[11px] text-slate-500">
+                      No cybernetics installed (purchase augments in Trade → Item Market).
+                    </div>
                   ) : (
                     <div className="space-y-1">
                       {c.augments.map((aug, i) => (
@@ -492,51 +492,8 @@ export function CharactersPanel({
                             )}
                             {"skill" in aug && <span className="ml-1 text-purple-300">({aug.skill} +1)</span>}
                           </div>
-                          {isEditing && (
-                            <button
-                              onClick={() => handleRemoveAugment(row, i)}
-                              className="text-red-400 hover:text-red-300"
-                            >
-                              <Trash2 className="w-3 h-3" />
-                            </button>
-                          )}
                         </div>
                       ))}
-                    </div>
-                  )}
-
-                  {isEditing && (
-                    <div className="flex flex-wrap gap-1 pt-1">
-                      <select
-                        className="bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-[11px]"
-                        value={newAugKind}
-                        onChange={(e) => setNewAugKind(e.target.value as typeof newAugKind)}
-                      >
-                        <option value="neural_jack">Neural Jack (TL13)</option>
-                        <option value="wafer_jack">Wafer Jack (TL12)</option>
-                        <option value="neural_link">Neural Link (TL13)</option>
-                        <option value="skill_augmentation">Skill Augment (+1)</option>
-                      </select>
-                      <input
-                        className="flex-1 min-w-[110px] bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-[11px]"
-                        placeholder="Expert/Aug skill"
-                        value={newAugSkill}
-                        onChange={(e) => setNewAugSkill(e.target.value)}
-                      />
-                      <input
-                        type="number"
-                        min={1}
-                        max={3}
-                        className="w-10 bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-center text-[11px]"
-                        value={newAugRating}
-                        onChange={(e) => setNewAugRating(Number(e.target.value))}
-                      />
-                      <button
-                        onClick={() => handleAddAugment(row)}
-                        className="bg-purple-700 hover:bg-purple-600 text-white rounded px-2 py-0.5 text-[11px]"
-                      >
-                        + Install
-                      </button>
                     </div>
                   )}
                 </div>
@@ -547,7 +504,6 @@ export function CharactersPanel({
                   </div>
                 )}
 
-                {/* Equipment Inventory */}
                 {row.equipment.length > 0 && (
                   <div className="border-t border-slate-800 pt-1.5">
                     <div className="text-[10px] text-slate-400 uppercase tracking-wider">Inventory</div>
@@ -566,7 +522,7 @@ export function CharactersPanel({
               </div>
             );
           })}
-        </>
+        </div>
       )}
     </div>
   );
