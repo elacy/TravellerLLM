@@ -12,8 +12,9 @@ use traveller_rules::combat_space::{
     execute_space_ai_turn, start_space_combat, SpaceCombatShip, SpaceRangeBand,
 };
 use traveller_rules::ship::{
-    calculate_refuel_quote, calculate_refit_cost, fleet_max_jump_rating, jump_fuel_for_distance,
-    roll_berthing_fee, sample_free_trader, RefuelMode, SensorGrade,
+    calculate_accrued_berthing_fee, calculate_refuel_quote, calculate_refit_cost,
+    fleet_max_jump_rating, jump_fuel_for_distance, roll_berthing_fee, sample_free_trader,
+    RefuelMode, SensorGrade,
 };
 use traveller_rules::trade::compute_fleet_max_broker;
 use traveller_rules::universe::{build_spatial_memory_scope, parse_uwp};
@@ -52,13 +53,33 @@ fn fleet_jump_limit_refueling_berthing_and_spatial_memory_tags() {
     let proc = calculate_refuel_quote('E', 0, &free_trader, 20.0, RefuelMode::ProcessOnboard);
     assert!(proc.allowed && proc.hours_required >= 24);
 
-    // 3. Starport Berthing Fees (Core 2022 p. 235)
+    // 3. Starport Berthing Fees (Core 2022 p. 235) & Incremental Stay Billing
     let fee_a = roll_berthing_fee(&mut rng, 'A', 2);
     assert!(fee_a.base_berthing_cr >= 1_000 && fee_a.base_berthing_cr <= 6_000);
     assert_eq!(fee_a.extra_days_cr, 1_000);
     assert_eq!(fee_a.total_cr, fee_a.base_berthing_cr + 1_000);
     let fee_e = roll_berthing_fee(&mut rng, 'E', 3);
     assert_eq!(fee_e.total_cr, 0);
+
+    // Stateful stay duration billing: first 6 days prepaid by initial docking fee
+    let t0 = 100_000_i64;
+    let day6 = calculate_accrued_berthing_fee('A', t0, t0 + 6 * 1440, 6);
+    assert_eq!(day6.newly_billable_days, 0);
+    assert_eq!(day6.fee_cr, 0);
+
+    let day7 = calculate_accrued_berthing_fee('A', t0, t0 + 7 * 1440, 6);
+    assert_eq!(day7.newly_billable_days, 1);
+    assert_eq!(day7.fee_cr, 500);
+
+    // Subsequent days only bill the delta (no double-charging!)
+    let day10 = calculate_accrued_berthing_fee('A', t0, t0 + 10 * 1440, 7);
+    assert_eq!(day10.newly_billable_days, 3);
+    assert_eq!(day10.fee_cr, 1_500);
+
+    // Starport E charges Cr0 regardless of stay duration
+    let day15_e = calculate_accrued_berthing_fee('E', t0, t0 + 15 * 1440, 6);
+    assert_eq!(day15_e.newly_billable_days, 9);
+    assert_eq!(day15_e.fee_cr, 0);
 
     // 4. Paid Shipyard Refit Cost & Starport Eligibility
     let mut upgraded = free_trader.clone();

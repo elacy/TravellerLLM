@@ -107,18 +107,66 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
   async function handleDock(shipId: string) {
     setPortMsg(null);
     try {
-      const res = await api.dockShip(campaignId, shipId, 0);
+      const res = await api.dockShip(campaignId, shipId);
+      const note = typeof res.note === "string" ? res.note : null;
       const fee = res.berthing_fee as
         | { starport?: string; roll_1d6?: number; total_cr?: number }
         | undefined;
       setPortMsg(
-        `Paid Starport ${fee?.starport ?? "?"} berthing/docking fee (1D=${fee?.roll_1d6 ?? "?"}): ${formatCr(
-          fee?.total_cr ?? 0
-        )}.`
+        note ??
+          `Docked at Starport ${fee?.starport ?? "?"} (1D=${fee?.roll_1d6 ?? "?"}): ${formatCr(
+            fee?.total_cr ?? 0
+          )} initial berthing fee (covers first 6 days).`
       );
       await onRefresh();
     } catch (e) {
       onError((e as Error).message);
+    }
+  }
+
+  async function handleUndock(shipId: string) {
+    setPortMsg(null);
+    try {
+      const res = await api.undockShip(campaignId, shipId);
+      setPortMsg(typeof res.note === "string" ? res.note : "Ship undocked and broke orbit.");
+      if (editingShipId === shipId) {
+        setEditingShipId(null);
+        setDraft(null);
+        setQuote(null);
+      }
+      await onRefresh();
+    } catch (e) {
+      onError((e as Error).message);
+    }
+  }
+
+  function berthingDailyRate(sp: string): number {
+    switch (sp) {
+      case "A":
+        return 500;
+      case "B":
+        return 200;
+      case "C":
+        return 100;
+      case "D":
+        return 10;
+      default:
+        return 0;
+    }
+  }
+
+  function berthingBaseMult(sp: string): number {
+    switch (sp) {
+      case "A":
+        return 1000;
+      case "B":
+        return 500;
+      case "C":
+        return 100;
+      case "D":
+        return 10;
+      default:
+        return 0;
     }
   }
 
@@ -155,14 +203,34 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
         const hasScoops = Boolean(ship.spec.fuel_scoops);
         const hasProcessor = Number(ship.spec.fuel_processor_tons ?? 0) > 0;
 
+        const isDocked = Boolean(ship.is_docked);
+        const daysDocked =
+          isDocked &&
+          ship.docked_at_total_minutes != null &&
+          snapshot.current_total_minutes != null
+            ? Math.max(
+                0,
+                Math.floor((snapshot.current_total_minutes - ship.docked_at_total_minutes) / 1440)
+              )
+            : 0;
+        const prepaidDaysLeft = Math.max(0, 6 - daysDocked);
+        const extraDayRate = berthingDailyRate(starport);
+        const baseMult = berthingBaseMult(starport);
+
         const canRefuelRefined =
-          (starport === "A" || starport === "B") && freeFuel > 0.1 && companyAvailable >= refinedCost;
+          isDocked &&
+          (starport === "A" || starport === "B") &&
+          freeFuel > 0.1 &&
+          companyAvailable >= refinedCost;
         const canRefuelUnref =
-          ["A", "B", "C", "D"].includes(starport) && freeFuel > 0.1 && companyAvailable >= unrefCost;
-        const canSkim = gasGiants > 0 && hasScoops && freeFuel > 0.1;
+          isDocked &&
+          ["A", "B", "C", "D"].includes(starport) &&
+          freeFuel > 0.1 &&
+          companyAvailable >= unrefCost;
+        const canSkim = !isDocked && gasGiants > 0 && hasScoops && freeFuel > 0.1;
         const canProcess = hasProcessor && ship.fuel_unrefined > 0.1;
-        const canDock = ["A", "B", "C", "D"].includes(starport);
-        const canOpenShipyard = ["A", "B", "C"].includes(starport);
+        const canDock = !isDocked && ["A", "B", "C", "D", "E"].includes(starport);
+        const canOpenShipyard = isDocked && ["A", "B", "C"].includes(starport);
 
         const refitCanSubmit =
           Boolean(quote) &&
@@ -184,10 +252,20 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
                   <span className="font-bold text-sm text-slate-100">{ship.name}</span>
                   <span className="text-slate-400">({ship.class_name})</span>
                 </div>
-                <div className="text-[11px] text-slate-400">
-                  {ship.spec.tonnage}t · TL{ship.spec.tl} · J-{ship.spec.jump_rating} / M-
-                  {ship.spec.thrust} · Docked:{" "}
-                  <span className="text-cyan-300">{ship.docked_system_name}</span>
+                <div className="text-[11px] text-slate-400 flex flex-wrap items-center gap-1.5">
+                  <span>
+                    {ship.spec.tonnage}t · TL{ship.spec.tl} · J-{ship.spec.jump_rating} / M-
+                    {ship.spec.thrust}
+                  </span>
+                  {isDocked ? (
+                    <span className="px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700/70 text-emerald-300 text-[10px] font-medium">
+                      Docked · {ship.docked_system_name} ({daysDocked}d)
+                    </span>
+                  ) : (
+                    <span className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-cyan-300 text-[10px] font-medium">
+                      In Orbit · {ship.docked_system_name}
+                    </span>
+                  )}
                 </div>
               </div>
               <div className="flex items-center gap-1.5">
@@ -203,7 +281,9 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
                 <button
                   disabled={!isEditing && !canOpenShipyard}
                   title={
-                    !canOpenShipyard
+                    !isDocked
+                      ? `Dock at ${snapshot.campaign.current_system_name} Starport first to access the Shipyard`
+                      : !["A", "B", "C"].includes(starport)
                       ? `Starport Class ${starport} has no shipyard or repair facilities (requires Class A–C)`
                       : "Open paid Shipyard Refit & Repair Bay"
                   }
@@ -412,7 +492,9 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
                     <button
                       disabled={!canRefuelRefined}
                       title={
-                        starport !== "A" && starport !== "B"
+                        !isDocked
+                          ? "Dock at Starport first to purchase refined fuel"
+                          : starport !== "A" && starport !== "B"
                           ? `Starport ${starport} does not sell Refined fuel (Class A/B only)`
                           : freeFuel <= 0.1
                           ? "Fuel tanks are already full"
@@ -428,7 +510,9 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
                     <button
                       disabled={!canRefuelUnref}
                       title={
-                        !["A", "B", "C", "D"].includes(starport)
+                        !isDocked
+                          ? "Dock at Starport first to purchase commercial fuel"
+                          : !["A", "B", "C", "D"].includes(starport)
                           ? `Starport ${starport} has no commercial fuel`
                           : freeFuel <= 0.1
                           ? "Fuel tanks are already full"
@@ -444,7 +528,9 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
                     <button
                       disabled={!canSkim}
                       title={
-                        gasGiants <= 0
+                        isDocked
+                          ? "Undock from Starport before skimming a gas giant"
+                          : gasGiants <= 0
                           ? "No gas giant in this system"
                           : !hasScoops
                           ? "Ship has no Fuel Scoops installed"
@@ -472,21 +558,53 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
                       Refine Onboard ({ship.fuel_unrefined.toFixed(0)}t)
                     </button>
                   </div>
-                  <button
-                    disabled={!canDock}
-                    title={
-                      !canDock
-                        ? `Starport Class ${starport} charges no berthing fee (Cr0)`
-                        : `Roll 1D Starport ${starport} docking fee`
-                    }
-                    onClick={() => handleDock(ship.id)}
-                    className="w-full bg-slate-900 hover:bg-slate-800 disabled:opacity-35 disabled:cursor-not-allowed border border-slate-700 text-slate-200 rounded py-1 text-[10px] flex items-center justify-center gap-1 transition-colors"
-                  >
-                    <Anchor className="w-3 h-3 text-amber-400" />
-                    {canDock
-                      ? `Pay Starport ${starport} Docking Fee (1D × Port)`
-                      : `Starport ${starport} — No Docking Fee (Cr0)`}
-                  </button>
+                  {isDocked ? (
+                    <div className="flex items-center justify-between gap-2 bg-emerald-950/40 border border-emerald-800/70 rounded px-2 py-1.5 text-[10px]">
+                      <div className="text-emerald-200 flex items-center gap-1.5 min-w-0">
+                        <Anchor className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                        <span className="truncate">
+                          <strong>Docked at {ship.docked_system_name} Starport {starport}</strong> ·{" "}
+                          {daysDocked}d stayed ·{" "}
+                          {extraDayRate === 0
+                            ? "Cr0/day"
+                            : prepaidDaysLeft > 0
+                            ? `${prepaidDaysLeft}d prepaid left, then ${formatCr(extraDayRate)}/d`
+                            : `${formatCr(extraDayRate)}/day accruing`}
+                        </span>
+                      </div>
+                      <button
+                        onClick={() => handleUndock(ship.id)}
+                        title="Undock from starport into orbit (stops daily berthing fees)"
+                        className="shrink-0 px-2.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-100 font-medium transition-colors"
+                      >
+                        Undock
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      disabled={!canDock}
+                      title={
+                        !canDock
+                          ? `Starport Class ${starport} has no starport facilities to dock at`
+                          : baseMult > 0
+                          ? `Dock at ${snapshot.campaign.current_system_name} Starport ${starport} (1D × ${formatCr(
+                              baseMult
+                            )} covers first 6 days, then ${formatCr(extraDayRate)}/day)`
+                          : `Dock at Starport Class ${starport} (Cr0 berthing fee)`
+                      }
+                      onClick={() => handleDock(ship.id)}
+                      className="w-full bg-amber-900/50 hover:bg-amber-800/70 disabled:opacity-35 disabled:cursor-not-allowed border border-amber-700/70 text-amber-100 rounded py-1.5 text-[11px] font-medium flex items-center justify-center gap-1.5 transition-colors"
+                    >
+                      <Anchor className="w-3.5 h-3.5 text-amber-400" />
+                      {!canDock
+                        ? `Starport ${starport} — Cannot Dock`
+                        : baseMult > 0
+                        ? `Dock at Starport ${starport} (1D×${formatCr(baseMult)} · 6d, then ${formatCr(
+                            extraDayRate
+                          )}/d)`
+                        : `Dock at Starport ${starport} (Cr0)`}
+                    </button>
+                  )}
                 </div>
 
                 {/* High Guard Validation Summary */}

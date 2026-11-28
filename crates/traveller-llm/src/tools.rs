@@ -20,8 +20,9 @@ use traveller_rules::dice::{resolve_task, roll_d66, roll_nd6, Difficulty, Modifi
 use traveller_rules::finance::AccountKind;
 use traveller_rules::sensors::{resolve_sensor_detection, SensorContext, SensorDetectionInput};
 use traveller_rules::ship::{
-    calculate_refuel_quote, compute_running_costs, fleet_max_jump_rating, jump_fuel_for_distance,
-    roll_berthing_fee, roll_poor_maintenance, validate_ship, RefuelMode, SensorGrade,
+    berthing_extra_day_rate, calculate_accrued_berthing_fee, calculate_refuel_quote,
+    compute_running_costs, fleet_max_jump_rating, jump_fuel_for_distance, roll_berthing_fee,
+    roll_poor_maintenance, validate_ship, RefuelMode, SensorGrade,
 };
 use traveller_rules::trade::{compute_fleet_max_broker, generate_world_market, roll_speculative_sale};
 use traveller_rules::traffic::generate_system_traffic;
@@ -186,15 +187,14 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
         }),
         json!({
             "name": "port_ops",
-            "description": "Starport & fleet operations: refuel a ship (refined Cr500/t at Starport A/B, unrefined Cr100/t at A–D, free gas giant skimming with fuel scoops, or onboard fuel processor refining) and pay Core 2022 Starport Berthing / Docking Fees (1D x starport base + extra days).",
+            "description": "Starport & fleet operations: dock at the current system's starport (pays the Core 2022 1D initial berthing fee covering days 1–6; extended stay beyond 6 days is billed automatically by advance_time), undock to leave the starport into orbit, or refuel (refined Cr500/t at Starport A/B while docked, unrefined Cr100/t at A–D while docked, free gas giant skimming with fuel scoops while undocked, or onboard fuel processor refining).",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["refuel", "dock"]},
+                    "action": {"type": "string", "enum": ["refuel", "dock", "undock"]},
                     "ship_id": {"type": "string", "description": "Optional ship UUID (defaults to lead ship)."},
                     "mode": {"type": "string", "enum": ["refined", "unrefined", "gas_giant_skim", "process_onboard"], "default": "refined"},
-                    "tons": {"type": "number", "description": "Tons of fuel to add/process (omit to fill tanks)."},
-                    "extra_days": {"type": "integer", "default": 0, "description": "Extra berthing days beyond initial 6 days."}
+                    "tons": {"type": "number", "description": "Tons of fuel to add/process (omit to fill tanks)."}
                 },
                 "required": ["action"]
             }
@@ -704,6 +704,9 @@ pub async fn execute_tool(
                             ship.fuel_refined -= from_ref;
                             ship.fuel_unrefined = (ship.fuel_unrefined - (req_fuel - from_ref)).max(0.0);
                             ship.docked_system_name = dest.name.clone();
+                            ship.is_docked = false;
+                            ship.docked_at_total_minutes = None;
+                            ship.berthing_billed_days = 0;
                             db.save_ship(ship).await?;
                             fuel_burned_total += req_fuel;
                             fleet_fuel_log.push(json!({
@@ -1758,13 +1761,70 @@ pub async fn execute_tool(
                 .await?;
 
             let mut billing_events = Vec::new();
+            let accounts = db.list_accounts(campaign_id).await?;
+            let company_acc = accounts
+                .iter()
+                .find(|a| a.kind == AccountKind::Company)
+                .or_else(|| accounts.first());
+
+            // 1. Extended Starport Berthing Fees: charge daily rate for any docked ship staying past its initial 6 prepaid days
+            let mut ships = db.list_ships(campaign_id).await?;
+            if let Ok(world) = parse_uwp(&camp.current_system_uwp) {
+                let now_mins = adv.to.to_total_minutes();
+                for ship in &mut ships {
+                    if ship.is_docked
+                        && let Some(docked_at) = ship.docked_at_total_minutes
+                    {
+                        let accrued = calculate_accrued_berthing_fee(
+                            world.starport,
+                            docked_at,
+                            now_mins,
+                            ship.berthing_billed_days.max(0) as u32,
+                        );
+                        if accrued.newly_billable_days > 0 {
+                            ship.berthing_billed_days =
+                                ship.berthing_billed_days.max(6) + accrued.newly_billable_days as i32;
+                            db.save_ship(ship).await?;
+                            if accrued.fee_cr > 0
+                                && let Some(acc) = company_acc
+                            {
+                                let tx = db
+                                    .post_transaction(
+                                        campaign_id,
+                                        acc.id,
+                                        &adv.to.format_date_only(),
+                                        -accrued.fee_cr,
+                                        "berthing_fee",
+                                        &format!(
+                                            "Extended Starport {} berthing for {} ({} extra day(s) @ Cr{}/day; total stay {}d)",
+                                            world.starport,
+                                            ship.name,
+                                            accrued.newly_billable_days,
+                                            accrued.daily_rate_cr,
+                                            accrued.total_days_docked
+                                        ),
+                                        &format!("{} Port Authority", camp.current_system_name),
+                                    )
+                                    .await?;
+                                billing_events.push(json!({
+                                    "kind": "extended_berthing",
+                                    "ship": ship.name,
+                                    "starport": world.starport.to_string(),
+                                    "newly_billable_days": accrued.newly_billable_days,
+                                    "total_days_docked": accrued.total_days_docked,
+                                    "daily_rate_cr": accrued.daily_rate_cr,
+                                    "total_cr": accrued.fee_cr,
+                                    "already_debited_from_company_account": true,
+                                    "balance_after_cr": tx.balance_after_cr
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+
             if adv.maintenance_periods_crossed > 0 {
                 let chars = db.list_characters(campaign_id).await?;
-                let mut ships = db.list_ships(campaign_id).await?;
-                let accounts = db.list_accounts(campaign_id).await?;
-                let company_acc = accounts
-                    .iter()
-                    .find(|a| a.kind == AccountKind::Company);
 
                 let crew_salaries: i64 = chars
                     .iter()
@@ -2227,7 +2287,15 @@ pub async fn execute_tool(
                         .update_system_ship(campaign_id, vessel_id, Some("hostile"), None, None)
                         .await?
                         .context("In-system vessel not found")?;
-                    let player_ships = db.list_ships(campaign_id).await?;
+                    let mut player_ships = db.list_ships(campaign_id).await?;
+                    for ps_mut in &mut player_ships {
+                        if ps_mut.is_docked {
+                            ps_mut.is_docked = false;
+                            ps_mut.docked_at_total_minutes = None;
+                            ps_mut.berthing_billed_days = 0;
+                            db.save_ship(ps_mut).await?;
+                        }
+                    }
                     let ps = player_ships.first();
                     let range = input
                         .get("range_band")
@@ -2348,6 +2416,20 @@ pub async fn execute_tool(
                             ship.spec.fuel_capacity_tons
                         );
                     }
+                    if matches!(mode, RefuelMode::Refined | RefuelMode::Unrefined) && !ship.is_docked {
+                        anyhow::bail!(
+                            "{} must dock at {} Starport before purchasing commercial starport fuel.",
+                            ship.name,
+                            camp.current_system_name
+                        );
+                    }
+                    if matches!(mode, RefuelMode::GasGiantSkim) && ship.is_docked {
+                        anyhow::bail!(
+                            "{} must undock from {} Starport before skimming a gas giant.",
+                            ship.name,
+                            camp.current_system_name
+                        );
+                    }
                     let quote = calculate_refuel_quote(world.starport, gas_giants, &ship.spec, actual_tons, mode);
                     if !quote.allowed {
                         anyhow::bail!("{}", quote.note);
@@ -2401,10 +2483,27 @@ pub async fn execute_tool(
                     })
                 }
                 "dock" => {
-                    let extra_days = input.get("extra_days").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let sp = world.starport.to_ascii_uppercase();
+                    if sp == 'X' {
+                        anyhow::bail!(
+                            "Starport Class X at {} has no starport facilities to dock at.",
+                            camp.current_system_name
+                        );
+                    }
+                    if ship.is_docked
+                        && ship
+                            .docked_system_name
+                            .eq_ignore_ascii_case(&camp.current_system_name)
+                    {
+                        anyhow::bail!(
+                            "{} is already docked at {} Starport. Extended stay fees accrue automatically as days pass; undock first if you wish to depart.",
+                            ship.name,
+                            camp.current_system_name
+                        );
+                    }
                     let fee = {
                         let mut r = rng();
-                        roll_berthing_fee(&mut r, world.starport, extra_days)
+                        roll_berthing_fee(&mut r, sp, 0)
                     };
                     if fee.total_cr > 0 {
                         let accounts = db.list_accounts(campaign_id).await?;
@@ -2413,6 +2512,16 @@ pub async fn execute_tool(
                             .find(|a| a.kind == AccountKind::Company)
                             .or_else(|| accounts.first())
                             .context("No account found")?;
+                        let available = company.balance_cr + company.credit_limit_cr;
+                        if available < fee.total_cr {
+                            anyhow::bail!(
+                                "Insufficient funds in {} to pay Starport {} docking fee (need Cr{}, available Cr{}).",
+                                company.name,
+                                sp,
+                                fee.total_cr,
+                                available
+                            );
+                        }
                         db.post_transaction(
                             campaign_id,
                             company.id,
@@ -2420,18 +2529,57 @@ pub async fn execute_tool(
                             -fee.total_cr,
                             "berthing_fee",
                             &format!(
-                                "Starport {} docking/berthing fee for {} (1D={} -> Cr{} + {} extra days)",
-                                world.starport, ship.name, fee.roll_1d6, fee.base_berthing_cr, extra_days
+                                "Starport {} docking fee for {} (1D={} -> Cr{}, covers first 6 days)",
+                                sp, ship.name, fee.roll_1d6, fee.base_berthing_cr
                             ),
                             &format!("{} Port Authority", camp.current_system_name),
                         )
                         .await?;
                     }
+                    ship.is_docked = true;
+                    ship.docked_system_name = camp.current_system_name.clone();
+                    ship.docked_at_total_minutes = Some(camp.date.to_total_minutes());
+                    ship.berthing_billed_days = 6;
+                    db.save_ship(ship).await?;
+                    let extra_day_rate_cr = berthing_extra_day_rate(sp);
                     Ok(ToolExecutionResult {
                         output_json: json!({
                             "ship": ship.name,
                             "system": camp.current_system_name,
-                            "berthing_fee": fee
+                            "is_docked": true,
+                            "berthing_fee": fee,
+                            "extra_day_rate_cr": extra_day_rate_cr,
+                            "note": format!(
+                                "Docked {} at {} Starport {}. Initial fee Cr{} covers days 1–6; extra days accrue at Cr{}/day automatically.",
+                                ship.name, camp.current_system_name, sp, fee.total_cr, extra_day_rate_cr
+                            )
+                        })
+                        .to_string(),
+                        state_changed: true,
+                    })
+                }
+                "undock" => {
+                    if !ship.is_docked {
+                        anyhow::bail!("{} is already in orbit (not docked at a starport).", ship.name);
+                    }
+                    let days_stayed = ship
+                        .docked_at_total_minutes
+                        .map(|t0| (camp.date.to_total_minutes() - t0).max(0) / 1440)
+                        .unwrap_or(0);
+                    ship.is_docked = false;
+                    ship.docked_at_total_minutes = None;
+                    ship.berthing_billed_days = 0;
+                    db.save_ship(ship).await?;
+                    Ok(ToolExecutionResult {
+                        output_json: json!({
+                            "ship": ship.name,
+                            "system": camp.current_system_name,
+                            "is_docked": false,
+                            "days_stayed": days_stayed,
+                            "note": format!(
+                                "{} undocked from {} Starport after {} day(s) and broke orbit.",
+                                ship.name, camp.current_system_name, days_stayed
+                            )
                         })
                         .to_string(),
                         state_changed: true,

@@ -367,7 +367,8 @@ impl Db {
         let rows = sqlx::query(
             "SELECT id, campaign_id, name, class_name, owner_account_id, spec, validation,
                     hull_current, fuel_refined, fuel_unrefined, crits, cargo, passengers,
-                    mortgage, skipped_maintenance_periods, last_annual_overhaul_year, docked_system_name
+                    mortgage, skipped_maintenance_periods, last_annual_overhaul_year, docked_system_name,
+                    is_docked, docked_at_total_minutes, berthing_billed_days
              FROM ships WHERE campaign_id = $1 ORDER BY created_at ASC",
         )
         .bind(campaign_id)
@@ -395,11 +396,13 @@ impl Db {
         let row = sqlx::query(
             "INSERT INTO ships
                 (id, campaign_id, name, class_name, owner_account_id, spec, validation,
-                 hull_current, fuel_refined, mortgage, docked_system_name)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                 hull_current, fuel_refined, mortgage, docked_system_name,
+                 is_docked, docked_at_total_minutes, berthing_billed_days)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,NULL,0)
              RETURNING id, campaign_id, name, class_name, owner_account_id, spec, validation,
                        hull_current, fuel_refined, fuel_unrefined, crits, cargo, passengers,
-                       mortgage, skipped_maintenance_periods, last_annual_overhaul_year, docked_system_name",
+                       mortgage, skipped_maintenance_periods, last_annual_overhaul_year, docked_system_name,
+                       is_docked, docked_at_total_minutes, berthing_billed_days",
         )
         .bind(id)
         .bind(campaign_id)
@@ -425,7 +428,9 @@ impl Db {
              SET name = $3, class_name = $4, owner_account_id = $5, spec = $6, validation = $7,
                  hull_current = $8, fuel_refined = $9, fuel_unrefined = $10, crits = $11,
                  cargo = $12, passengers = $13, mortgage = $14, skipped_maintenance_periods = $15,
-                 last_annual_overhaul_year = $16, docked_system_name = $17, updated_at = NOW()
+                 last_annual_overhaul_year = $16, docked_system_name = $17,
+                 is_docked = $18, docked_at_total_minutes = $19, berthing_billed_days = $20,
+                 updated_at = NOW()
              WHERE campaign_id = $1 AND id = $2",
         )
         .bind(ship.campaign_id)
@@ -445,6 +450,9 @@ impl Db {
         .bind(ship.skipped_maintenance_periods)
         .bind(ship.last_annual_overhaul_year)
         .bind(&ship.docked_system_name)
+        .bind(ship.is_docked)
+        .bind(ship.docked_at_total_minutes)
+        .bind(ship.berthing_billed_days)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -470,6 +478,9 @@ impl Db {
             skipped_maintenance_periods: r.try_get("skipped_maintenance_periods")?,
             last_annual_overhaul_year: r.try_get("last_annual_overhaul_year")?,
             docked_system_name: r.try_get("docked_system_name")?,
+            is_docked: r.try_get("is_docked")?,
+            docked_at_total_minutes: r.try_get("docked_at_total_minutes")?,
+            berthing_billed_days: r.try_get("berthing_billed_days")?,
         })
     }
 
@@ -958,14 +969,24 @@ impl Db {
                 total_crew_salaries,
             );
             let valid_tag = if ship.validation.valid { "VALID" } else { "INVALID" };
+            let dock_status = if ship.is_docked {
+                let days = ship
+                    .docked_at_total_minutes
+                    .map(|t0| (campaign.date.to_total_minutes() - t0).max(0) / 1440)
+                    .unwrap_or(0);
+                format!("Docked at {} Starport ({days}d stayed)", ship.docked_system_name)
+            } else {
+                format!("In Orbit at {}", ship.docked_system_name)
+            };
             out.push_str(&format!(
-                "- {} ({}, {}t, J-{}/M-{}, {}, id: {}): Hull {}/{}, Fuel {:.1}t ref / {:.1}t unref (cap {:.1}t), Cargo {} lot(s) / {:.1}t cap, Sensors {:?}, Stealth DM {}, Running Cost Cr{}/4wk (Mortgage Cr{}, Maint Cr{}, LifeSupp Cr{}, Salaries Cr{}), Skipped Maint: {}, Crits: {}\n",
+                "- {} ({}, {}t, J-{}/M-{}, {}, {}, id: {}): Hull {}/{}, Fuel {:.1}t ref / {:.1}t unref (cap {:.1}t), Cargo {} lot(s) / {:.1}t cap, Sensors {:?}, Stealth DM {}, Running Cost Cr{}/4wk (Mortgage Cr{}, Maint Cr{}, LifeSupp Cr{}, Salaries Cr{}), Skipped Maint: {}, Crits: {}\n",
                 ship.name,
                 ship.class_name,
                 ship.spec.tonnage,
                 ship.spec.jump_rating,
                 ship.spec.thrust,
                 valid_tag,
+                dock_status,
                 ship.id,
                 ship.hull_current,
                 ship.spec.hull_points_max,

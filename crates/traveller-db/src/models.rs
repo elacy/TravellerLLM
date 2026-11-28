@@ -72,6 +72,12 @@ pub struct ShipRecord {
     pub skipped_maintenance_periods: i32,
     pub last_annual_overhaul_year: i32,
     pub docked_system_name: String,
+    #[serde(default)]
+    pub is_docked: bool,
+    #[serde(default)]
+    pub docked_at_total_minutes: Option<i64>,
+    #[serde(default)]
+    pub berthing_billed_days: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

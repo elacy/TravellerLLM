@@ -100,6 +100,10 @@ pub fn router(state: AppState) -> Router {
             post(dock_ship_handler),
         )
         .route(
+            "/api/campaigns/{id}/ships/{ship_id}/undock",
+            post(undock_ship_handler),
+        )
+        .route(
             "/api/campaigns/{id}/finances/pay-maintenance",
             post(pay_maintenance_handler),
         )
@@ -376,6 +380,7 @@ async fn get_campaign_snapshot(
 
     Ok(Json(json!({
         "campaign": camp,
+        "current_total_minutes": camp.date.to_total_minutes(),
         "current_system_info": current_system_info,
         "characters": characters,
         "ships": ships,
@@ -581,7 +586,7 @@ async fn refit_quote_handler(
         .ok_or_else(|| anyhow::anyhow!("Ship not found"))?;
     let uwp = parse_uwp(&camp.current_system_uwp)
         .unwrap_or_else(|_| parse_uwp("A788899-C").expect("valid uwp"));
-    let quote = calculate_refit_cost(
+    let mut quote = calculate_refit_cost(
         &existing.spec,
         existing.hull_current,
         existing.crits.len(),
@@ -591,6 +596,13 @@ async fn refit_quote_handler(
         uwp.starport,
         uwp.tech_level,
     );
+    if !existing.is_docked {
+        quote.allowed = false;
+        quote.block_reason = Some(format!(
+            "{} must be docked at {} Starport to perform shipyard refits or repairs.",
+            existing.name, camp.current_system_name
+        ));
+    }
     let validation = validate_ship(&proposed.spec);
     Ok(Json(json!({ "quote": quote, "validation": validation })))
 }
@@ -613,6 +625,15 @@ async fn update_ship(
         .find(|s| s.id == ship_id)
         .ok_or_else(|| anyhow::anyhow!("Ship not found"))?;
 
+    if !existing.is_docked {
+        return Err(anyhow::anyhow!(
+            "{} must be docked at {} Starport to perform shipyard refits or repairs.",
+            existing.name,
+            camp.current_system_name
+        )
+        .into());
+    }
+
     // Preserve authoritative fields that cannot be freely edited via refit
     ship.campaign_id = id;
     ship.id = ship_id;
@@ -620,6 +641,9 @@ async fn update_ship(
     ship.fuel_unrefined = existing.fuel_unrefined;
     ship.cargo = existing.cargo.clone();
     ship.mortgage = existing.mortgage.clone();
+    ship.is_docked = existing.is_docked;
+    ship.docked_at_total_minutes = existing.docked_at_total_minutes;
+    ship.berthing_billed_days = existing.berthing_billed_days;
 
     let uwp = parse_uwp(&camp.current_system_uwp)
         .unwrap_or_else(|_| parse_uwp("A788899-C").expect("valid uwp"));
@@ -1714,6 +1738,19 @@ async fn dock_ship_handler(
         obj.insert("action".into(), json!("dock"));
         obj.insert("ship_id".into(), json!(ship_id.to_string()));
     }
+    let res = execute_tool(&st.db, &st.hindsight, id, "port_ops", &payload).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+async fn undock_ship_handler(
+    State(st): State<AppState>,
+    Path((id, ship_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    let payload = json!({
+        "action": "undock",
+        "ship_id": ship_id.to_string()
+    });
     let res = execute_tool(&st.db, &st.hindsight, id, "port_ops", &payload).await?;
     let parsed: Value = serde_json::from_str(&res.output_json)?;
     Ok(Json(parsed))

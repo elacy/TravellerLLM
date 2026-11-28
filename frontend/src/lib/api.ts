@@ -153,6 +153,9 @@ export interface ShipRecord {
   skipped_maintenance_periods: number;
   last_annual_overhaul_year?: number;
   docked_system_name: string;
+  is_docked: boolean;
+  docked_at_total_minutes?: number | null;
+  berthing_billed_days?: number;
 }
 
 export interface AccountRecord {
@@ -408,6 +411,7 @@ export interface RefitQuote {
 
 export interface CampaignSnapshot {
   campaign: Campaign;
+  current_total_minutes?: number;
   current_system_info?: CurrentSystemInfo;
   characters: CharacterRow[];
   ships: ShipRecord[];
@@ -598,10 +602,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ mode, tons }),
     }),
-  dockShip: (id: string, shipId: string, extra_days = 0) =>
+  dockShip: (id: string, shipId: string) =>
     req<Record<string, unknown>>(`/api/campaigns/${id}/ships/${shipId}/dock`, {
       method: "POST",
-      body: JSON.stringify({ extra_days }),
+      body: JSON.stringify({}),
+    }),
+  undockShip: (id: string, shipId: string) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/ships/${shipId}/undock`, {
+      method: "POST",
     }),
   payMaintenance: (id: string) =>
     req<{ total_paid_cr: number }>(`/api/campaigns/${id}/finances/pay-maintenance`, {

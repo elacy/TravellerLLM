@@ -662,6 +662,26 @@ pub struct BerthingFeeResult {
     pub total_cr: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccruedBerthingFee {
+    pub starport: char,
+    pub total_days_docked: u32,
+    pub newly_billable_days: u32,
+    pub daily_rate_cr: i64,
+    pub fee_cr: i64,
+}
+
+/// Core 2022 p. 235 daily extended-berthing rate after the initial 6 prepaid days.
+pub fn berthing_extra_day_rate(starport: char) -> i64 {
+    match starport.to_ascii_uppercase() {
+        'A' => 500,
+        'B' => 200,
+        'C' => 100,
+        'D' => 10,
+        _ => 0,
+    }
+}
+
 /// Core 2022 p. 235 Starport Berthing / Docking Fees (covers 1–6 days + extra days).
 pub fn roll_berthing_fee<R: Rng + ?Sized>(
     rng: &mut R,
@@ -669,13 +689,14 @@ pub fn roll_berthing_fee<R: Rng + ?Sized>(
     extra_days: u32,
 ) -> BerthingFeeResult {
     let d = roll_nd6(rng, 1)[0];
-    let (mult, per_extra_day): (i64, i64) = match starport {
-        'A' => (1_000, 500),
-        'B' => (500, 200),
-        'C' => (100, 100),
-        'D' => (10, 10),
-        _ => (0, 0),
+    let mult: i64 = match starport.to_ascii_uppercase() {
+        'A' => 1_000,
+        'B' => 500,
+        'C' => 100,
+        'D' => 10,
+        _ => 0,
     };
+    let per_extra_day = berthing_extra_day_rate(starport);
     let base_berthing_cr = i64::from(d) * mult;
     let extra_days_cr = i64::from(extra_days) * per_extra_day;
     BerthingFeeResult {
@@ -685,6 +706,31 @@ pub fn roll_berthing_fee<R: Rng + ?Sized>(
         extra_days,
         extra_days_cr,
         total_cr: base_berthing_cr + extra_days_cr,
+    }
+}
+
+/// Computes newly billable extended-stay berthing fees as campaign time advances
+/// while a ship remains docked at a starport. The initial docking fee covers the
+/// first 6 days (`already_billed_days` starts at 6 upon docking); each full day
+/// beyond that accrues the starport's daily extended-berthing rate.
+pub fn calculate_accrued_berthing_fee(
+    starport: char,
+    docked_at_total_minutes: i64,
+    now_total_minutes: i64,
+    already_billed_days: u32,
+) -> AccruedBerthingFee {
+    let elapsed_mins = (now_total_minutes - docked_at_total_minutes).max(0);
+    let total_days_docked = (elapsed_mins / 1440) as u32;
+    let covered = already_billed_days.max(6);
+    let newly_billable_days = total_days_docked.saturating_sub(covered);
+    let daily_rate_cr = berthing_extra_day_rate(starport);
+    let fee_cr = i64::from(newly_billable_days) * daily_rate_cr;
+    AccruedBerthingFee {
+        starport,
+        total_days_docked,
+        newly_billable_days,
+        daily_rate_cr,
+        fee_cr,
     }
 }
 
