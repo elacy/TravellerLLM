@@ -105,6 +105,15 @@ export function FinancesCrewPanel({ campaignId, snapshot, onRefresh, onError }: 
     }
   }
 
+  async function handlePayMaintenance() {
+    try {
+      await api.payMaintenance(campaignId);
+      await onRefresh();
+    } catch (e) {
+      onError((e as Error).message);
+    }
+  }
+
   return (
     <div className="space-y-3 text-xs">
       <div className="grid grid-cols-3 gap-1">
@@ -158,6 +167,44 @@ export function FinancesCrewPanel({ campaignId, snapshot, onRefresh, onError }: 
               </div>
             ))}
           </div>
+
+          {/* Fleet 4-Week Running Costs: Mortgages, Maintenance, Life Support & Crew Salaries */}
+          {snapshot.fleet_running_costs && (
+            <div className="bg-slate-900 border border-amber-800/60 rounded p-2.5 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-amber-300">
+                  4-Week Maintenance Period & Payroll
+                </span>
+                <span className="font-mono font-bold text-amber-200">
+                  {formatCr(snapshot.fleet_running_costs.total_cr)} / 28d
+                </span>
+              </div>
+              <div className="grid grid-cols-4 gap-1 text-center font-mono text-[10px]">
+                <div className="bg-slate-950 rounded p-1 border border-slate-800">
+                  <div className="text-slate-400">MORTGAGE</div>
+                  <div className="text-slate-200">{formatCr(snapshot.fleet_running_costs.mortgage_cr)}</div>
+                </div>
+                <div className="bg-slate-950 rounded p-1 border border-slate-800">
+                  <div className="text-slate-400">MAINT</div>
+                  <div className="text-slate-200">{formatCr(snapshot.fleet_running_costs.maintenance_cr)}</div>
+                </div>
+                <div className="bg-slate-950 rounded p-1 border border-slate-800">
+                  <div className="text-slate-400">LIFE SUPP</div>
+                  <div className="text-slate-200">{formatCr(snapshot.fleet_running_costs.life_support_cr)}</div>
+                </div>
+                <div className="bg-slate-950 rounded p-1 border border-slate-800">
+                  <div className="text-slate-400">SALARIES</div>
+                  <div className="text-cyan-300">{formatCr(snapshot.fleet_running_costs.crew_salaries_cr)}</div>
+                </div>
+              </div>
+              <button
+                onClick={handlePayMaintenance}
+                className="w-full bg-amber-700 hover:bg-amber-600 text-white font-semibold rounded py-1 text-[11px]"
+              >
+                Pay Mortgage, Maintenance & Crew Salaries Now
+              </button>
+            </div>
+          )}
 
           {/* Personal <-> Company Transfer */}
           {snapshot.accounts.length >= 2 && (

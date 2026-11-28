@@ -25,6 +25,7 @@ export function CombatPanel({ campaignId, snapshot, onRefresh, onError }: Props)
   // Personal combat inputs
   const [burstMode, setBurstMode] = useState(false);
   const [reaction, setReaction] = useState("none");
+  const [autoAiTurn, setAutoAiTurn] = useState(true);
 
   // Sensor calculator state
   const [sensorGrade, setSensorGrade] = useState("military");
@@ -275,7 +276,26 @@ export function CombatPanel({ campaignId, snapshot, onRefresh, onError }: Props)
                 </div>
                 <div className="flex gap-1">
                   <button
-                    onClick={() => callSpace({ action: "next_round" })}
+                    onClick={() =>
+                      callSpace({
+                        action: "ai_turn",
+                        sandcaster_count: sandcasters,
+                        gunner_skill: gunnerSkill,
+                      })
+                    }
+                    className="bg-amber-600 hover:bg-amber-500 text-slate-950 font-semibold rounded px-2 py-1 text-[11px]"
+                  >
+                    AI Fight Back
+                  </button>
+                  <button
+                    onClick={() =>
+                      callSpace({
+                        action: "next_round",
+                        auto_ai_turn: autoAiTurn,
+                        sandcaster_count: sandcasters,
+                        gunner_skill: gunnerSkill,
+                      })
+                    }
                     className="bg-cyan-700 hover:bg-cyan-600 text-white rounded px-2 py-1 text-[11px]"
                   >
                     Next Round
@@ -288,6 +308,14 @@ export function CombatPanel({ campaignId, snapshot, onRefresh, onError }: Props)
                   </button>
                 </div>
               </div>
+              <label className="flex items-center gap-1.5 text-[10px] text-amber-300 px-1">
+                <input
+                  type="checkbox"
+                  checked={autoAiTurn}
+                  onChange={(e) => setAutoAiTurn(e.target.checked)}
+                />
+                Enemy AI automatically decides tactics & fights back on Next Round
+              </label>
 
               {/* Ships Tactical Cards */}
               {spaceState.ships.map((s) => (
@@ -514,7 +542,21 @@ export function CombatPanel({ campaignId, snapshot, onRefresh, onError }: Props)
                 </span>
                 <div className="flex gap-1">
                   <button
-                    onClick={() => callPersonal({ action: "next_round" })}
+                    onClick={() =>
+                      callPersonal({
+                        action: "ai_turn",
+                        reaction,
+                        defender_reaction_dm: 1,
+                      })
+                    }
+                    className="bg-amber-600 hover:bg-amber-500 text-slate-950 font-semibold rounded px-2 py-1 text-[11px]"
+                  >
+                    AI Fight Back
+                  </button>
+                  <button
+                    onClick={() =>
+                      callPersonal({ action: "next_round", auto_ai_turn: autoAiTurn })
+                    }
                     className="bg-cyan-700 hover:bg-cyan-600 text-white rounded px-2 py-1 text-[11px]"
                   >
                     Next Round

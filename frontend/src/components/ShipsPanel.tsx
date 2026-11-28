@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Edit3, Package, Rocket, Save, ShieldAlert, ShieldCheck, Wrench } from "lucide-react";
+import { Anchor, Edit3, Fuel, Package, Rocket, Save, ShieldAlert, ShieldCheck, Wrench } from "lucide-react";
 import { api, CampaignSnapshot, formatCr, ShipRecord } from "../lib/api";
 
 interface Props {
@@ -12,6 +12,7 @@ interface Props {
 export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) {
   const [editingShipId, setEditingShipId] = useState<string | null>(null);
   const [draft, setDraft] = useState<ShipRecord | null>(null);
+  const [portMsg, setPortMsg] = useState<string | null>(null);
 
   function startEdit(ship: ShipRecord) {
     setEditingShipId(ship.id);
@@ -30,8 +31,54 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
     }
   }
 
+  async function handleRefuel(
+    shipId: string,
+    mode: "refined" | "unrefined" | "gas_giant_skim" | "process_onboard"
+  ) {
+    setPortMsg(null);
+    try {
+      const res = await api.refuelShip(campaignId, shipId, mode);
+      const q = res.quote as { note?: string } | undefined;
+      setPortMsg(q?.note ?? "Refuel complete.");
+      await onRefresh();
+    } catch (e) {
+      onError((e as Error).message);
+    }
+  }
+
+  async function handleDock(shipId: string) {
+    setPortMsg(null);
+    try {
+      const res = await api.dockShip(campaignId, shipId, 0);
+      const fee = res.berthing_fee as { starport?: string; roll_1d6?: number; total_cr?: number } | undefined;
+      setPortMsg(
+        `Paid Starport ${fee?.starport ?? "?"} berthing/docking fee (1D=${fee?.roll_1d6 ?? "?"}): ${formatCr(
+          fee?.total_cr ?? 0
+        )}.`
+      );
+      await onRefresh();
+    } catch (e) {
+      onError((e as Error).message);
+    }
+  }
+
   return (
     <div className="space-y-3 text-xs">
+      {snapshot.ships.length > 0 && (
+        <div className="flex items-center justify-between bg-slate-900 border border-slate-800 rounded px-2.5 py-1.5 text-[11px]">
+          <span className="text-slate-300">
+            Fleet Size: <strong className="text-cyan-300">{snapshot.ships.length}</strong> ship(s)
+          </span>
+          <span className="font-mono text-amber-300">
+            Fleet Max Jump: J-{snapshot.fleet_max_jump ?? snapshot.ships[0].spec.jump_rating} (lowest in fleet)
+          </span>
+        </div>
+      )}
+      {portMsg && (
+        <div className="p-2 rounded bg-emerald-950/60 border border-emerald-700 text-emerald-200 text-[11px]">
+          {portMsg}
+        </div>
+      )}
       {snapshot.ships.length === 0 && (
         <div className="text-slate-400 text-center py-6">No ships registered in this campaign.</div>
       )}
@@ -178,6 +225,45 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
                     <div className="text-[9px] text-slate-400">SENSORS</div>
                     <div className="text-amber-300 capitalize font-bold">{ship.spec.sensor_grade}</div>
                   </div>
+                </div>
+
+                {/* Refueling & Starport Docking Operations */}
+                <div className="bg-slate-950 border border-slate-800 rounded p-2 space-y-1.5">
+                  <div className="text-[10px] text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                    <Fuel className="w-3 h-3 text-cyan-400" /> Starport Refuel & Berthing Ops
+                  </div>
+                  <div className="grid grid-cols-2 gap-1 text-[10px]">
+                    <button
+                      onClick={() => handleRefuel(ship.id, "refined")}
+                      className="bg-cyan-900/70 hover:bg-cyan-800 text-cyan-100 rounded py-1 px-1.5"
+                    >
+                      Refuel Refined (Cr500/t)
+                    </button>
+                    <button
+                      onClick={() => handleRefuel(ship.id, "unrefined")}
+                      className="bg-slate-800 hover:bg-slate-700 text-slate-200 rounded py-1 px-1.5"
+                    >
+                      Refuel Unref (Cr100/t)
+                    </button>
+                    <button
+                      onClick={() => handleRefuel(ship.id, "gas_giant_skim")}
+                      className="bg-amber-900/60 hover:bg-amber-800 text-amber-100 rounded py-1 px-1.5"
+                    >
+                      Skim Gas Giant (Cr0)
+                    </button>
+                    <button
+                      onClick={() => handleRefuel(ship.id, "process_onboard")}
+                      className="bg-slate-800 hover:bg-slate-700 text-slate-200 rounded py-1 px-1.5"
+                    >
+                      Refine Fuel Onboard
+                    </button>
+                  </div>
+                  <button
+                    onClick={() => handleDock(ship.id)}
+                    className="w-full bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 rounded py-1 text-[10px] flex items-center justify-center gap-1"
+                  >
+                    <Anchor className="w-3 h-3 text-amber-400" /> Pay Starport Docking / Berthing Fee (1D × Port)
+                  </button>
                 </div>
 
                 {/* High Guard Validation Summary */}

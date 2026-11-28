@@ -26,10 +26,12 @@ use traveller_rules::dice::{resolve_task, Difficulty, ModifierItem, RollMode};
 use traveller_rules::finance::AccountKind;
 use traveller_rules::sensors::{resolve_sensor_detection, SensorDetectionInput};
 use traveller_rules::ship::{
-    sample_free_trader, validate_ship, Mortgage, ShipSpec,
+    compute_running_costs, fleet_max_jump_rating, sample_free_trader, validate_ship, Mortgage,
+    ShipSpec,
 };
+use traveller_rules::trade::compute_fleet_max_broker;
 use traveller_rules::traffic::generate_system_traffic;
-use traveller_rules::universe::{parse_uwp, plan_jump_route, RouteNode};
+use traveller_rules::universe::{build_spatial_memory_scope, parse_uwp, plan_jump_route, RouteNode};
 use uuid::Uuid;
 
 use crate::auth::{auth_me, oidc_callback, oidc_login, oidc_logout, AuthUser};
@@ -84,6 +86,18 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/campaigns/{id}/ships/{ship_id}/validate",
             post(validate_ship_handler),
+        )
+        .route(
+            "/api/campaigns/{id}/ships/{ship_id}/refuel",
+            post(refuel_ship_handler),
+        )
+        .route(
+            "/api/campaigns/{id}/ships/{ship_id}/dock",
+            post(dock_ship_handler),
+        )
+        .route(
+            "/api/campaigns/{id}/finances/pay-maintenance",
+            post(pay_maintenance_handler),
         )
         .route(
             "/api/campaigns/{id}/accounts",
@@ -298,6 +312,45 @@ async fn get_campaign_snapshot(
     let sector_count = st.db.count_sectors().await.unwrap_or(0);
     let item_count = st.db.count_items().await.unwrap_or(0);
     let system_ship_count = system_ships.len();
+
+    // Compute fleet-wide metrics: lowest Jump rating, max Broker/Steward (incl. robots & Neural Jacks),
+    // and total 4-week Maintenance Period running costs across all fleet ships + crew salaries.
+    let ship_specs: Vec<_> = ships.iter().map(|s| &s.spec).collect();
+    let fleet_max_jump = fleet_max_jump_rating(&ship_specs);
+    let roster_refs: Vec<(&Character, &[Value])> = characters
+        .iter()
+        .map(|r| (&r.character, r.equipment.as_slice()))
+        .collect();
+    let fleet_assets: Vec<Value> = ships.iter().flat_map(|s| s.cargo.iter().cloned()).collect();
+    let fleet_broker = compute_fleet_max_broker(&roster_refs, &fleet_assets);
+
+    let crew_salaries_cr: i64 = characters
+        .iter()
+        .filter(|r| r.character.kind == CharacterKind::Crew)
+        .map(|r| r.character.salary_cr)
+        .sum();
+    let occupants = characters
+        .iter()
+        .filter(|r| matches!(r.character.kind, CharacterKind::Player | CharacterKind::Crew))
+        .count() as u32;
+    let mut total_mortgage_cr = 0i64;
+    let mut total_maintenance_cr = 0i64;
+    let mut total_life_support_cr = 0i64;
+    for (idx, s) in ships.iter().enumerate() {
+        let occ = if idx == 0 { occupants } else { 0 };
+        let rc = compute_running_costs(&s.spec, s.mortgage.as_ref(), occ, 0, 0);
+        total_mortgage_cr += rc.mortgage_cr;
+        total_maintenance_cr += rc.maintenance_cr;
+        total_life_support_cr += rc.life_support_cr;
+    }
+    let fleet_running_costs = json!({
+        "mortgage_cr": total_mortgage_cr,
+        "maintenance_cr": total_maintenance_cr,
+        "life_support_cr": total_life_support_cr,
+        "crew_salaries_cr": crew_salaries_cr,
+        "total_cr": total_mortgage_cr + total_maintenance_cr + total_life_support_cr + crew_salaries_cr
+    });
+
     Ok(Json(json!({
         "campaign": camp,
         "characters": characters,
@@ -311,6 +364,9 @@ async fn get_campaign_snapshot(
         "loaded_modules": loaded_modules,
         "system_ships": system_ships,
         "system_ship_count": system_ship_count,
+        "fleet_max_jump": fleet_max_jump,
+        "fleet_broker": fleet_broker,
+        "fleet_running_costs": fleet_running_costs,
         "pack_stats": { "sectors": sector_count, "items": item_count }
     })))
 }
@@ -1290,10 +1346,30 @@ async fn load_module_into_campaign(
         .ok_or_else(|| anyhow::anyhow!("Module not found"))?;
 
     // 1. Ensure Hindsight bank exists for this campaign and ingest all knowledge files
+    //    tagged with the module's starting system / sector / polity / government so regional recall finds them!
     let _ = st
         .hindsight
         .ensure_bank(&camp.hindsight_bank_id, &camp.name)
         .await;
+    let mod_sys_name = module
+        .starting_system_name
+        .as_deref()
+        .unwrap_or(&camp.current_system_name);
+    let mod_sys_rec = st.db.get_system_by_name(mod_sys_name).await.ok().flatten();
+    let mod_uwp_s = module
+        .starting_system_uwp
+        .as_deref()
+        .or_else(|| mod_sys_rec.as_ref().map(|s| s.uwp.as_str()))
+        .unwrap_or(&camp.current_system_uwp);
+    let mod_uwp = parse_uwp(mod_uwp_s)
+        .unwrap_or_else(|_| parse_uwp("A788899-C").expect("valid uwp"));
+    let mod_scope = build_spatial_memory_scope(
+        mod_sys_name,
+        mod_sys_rec.as_ref().map(|s| s.sector_name.as_str()),
+        &mod_uwp,
+        mod_sys_rec.as_ref().map(|s| s.allegiance.as_str()).unwrap_or("Im"),
+    );
+
     let mut chunks_ingested = 0usize;
     for kf in &module.knowledge_files {
         let title = if kf.title.trim().is_empty() {
@@ -1309,6 +1385,8 @@ async fn load_module_into_campaign(
                 &kf.filename,
                 title,
                 &kf.content,
+                mod_scope.all_tags.clone(),
+                mod_scope.entities.clone(),
             )
             .await
             .unwrap_or(0);
@@ -1460,4 +1538,103 @@ async fn interact_system_vessel(
     let res = execute_tool(&st.db, &st.hindsight, id, "system_traffic", &body).await?;
     let parsed: Value = serde_json::from_str(&res.output_json)?;
     Ok(Json(parsed))
+}
+
+// ── Port Ops (Refuel, Docking Fees) & Manual Maintenance Payment ──────────
+
+async fn refuel_ship_handler(
+    State(st): State<AppState>,
+    Path((id, ship_id)): Path<(Uuid, Uuid)>,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("action".into(), json!("refuel"));
+        obj.insert("ship_id".into(), json!(ship_id.to_string()));
+    }
+    let res = execute_tool(&st.db, &st.hindsight, id, "port_ops", &body).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+async fn dock_ship_handler(
+    State(st): State<AppState>,
+    Path((id, ship_id)): Path<(Uuid, Uuid)>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let mut payload = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("action".into(), json!("dock"));
+        obj.insert("ship_id".into(), json!(ship_id.to_string()));
+    }
+    let res = execute_tool(&st.db, &st.hindsight, id, "port_ops", &payload).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
+
+async fn pay_maintenance_handler(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let camp = st
+        .db
+        .get_campaign(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Campaign not found"))?;
+    let chars = st.db.list_characters(id).await?;
+    let mut ships = st.db.list_ships(id).await?;
+    let accounts = st.db.list_accounts(id).await?;
+    let company = accounts
+        .iter()
+        .find(|a| a.kind == AccountKind::Company)
+        .or_else(|| accounts.first())
+        .ok_or_else(|| anyhow::anyhow!("No account found"))?;
+
+    let crew_salaries_cr: i64 = chars
+        .iter()
+        .filter(|r| r.character.kind == CharacterKind::Crew)
+        .map(|r| r.character.salary_cr)
+        .sum();
+    let occupants = chars
+        .iter()
+        .filter(|r| matches!(r.character.kind, CharacterKind::Player | CharacterKind::Crew))
+        .count() as u32;
+
+    let mut total_paid = 0i64;
+    let mut ship_lines = Vec::new();
+    for (idx, ship) in ships.iter_mut().enumerate() {
+        let occ = if idx == 0 { occupants } else { 0 };
+        let sal = if idx == 0 { crew_salaries_cr } else { 0 };
+        let rc = compute_running_costs(&ship.spec, ship.mortgage.as_ref(), occ, 0, sal);
+        if rc.total_cr > 0 {
+            st.db
+                .post_transaction(
+                    id,
+                    company.id,
+                    &camp.date.format_date_only(),
+                    -rc.total_cr,
+                    "maintenance_period",
+                    &format!(
+                        "4-wk Maintenance Period for {} (Mortgage Cr{}, Maint Cr{}, LifeSupp Cr{}, Salaries Cr{})",
+                        ship.name, rc.mortgage_cr, rc.maintenance_cr, rc.life_support_cr, rc.crew_salaries_cr
+                    ),
+                    "Imperial Bank / Crew Payroll",
+                )
+                .await?;
+            total_paid += rc.total_cr;
+        }
+        if let Some(m) = &mut ship.mortgage
+            && m.active
+            && m.periods_paid < m.periods_total
+        {
+            m.periods_paid += 1;
+        }
+        ship.skipped_maintenance_periods = 0;
+        st.db.save_ship(ship).await?;
+        ship_lines.push(json!({ "ship": ship.name, "paid_cr": rc.total_cr, "breakdown": rc }));
+    }
+
+    Ok(Json(json!({
+        "total_paid_cr": total_paid,
+        "ships": ship_lines
+    })))
 }

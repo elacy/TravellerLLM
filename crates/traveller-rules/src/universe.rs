@@ -119,6 +119,127 @@ pub fn parse_uwp(raw: &str) -> Result<Uwp, UwpError> {
     })
 }
 
+/// Core 2022 p. 252 Government Type names for UWP hex digit `0..=F`.
+pub fn government_name(code: u8) -> &'static str {
+    match code {
+        0 => "None / Anarchy",
+        1 => "Company / Corporation",
+        2 => "Participating Democracy",
+        3 => "Self-Perpetuating Oligarchy",
+        4 => "Representative Democracy",
+        5 => "Feudal Technocracy",
+        6 => "Captive Government",
+        7 => "Balkanisation",
+        8 => "Civil Service Bureaucracy",
+        9 => "Impersonal Bureaucracy",
+        10 => "Charismatic Dictator",
+        11 => "Non-Charismatic Leader",
+        12 => "Charismatic Oligarchy",
+        13 => "Religious Dictatorship",
+        14 => "Religious Autocracy",
+        _ => "Totalitarian Oligarchy",
+    }
+}
+
+/// Canonical Third Imperium / Charted Space polity names from TravellerMap allegiance codes.
+pub fn polity_name(allegiance: &str) -> &'static str {
+    let a = allegiance.trim().to_ascii_uppercase();
+    if a.starts_with("IM") {
+        "Third Imperium"
+    } else if a.starts_with("ZH") {
+        "Zhodani Consulate"
+    } else if a.starts_with("VA") {
+        "Vargr Extents"
+    } else if a.starts_with("SW") {
+        "Sword Worlds Confederation"
+    } else if a.starts_with("AS") {
+        "Aslan Hierate"
+    } else if a.starts_with("SO") {
+        "Solomani Confederation"
+    } else if a.starts_with("KK") {
+        "Two Thousand Worlds (K'kree)"
+    } else if a.starts_with("HI") {
+        "Hive Federation"
+    } else if a.starts_with("DR") {
+        "Kingdom of Drinax"
+    } else if a.starts_with("DA") {
+        "Darrian Confederation"
+    } else {
+        "Independent / Non-Aligned"
+    }
+}
+
+fn slugify_tag(s: &str) -> String {
+    let raw: String = s
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    raw.split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Hierarchical Hindsight spatial & political tags for a star system so memories relevant
+/// to a region of space, polity/allegiance, or government type bubble up automatically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpatialMemoryScope {
+    pub local_tags: Vec<String>,
+    pub polity_tags: Vec<String>,
+    pub all_tags: Vec<String>,
+    pub entities: Vec<(String, String)>, // (name, entity_type)
+}
+
+pub fn build_spatial_memory_scope(
+    system_name: &str,
+    sector_name: Option<&str>,
+    uwp: &Uwp,
+    allegiance: &str,
+) -> SpatialMemoryScope {
+    let mut local_tags = vec![format!("system:{}", slugify_tag(system_name))];
+    let mut entities = vec![(system_name.to_string(), "location".to_string())];
+
+    if let Some(sec) = sector_name
+        && !sec.trim().is_empty()
+    {
+        local_tags.push(format!("sector:{}", slugify_tag(sec)));
+        entities.push((sec.to_string(), "region".to_string()));
+    }
+
+    let polity = polity_name(allegiance);
+    let gov = government_name(uwp.government);
+    let law_band = if uwp.law_level >= 8 {
+        "law:high"
+    } else if uwp.law_level >= 4 {
+        "law:moderate"
+    } else {
+        "law:low"
+    };
+
+    let polity_tags = vec![
+        format!("polity:{}", slugify_tag(polity)),
+        format!("gov:{:x}-{}", uwp.government, slugify_tag(gov)),
+        law_band.to_string(),
+    ];
+    entities.push((polity.to_string(), "polity".to_string()));
+    entities.push((gov.to_string(), "government".to_string()));
+
+    let mut all_tags = Vec::with_capacity(local_tags.len() + polity_tags.len() + uwp.trade_codes.len());
+    all_tags.extend(local_tags.iter().cloned());
+    all_tags.extend(polity_tags.iter().cloned());
+    for tc in &uwp.trade_codes {
+        all_tags.push(format!("tc:{}", tc.to_lowercase()));
+    }
+
+    SpatialMemoryScope {
+        local_tags,
+        polity_tags,
+        all_tags,
+        entities,
+    }
+}
+
 /// Parsec distance between two TravellerMap hexes `(x1, y1)` and `(x2, y2)` in global odd-q offset coordinates.
 pub fn hex_distance(x1: i32, y1: i32, x2: i32, y2: i32) -> i32 {
     let to_cube = |col: i32, row: i32| -> (i32, i32, i32) {

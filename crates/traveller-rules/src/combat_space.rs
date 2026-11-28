@@ -215,23 +215,49 @@ pub struct MissileSalvo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpaceCombatShip {
+    #[serde(default = "Uuid::new_v4")]
     pub ship_id: Uuid,
     pub name: String,
     pub side: String, // "party" or "hostile"
+    #[serde(default = "default_tonnage")]
     pub tonnage: u32,
+    #[serde(default = "default_tl")]
     pub tl: u8,
     pub hull_max: i32,
     pub hull_current: i32,
+    #[serde(default)]
     pub armor: i32,
+    #[serde(default = "default_thrust")]
     pub thrust_max: u8,
+    #[serde(default)]
     pub thrust_remaining: u8,
+    #[serde(default)]
     pub evasive_dm: i32,
+    #[serde(default)]
     pub aid_gunners_dm: i32,
+    #[serde(default = "default_power")]
     pub power_available: i32,
+    #[serde(default)]
     pub sensor_lock_targets: Vec<Uuid>,
+    #[serde(default)]
     pub crits: BTreeMap<CritLocation, u8>,
+    #[serde(default)]
     pub initiative: i32,
+    #[serde(default)]
     pub last_ten_pct_threshold: i32,
+}
+
+fn default_tonnage() -> u32 {
+    200
+}
+fn default_tl() -> u8 {
+    12
+}
+fn default_thrust() -> u8 {
+    2
+}
+fn default_power() -> i32 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -733,4 +759,206 @@ pub fn advance_space_round<R: Rng + ?Sized>(rng: &mut R, state: &mut SpaceCombat
     events.push(format!("--- Space Combat Round {} (Maneuver Step) ---", state.round));
     state.log.extend(events.clone());
     events
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpaceAiActionLog {
+    pub ship_id: Uuid,
+    pub ship_name: String,
+    pub tactical_stance: String,
+    pub actions: Vec<String>,
+    pub hull_damage_dealt: i32,
+    pub crits_inflicted: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpaceAiTurnReport {
+    pub round: u32,
+    pub actions: Vec<SpaceAiActionLog>,
+    pub summary: String,
+}
+
+/// Autonomous High Guard 2024 Tactical AI for hostile ships: evaluates hull integrity,
+/// range band, thrust pool, incoming player missiles, sensor locks, and weapons to decide
+/// whether to close/evade/flee, jam incoming missiles, acquire sensor lock, fire turrets,
+/// or launch missile salvos.
+pub fn execute_space_ai_turn<R: Rng + ?Sized>(
+    rng: &mut R,
+    state: &mut SpaceCombatState,
+    player_sandcasters: u8,
+    player_gunner_skill: i32,
+) -> SpaceAiTurnReport {
+    let hostile_ids: Vec<Uuid> = state
+        .ships
+        .iter()
+        .filter(|s| s.side != "party" && s.hull_current > 0)
+        .map(|s| s.ship_id)
+        .collect();
+
+    let mut report_actions = Vec::new();
+
+    for hid in hostile_ids {
+        // Pick primary surviving party target (lowest hull % first to focus fire, else first alive)
+        let target_id = match state
+            .ships
+            .iter()
+            .filter(|s| s.side == "party" && s.hull_current > 0)
+            .min_by_key(|s| (s.hull_current * 100) / s.hull_max.max(1))
+            .map(|s| s.ship_id)
+        {
+            Some(id) => id,
+            None => break,
+        };
+
+        let Some(ship) = state.ships.iter().find(|s| s.ship_id == hid).cloned() else {
+            continue;
+        };
+        let hull_pct = (ship.hull_current * 100) / ship.hull_max.max(1);
+        let mut ship_actions = Vec::new();
+        let mut dmg_dealt = 0;
+        let mut crits_dealt = 0;
+
+        let stance = if hull_pct < 30 {
+            "evasive_retreat"
+        } else if matches!(state.range_band, SpaceRangeBand::VeryLong | SpaceRangeBand::Distant) {
+            "closing_engagement"
+        } else if hull_pct < 65 {
+            "defensive_skirmish"
+        } else {
+            "aggressive_assault"
+        };
+
+        // 1. Maneuver Thrust Pool decision
+        if ship.thrust_remaining > 0 {
+            let (t_range, t_evade, aid) = match stance {
+                "evasive_retreat" => {
+                    let ev = (ship.thrust_remaining / 2).max(1).min(ship.thrust_remaining);
+                    let rng_t = i32::from(ship.thrust_remaining.saturating_sub(ev));
+                    (rng_t, ev, false) // open range (+) & evade
+                }
+                "closing_engagement" => {
+                    let close_t = -(i32::from(ship.thrust_remaining.saturating_sub(1).max(1)));
+                    let ev = if ship.thrust_remaining >= 2 { 1 } else { 0 };
+                    (close_t, ev, false) // close range (-)
+                }
+                "defensive_skirmish" => {
+                    let ev = (ship.thrust_remaining / 2).max(1);
+                    let aid = ship.thrust_remaining > ev;
+                    (0, ev, aid)
+                }
+                _ => {
+                    let ev = if ship.thrust_remaining >= 3 { 1 } else { 0 };
+                    let aid = ship.thrust_remaining > ev;
+                    (0, ev, aid)
+                }
+            };
+            if let Ok(msg) = allocate_maneuver_thrust(rng, state, hid, t_range, t_evade, 1, aid) {
+                ship_actions.push(msg);
+            }
+        }
+
+        // 2. EW Defense vs incoming player missile salvos targeting this ship
+        let incoming_salvo = state
+            .active_missiles
+            .iter()
+            .find(|m| m.target_ship_id == hid && !m.ew_attempted_this_round)
+            .map(|m| m.id);
+        if let Some(salvo_id) = incoming_salvo
+            && let Ok((ew_roll, destroyed)) = ew_jam_missiles(rng, state, salvo_id, 1, 1)
+        {
+            ship_actions.push(format!(
+                "EW countermeasure roll {} ({} -> jammed {} missile(s))",
+                ew_roll.total,
+                if ew_roll.success { "SUCCESS" } else { "FAIL" },
+                destroyed
+            ));
+        }
+
+        // 3. Acquire Sensor Lock if not locked on target
+        let already_locked = state
+            .ships
+            .iter()
+            .find(|s| s.ship_id == hid)
+            .map(|s| s.sensor_lock_targets.contains(&target_id))
+            .unwrap_or(false);
+        if !already_locked
+            && let Ok(lock_roll) = acquire_sensor_lock(rng, state, hid, target_id, 1, 1)
+        {
+            ship_actions.push(format!(
+                "Sensor Lock attempt: {} ({})",
+                lock_roll.total,
+                if lock_roll.success { "LOCKED (+2 DM)" } else { "no lock" }
+            ));
+        }
+
+        // 4. Offensive Weapon Decision: Missiles at Long+ range, or linked Pulse/Beam Laser fire
+        let use_missiles = matches!(
+            state.range_band,
+            SpaceRangeBand::Long | SpaceRangeBand::VeryLong | SpaceRangeBand::Distant
+        ) && state.round.is_multiple_of(2);
+
+        if use_missiles {
+            let count = if ship.tonnage >= 400 { 4 } else { 2 };
+            let salvo = launch_missile_salvo(state, hid, target_id, count, ship.tl);
+            ship_actions.push(format!(
+                "Launched {count}x Smart TL{} missiles (impact in {} rd(s))",
+                ship.tl, salvo.rounds_to_impact
+            ));
+        } else {
+            let linked = if ship.tonnage >= 400 { 3 } else { 2 };
+            let weapon = if matches!(state.range_band, SpaceRangeBand::Adjacent | SpaceRangeBand::Close | SpaceRangeBand::Short) {
+                "Beam Laser"
+            } else {
+                "Pulse Laser"
+            };
+            if let Ok(res) = resolve_space_attack(
+                rng,
+                state,
+                &SpaceWeaponAttackInput {
+                    attacker_ship_id: hid,
+                    target_ship_id: target_id,
+                    weapon_name: weapon.to_string(),
+                    linked_count: linked,
+                    damage_dice: 2,
+                    is_laser: true,
+                    gunner_skill: if ship.tonnage >= 400 { 2 } else { 1 },
+                    gunner_dex_dm: 1,
+                    fire_control_dm: 1,
+                    sandcaster_count_defending: player_sandcasters,
+                    defender_gunner_skill: player_gunner_skill,
+                    called_shot: None,
+                },
+            ) {
+                dmg_dealt += res.net_hull_damage;
+                crits_dealt += res.crits_inflicted.len();
+                ship_actions.push(res.summary);
+            }
+        }
+
+        report_actions.push(SpaceAiActionLog {
+            ship_id: hid,
+            ship_name: ship.name,
+            tactical_stance: stance.to_string(),
+            actions: ship_actions,
+            hull_damage_dealt: dmg_dealt,
+            crits_inflicted: crits_dealt,
+        });
+    }
+
+    let summary = if report_actions.is_empty() {
+        "No surviving hostile vessels able to act.".to_string()
+    } else {
+        let total_dmg: i32 = report_actions.iter().map(|a| a.hull_damage_dealt).sum();
+        let total_crits: usize = report_actions.iter().map(|a| a.crits_inflicted).sum();
+        format!(
+            "Enemy AI executed {} vessel turn(s): {total_dmg} total hull damage, {total_crits} crit(s) inflicted.",
+            report_actions.len()
+        )
+    };
+
+    SpaceAiTurnReport {
+        round: state.round,
+        actions: report_actions,
+        summary,
+    }
 }

@@ -364,3 +364,176 @@ pub fn summarize_cargo_tons(cargo_items: &[BTreeMap<String, serde_json::Value>])
         .filter_map(|c| c.get("tons").and_then(|v| v.as_f64()))
         .sum()
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetBrokerSummary {
+    pub max_broker_skill: i32,
+    pub broker_source: String,
+    pub max_steward_skill: i32,
+    pub steward_source: String,
+    pub contributors: Vec<(String, i32)>,
+}
+
+fn effective_skill_with_augments(c: &crate::character::Character, skill_name: &str) -> (i32, String) {
+    let raw = c.raw_skill_level(skill_name);
+    let mut best_expert: Option<u8> = None;
+    for aug in &c.augments {
+        let loaded = match aug {
+            crate::character::Augment::NeuralJack { loaded_expert, .. }
+            | crate::character::Augment::WaferJack { loaded_expert, .. } => loaded_expert,
+            _ => continue,
+        };
+        for sw in loaded {
+            if sw.active && sw.skill.eq_ignore_ascii_case(skill_name) {
+                best_expert = Some(best_expert.map_or(sw.rating, |b| b.max(sw.rating)));
+            }
+        }
+    }
+    let has_skill_aug = raw.is_some()
+        && c.augments.iter().any(|a| {
+            matches!(a, crate::character::Augment::SkillAugmentation { skill: s } if s.eq_ignore_ascii_case(skill_name))
+        });
+
+    let mut eff = match (raw, best_expert) {
+        (Some(lvl), Some(_)) => lvl + 1, // Core p. 112: Expert grants DM+1 if skill possessed
+        (Some(lvl), None) => lvl,
+        (None, Some(r)) => i32::from(r).saturating_sub(1), // Unskilled uses Bandwidth - 1
+        (None, None) => 0,
+    };
+    if has_skill_aug {
+        eff += 1;
+    }
+
+    let suffix = match (best_expert, has_skill_aug) {
+        (Some(r), true) => format!(" (Expert/{r} + Skill Aug)"),
+        (Some(r), false) => format!(" (Expert/{r})"),
+        (None, true) => " (Skill Aug)".into(),
+        (None, false) => String::new(),
+    };
+    let species_tag = if c.species.to_lowercase().contains("robot") {
+        " [Robot]"
+    } else {
+        ""
+    };
+    (eff, format!("{}{species_tag}{suffix}", c.name))
+}
+
+fn extract_item_skill(item: &serde_json::Value, skill_key: &str) -> Option<(String, i32)> {
+    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("Item");
+    let stats = item.get("stats").unwrap_or(item);
+    let lower_key = skill_key.to_lowercase();
+
+    // 1. Direct numeric stat e.g. stats.broker = 2 or stats.broker_skill = 2
+    for field in [lower_key.as_str(), "broker_skill", "steward_skill"] {
+        if field.starts_with(&lower_key)
+            && let Some(val) = stats.get(field).and_then(|v| v.as_i64())
+        {
+            return Some((format!("{name} [Robot/Gear]"), val as i32));
+        }
+    }
+
+    // 2. Nested skills map e.g. stats.skills = {"Broker": 3}
+    if let Some(obj) = stats.get("skills").and_then(|v| v.as_object()) {
+        for (k, v) in obj {
+            if k.to_lowercase() == lower_key
+                && let Some(lvl) = v.as_i64()
+            {
+                return Some((format!("{name} [Robot/Gear]"), lvl as i32));
+            }
+        }
+    }
+
+    // 3. Parse text field e.g. stats.effect or stats.software containing "Broker-2" or "Broker 2"
+    for field in ["effect", "skills", "software", "traits", "notes"] {
+        if let Some(s) = stats.get(field).and_then(|v| v.as_str()) {
+            let sl = s.to_lowercase();
+            if let Some(pos) = sl.find(&lower_key) {
+                let tail = &sl[pos + lower_key.len()..];
+                let num_str: String = tail
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(lvl) = num_str.parse::<i32>() {
+                    return Some((format!("{name} [Robot/Gear]"), lvl));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Compute the maximum effective Broker & Steward skill across EVERY member of the player's fleet:
+/// Player Character, all Hired Crew (including Robot crew & Neural/Wafer Jack Expert software),
+/// AND all owned Robot/Drone/Software equipment carried by characters or aboard fleet ships.
+pub fn compute_fleet_max_broker(
+    roster: &[(&crate::character::Character, &[serde_json::Value])],
+    fleet_assets: &[serde_json::Value],
+) -> FleetBrokerSummary {
+    let mut best_broker = 0;
+    let mut broker_source = "Default (Untrained 0)".to_string();
+    let mut best_steward = 0;
+    let mut steward_source = "Default (Untrained 0)".to_string();
+    let mut contributors: Vec<(String, i32)> = Vec::new();
+
+    for &(ch, equip) in roster {
+        // Only count Player + Hired Crew (not unrelated story NPCs!)
+        if ch.kind == crate::character::CharacterKind::Npc {
+            continue;
+        }
+        let (b_lvl, b_src) = effective_skill_with_augments(ch, "Broker");
+        contributors.push((b_src.clone(), b_lvl));
+        if b_lvl > best_broker {
+            best_broker = b_lvl;
+            broker_source = b_src;
+        }
+
+        let (s_lvl, s_src) = effective_skill_with_augments(ch, "Steward");
+        if s_lvl > best_steward {
+            best_steward = s_lvl;
+            steward_source = s_src;
+        }
+
+        // Check robots / broker drones / software in character equipment
+        for item in equip {
+            if let Some((src, lvl)) = extract_item_skill(item, "Broker") {
+                contributors.push((src.clone(), lvl));
+                if lvl > best_broker {
+                    best_broker = lvl;
+                    broker_source = src;
+                }
+            }
+            if let Some((src, lvl)) = extract_item_skill(item, "Steward")
+                && lvl > best_steward
+            {
+                best_steward = lvl;
+                steward_source = src;
+            }
+        }
+    }
+
+    // Check robots / shipboard trade bots stored in ship cargo or fleet assets
+    for asset in fleet_assets {
+        if let Some((src, lvl)) = extract_item_skill(asset, "Broker") {
+            contributors.push((src.clone(), lvl));
+            if lvl > best_broker {
+                best_broker = lvl;
+                broker_source = src;
+            }
+        }
+        if let Some((src, lvl)) = extract_item_skill(asset, "Steward")
+            && lvl > best_steward
+        {
+            best_steward = lvl;
+            steward_source = src;
+        }
+    }
+
+    FleetBrokerSummary {
+        max_broker_skill: best_broker,
+        broker_source,
+        max_steward_skill: best_steward,
+        steward_source,
+        contributors,
+    }
+}

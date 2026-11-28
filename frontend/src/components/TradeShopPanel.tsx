@@ -25,12 +25,19 @@ const CATEGORIES = [
 export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Props) {
   const [subTab, setSubTab] = useState<"trade" | "shop">("trade");
 
-  // Trade state
+  // Trade state (automatically defaults to MAX Broker & Steward across entire fleet incl. robots!)
   const [destSystem, setDestSystem] = useState("Efate");
   const [parsecs, setParsecs] = useState(1);
-  const [brokerSkill, setBrokerSkill] = useState(1);
-  const [stewardSkill, setStewardSkill] = useState(0);
+  const [brokerSkill, setBrokerSkill] = useState(snapshot.fleet_broker?.max_broker_skill ?? 1);
+  const [stewardSkill, setStewardSkill] = useState(snapshot.fleet_broker?.max_steward_skill ?? 0);
   const [includeIllegal, setIncludeIllegal] = useState(false);
+
+  useEffect(() => {
+    if (snapshot.fleet_broker) {
+      setBrokerSkill(snapshot.fleet_broker.max_broker_skill);
+      setStewardSkill(snapshot.fleet_broker.max_steward_skill);
+    }
+  }, [snapshot.fleet_broker]);
   const [market, setMarket] = useState<Record<string, unknown> | null>(null);
   const [tradeMsg, setTradeMsg] = useState<string | null>(null);
   const [buyTons, setBuyTons] = useState<Record<number, number>>({});
@@ -236,6 +243,18 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
             <div className="font-semibold text-cyan-300 flex items-center gap-1">
               <Store className="w-3.5 h-3.5" /> {snapshot.campaign.current_system_name} Starport Trade Exchange
             </div>
+            {snapshot.fleet_broker && (
+              <div className="bg-cyan-950/40 border border-cyan-800/60 rounded px-2 py-1 text-[10px] text-cyan-200 flex items-center justify-between gap-2">
+                <span>
+                  Fleet Max Broker: <strong>Broker-{snapshot.fleet_broker.max_broker_skill}</strong> ({snapshot.fleet_broker.broker_source})
+                </span>
+                {Array.isArray(market?.trade_codes) && (
+                  <span className="font-mono text-amber-300">
+                    Codes: {(market.trade_codes as string[]).join(" ") || "None"}
+                  </span>
+                )}
+              </div>
+            )}
             <div className="grid grid-cols-2 gap-1.5">
               <label className="block">
                 <span className="text-[10px] text-slate-400">Destination World</span>

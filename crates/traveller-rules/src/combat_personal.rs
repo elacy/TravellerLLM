@@ -67,21 +67,43 @@ pub struct PersonalWeapon {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonalCombatant {
+    #[serde(default = "Uuid::new_v4")]
     pub character_id: Uuid,
     pub name: String,
     pub side: String, // "party" or "hostile"
+    #[serde(default)]
     pub initiative: i32,
+    #[serde(default)]
     pub next_round_init_penalty: i32,
+    #[serde(default)]
     pub armor: i32,
+    #[serde(default)]
     pub cover_dm: i32, // 0, -2 partial, -4 full
+    #[serde(default)]
     pub aim_bonus: i32,
+    #[serde(default = "default_range_band")]
     pub range_band: PersonalRangeBand,
     pub weapon: PersonalWeapon,
+    #[serde(default = "default_true_b")]
     pub conscious: bool,
+    #[serde(default = "default_true_b")]
     pub alive: bool,
+    #[serde(default = "default_stat")]
     pub str_cur: i32,
+    #[serde(default = "default_stat")]
     pub dex_cur: i32,
+    #[serde(default = "default_stat")]
     pub end_cur: i32,
+}
+
+fn default_range_band() -> PersonalRangeBand {
+    PersonalRangeBand::Medium
+}
+fn default_true_b() -> bool {
+    true
+}
+fn default_stat() -> i32 {
+    7
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,4 +353,139 @@ pub fn next_personal_round(state: &mut PersonalCombatState) {
     }
     state.combatants.sort_by_key(|a| std::cmp::Reverse(a.initiative));
     state.log.push(format!("--- Round {} ---", state.round));
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonalAiActionLog {
+    pub attacker_id: Uuid,
+    pub attacker_name: String,
+    pub decision: String,
+    pub net_damage: i32,
+    pub target_id: Option<Uuid>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonalAiTurnReport {
+    pub round: u32,
+    pub actions: Vec<PersonalAiActionLog>,
+    pub summary: String,
+}
+
+/// Autonomous Core 2022 Personal Combat Tactical AI: hostile combatants reload when empty,
+/// seek cover when wounded (END == 0), pick targets, choose burst vs single fire, and counterattack.
+pub fn execute_personal_ai_turn<R: Rng + ?Sized>(
+    rng: &mut R,
+    state: &mut PersonalCombatState,
+    party_reaction: ReactionKind,
+    party_reaction_dm: i32,
+) -> PersonalAiTurnReport {
+    let hostile_ids: Vec<Uuid> = state
+        .combatants
+        .iter()
+        .filter(|c| c.side != "party" && c.alive && c.conscious)
+        .map(|c| c.character_id)
+        .collect();
+
+    let mut actions = Vec::new();
+    for hid in hostile_ids {
+        let Some(h_idx) = state.combatants.iter().position(|c| c.character_id == hid) else {
+            continue;
+        };
+        let h_name = state.combatants[h_idx].name.clone();
+
+        // 1. Reload if out of ammo
+        if state.combatants[h_idx].weapon.magazine_max > 0
+            && state.combatants[h_idx].weapon.magazine_current == 0
+        {
+            let max_m = state.combatants[h_idx].weapon.magazine_max;
+            state.combatants[h_idx].weapon.magazine_current = max_m;
+            let detail = format!("{h_name} dives behind cover and reloads ({max_m} rounds).");
+            state.combatants[h_idx].cover_dm = state.combatants[h_idx].cover_dm.min(-2);
+            state.log.push(detail.clone());
+            actions.push(PersonalAiActionLog {
+                attacker_id: hid,
+                attacker_name: h_name,
+                decision: "reload_and_cover".into(),
+                net_damage: 0,
+                target_id: None,
+                detail,
+            });
+            continue;
+        }
+
+        // 2. If wounded (END == 0), seek cover first (-2 cover DM) before returning fire
+        let wounded = state.combatants[h_idx].end_cur <= 0;
+        if wounded && state.combatants[h_idx].cover_dm == 0 {
+            state.combatants[h_idx].cover_dm = -2;
+            state.log.push(format!("{h_name} is wounded and takes partial cover (DM-2)!"));
+        }
+
+        // 3. Pick highest-threat conscious party target
+        let target_id = match state
+            .combatants
+            .iter()
+            .filter(|c| c.side == "party" && c.alive && c.conscious)
+            .max_by_key(|c| c.dex_cur + c.end_cur)
+            .map(|c| c.character_id)
+        {
+            Some(id) => id,
+            None => break,
+        };
+
+        let burst = state.combatants[h_idx].weapon.auto_rating > 0
+            && state.combatants[h_idx].weapon.magazine_current
+                >= u32::from(state.combatants[h_idx].weapon.auto_rating)
+            && !wounded;
+
+        match resolve_personal_attack(
+            rng,
+            state,
+            None,
+            &PersonalAttackInput {
+                attacker_id: hid,
+                defender_id: target_id,
+                burst_mode: burst,
+                reaction: party_reaction,
+                defender_reaction_dm: party_reaction_dm,
+                extra_dm: 1, // trained NPC combatant Gun Combat-1 baseline
+            },
+        ) {
+            Ok(res) => {
+                actions.push(PersonalAiActionLog {
+                    attacker_id: hid,
+                    attacker_name: h_name,
+                    decision: if burst { "burst_fire".into() } else if wounded { "cover_and_fire".into() } else { "aimed_shot".into() },
+                    net_damage: res.net_damage,
+                    target_id: Some(target_id),
+                    detail: res.summary,
+                });
+            }
+            Err(e) => {
+                actions.push(PersonalAiActionLog {
+                    attacker_id: hid,
+                    attacker_name: h_name,
+                    decision: "hold".into(),
+                    net_damage: 0,
+                    target_id: None,
+                    detail: e.to_string(),
+                });
+            }
+        }
+    }
+
+    let total_dmg: i32 = actions.iter().map(|a| a.net_damage).sum();
+    let summary = if actions.is_empty() {
+        "No conscious hostile combatants left to fight back.".into()
+    } else {
+        format!(
+            "Enemy AI resolved {} hostile action(s) dealing {total_dmg} total net damage.",
+            actions.len()
+        )
+    };
+    PersonalAiTurnReport {
+        round: state.round,
+        actions,
+        summary,
+    }
 }

@@ -5,13 +5,14 @@ use traveller_db::Db;
 use traveller_rules::calendar::{compute_advance, roll_jump_duration_hours};
 use traveller_rules::character::{Characteristic, CharacterKind};
 use traveller_rules::combat_personal::{
-    next_personal_round, resolve_personal_attack, start_personal_combat, PersonalAttackInput,
-    PersonalCombatState, PersonalCombatant, PersonalRangeBand, PersonalWeapon, ReactionKind,
+    execute_personal_ai_turn, next_personal_round, resolve_personal_attack, start_personal_combat,
+    PersonalAttackInput, PersonalCombatState, PersonalCombatant, PersonalRangeBand, PersonalWeapon,
+    ReactionKind,
 };
 use traveller_rules::combat_space::{
     acquire_sensor_lock, advance_space_round, allocate_maneuver_thrust, ew_jam_missiles,
-    launch_missile_salvo, resolve_space_attack, start_space_combat, SpaceCombatShip,
-    SpaceCombatState, SpaceRangeBand, SpaceWeaponAttackInput,
+    execute_space_ai_turn, launch_missile_salvo, resolve_space_attack, start_space_combat,
+    SpaceCombatShip, SpaceCombatState, SpaceRangeBand, SpaceWeaponAttackInput,
 };
 use traveller_rules::commerce::{check_item_availability, AvailabilityInput, LegalityCategory};
 use traveller_rules::crew::generate_hiring_hall;
@@ -19,11 +20,14 @@ use traveller_rules::dice::{resolve_task, roll_d66, roll_nd6, Difficulty, Modifi
 use traveller_rules::finance::AccountKind;
 use traveller_rules::sensors::{resolve_sensor_detection, SensorContext, SensorDetectionInput};
 use traveller_rules::ship::{
-    compute_running_costs, roll_poor_maintenance, validate_ship, SensorGrade,
+    calculate_refuel_quote, compute_running_costs, fleet_max_jump_rating, jump_fuel_for_distance,
+    roll_berthing_fee, roll_poor_maintenance, validate_ship, RefuelMode, SensorGrade,
 };
-use traveller_rules::trade::{generate_world_market, roll_speculative_sale};
+use traveller_rules::trade::{compute_fleet_max_broker, generate_world_market, roll_speculative_sale};
 use traveller_rules::traffic::generate_system_traffic;
-use traveller_rules::universe::{parse_uwp, plan_jump_route, RouteNode};
+use traveller_rules::universe::{
+    build_spatial_memory_scope, hex_distance, parse_uwp, plan_jump_route, RouteNode,
+};
 use uuid::Uuid;
 
 use crate::hindsight::HindsightClient;
@@ -181,30 +185,46 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "personal_combat",
-            "description": "Core 2022 6-second personal combat tracker: start combat, resolve attacks (ammo, range, cover, aim, reactions, armor-AP, END->DEX->STR damage & unconsciousness/death), advance round, or end combat.",
+            "name": "port_ops",
+            "description": "Starport & fleet operations: refuel a ship (refined Cr500/t at Starport A/B, unrefined Cr100/t at A–D, free gas giant skimming with fuel scoops, or onboard fuel processor refining) and pay Core 2022 Starport Berthing / Docking Fees (1D x starport base + extra days).",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["start", "attack", "next_round", "end"]},
+                    "action": {"type": "string", "enum": ["refuel", "dock"]},
+                    "ship_id": {"type": "string", "description": "Optional ship UUID (defaults to lead ship)."},
+                    "mode": {"type": "string", "enum": ["refined", "unrefined", "gas_giant_skim", "process_onboard"], "default": "refined"},
+                    "tons": {"type": "number", "description": "Tons of fuel to add/process (omit to fill tanks)."},
+                    "extra_days": {"type": "integer", "default": 0, "description": "Extra berthing days beyond initial 6 days."}
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "personal_combat",
+            "description": "Core 2022 6-second personal combat tracker: start combat, resolve attacks (ammo, range, cover, aim, reactions, armor-AP, END->DEX->STR damage & unconsciousness/death), run autonomous enemy AI counterattacks (`ai_turn`), advance round, or end combat.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["start", "attack", "ai_turn", "next_round", "end"]},
                     "combatants": {"type": "array", "items": {"type": "object"}},
                     "attacker_id": {"type": "string"},
                     "defender_id": {"type": "string"},
                     "burst_mode": {"type": "boolean", "default": false},
                     "reaction": {"type": "string", "enum": ["none", "dodge", "parry", "dive_for_cover"], "default": "none"},
                     "defender_reaction_dm": {"type": "integer", "default": 0},
-                    "extra_dm": {"type": "integer", "default": 0}
+                    "extra_dm": {"type": "integer", "default": 0},
+                    "auto_ai_turn": {"type": "boolean", "default": false}
                 },
                 "required": ["action"]
             }
         }),
         json!({
             "name": "space_combat",
-            "description": "Core 2022 / High Guard 2024 6-minute spacecraft combat: start combat, allocate Thrust Pool (range shift, evasive action, aid gunners), fire linked turrets/barbettes (sandcasters, armor, 2D x Severity 1-6 Critical Hits on Effect 6+ and 10% hull loss), launch missiles, EW jam missiles, Sensor Lock (+2), advance round, or end combat.",
+            "description": "Core 2022 / High Guard 2024 6-minute spacecraft combat: start combat, allocate Thrust Pool (range shift, evasive action, aid gunners), fire linked turrets/barbettes (sandcasters, armor, 2D x Severity 1-6 Critical Hits on Effect 6+ and 10% hull loss), launch missiles, EW jam missiles, Sensor Lock (+2), run autonomous enemy fleet Tactical AI (`ai_turn`), advance round, or end combat.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["start", "maneuver", "fire", "launch_missiles", "ew_jam", "sensor_lock", "next_round", "end"]},
+                    "action": {"type": "string", "enum": ["start", "maneuver", "fire", "launch_missiles", "ew_jam", "sensor_lock", "ai_turn", "next_round", "end"]},
                     "range_band": {"type": "string", "enum": ["adjacent", "close", "short", "medium", "long", "very_long", "distant"], "default": "long"},
                     "ships": {"type": "array", "items": {"type": "object"}},
                     "ship_id": {"type": "string"},
@@ -225,7 +245,8 @@ pub fn tool_specs(hindsight_enabled: bool) -> Vec<Value> {
                     "smart_tl": {"type": "integer", "default": 12},
                     "salvo_id": {"type": "string"},
                     "sensors_skill": {"type": "integer", "default": 1},
-                    "edu_dm": {"type": "integer", "default": 0}
+                    "edu_dm": {"type": "integer", "default": 0},
+                    "auto_ai_turn": {"type": "boolean", "default": false}
                 },
                 "required": ["action"]
             }
@@ -622,6 +643,10 @@ pub async fn execute_tool(
                     })
                 }
                 "jump_to" => {
+                    let camp = db
+                        .get_campaign(campaign_id)
+                        .await?
+                        .context("Campaign not found")?;
                     let to_name = input
                         .get("to_system")
                         .and_then(|v| v.as_str())
@@ -631,28 +656,63 @@ pub async fn execute_tool(
                         .await?
                         .with_context(|| format!("Destination system '{to_name}' not found"))?;
 
-                    // Deduct jump fuel from active ship if present
+                    // Compute exact parsec distance from current system
+                    let parsecs: u8 = if let Some(origin) = db.get_system_by_name(&camp.current_system_name).await? {
+                        hex_distance(origin.global_x, origin.global_y, dest.global_x, dest.global_y)
+                            .clamp(1, 20) as u8
+                    } else {
+                        1
+                    };
+
+                    // Enforce FLEET jump constraint: fleet can only jump the distance of the LOWEST Jump Rating ship!
                     let mut ships = db.list_ships(campaign_id).await?;
-                    let mut fuel_burned = 0.0;
-                    if let Some(ship) = ships.first_mut() {
-                        let req_fuel =
-                            f64::from(ship.spec.tonnage) * 0.10 * f64::from(ship.spec.jump_rating.max(1));
-                        let total_fuel = ship.fuel_refined + ship.fuel_unrefined;
-                        if total_fuel + 0.01 < req_fuel {
+                    let mut fuel_burned_total = 0.0;
+                    let mut fleet_fuel_log = Vec::new();
+                    if !ships.is_empty() {
+                        let specs: Vec<_> = ships.iter().map(|s| &s.spec).collect();
+                        let fleet_max_j = fleet_max_jump_rating(&specs);
+                        if parsecs > fleet_max_j {
+                            let bottleneck = ships
+                                .iter()
+                                .min_by_key(|s| s.spec.jump_rating)
+                                .map(|s| format!("{} (J-{})", s.name, s.spec.jump_rating))
+                                .unwrap_or_else(|| format!("J-{fleet_max_j}"));
                             anyhow::bail!(
-                                "{} needs {:.1}t fuel for Jump-{}, only has {:.1}t!",
-                                ship.name,
-                                req_fuel,
-                                ship.spec.jump_rating,
-                                total_fuel
+                                "Fleet cannot jump {parsecs} parsecs to {}: maximum fleet jump range is Jump-{fleet_max_j} (limited by lowest-jump ship {bottleneck}). Plot a multi-leg route instead!",
+                                dest.name
                             );
                         }
-                        let from_ref = ship.fuel_refined.min(req_fuel);
-                        ship.fuel_refined -= from_ref;
-                        ship.fuel_unrefined = (ship.fuel_unrefined - (req_fuel - from_ref)).max(0.0);
-                        ship.docked_system_name = dest.name.clone();
-                        db.save_ship(ship).await?;
-                        fuel_burned = req_fuel;
+
+                        // Pre-validate fuel across EVERY ship in the fleet before deducting
+                        for ship in &ships {
+                            let req_fuel = jump_fuel_for_distance(ship.spec.tonnage, parsecs);
+                            let total_fuel = ship.fuel_refined + ship.fuel_unrefined;
+                            if total_fuel + 0.01 < req_fuel {
+                                anyhow::bail!(
+                                    "Fleet ship {} needs {:.1}t fuel for a {parsecs}-parsec jump, only has {:.1}t! Refuel before jumping.",
+                                    ship.name,
+                                    req_fuel,
+                                    total_fuel
+                                );
+                            }
+                        }
+
+                        // Deduct fuel & move EVERY ship in the fleet together
+                        for ship in &mut ships {
+                            let req_fuel = jump_fuel_for_distance(ship.spec.tonnage, parsecs);
+                            let from_ref = ship.fuel_refined.min(req_fuel);
+                            ship.fuel_refined -= from_ref;
+                            ship.fuel_unrefined = (ship.fuel_unrefined - (req_fuel - from_ref)).max(0.0);
+                            ship.docked_system_name = dest.name.clone();
+                            db.save_ship(ship).await?;
+                            fuel_burned_total += req_fuel;
+                            fleet_fuel_log.push(json!({
+                                "ship": ship.name,
+                                "jump_rating": ship.spec.jump_rating,
+                                "fuel_burned_tons": req_fuel,
+                                "fuel_remaining_tons": ship.fuel_refined + ship.fuel_unrefined
+                            }));
+                        }
                     }
 
                     db.update_campaign_system(campaign_id, &dest.name, &dest.uwp, Some(dest.id))
@@ -688,8 +748,10 @@ pub async fn execute_tool(
                         output_json: serde_json::to_string(&json!({
                             "arrived_at": dest.name,
                             "uwp": dest.uwp,
+                            "parsecs_jumped": parsecs,
                             "arrived_system": dest,
-                            "fuel_burned_tons": fuel_burned,
+                            "fuel_burned_tons": fuel_burned_total,
+                            "fleet_fuel_log": fleet_fuel_log,
                             "time_advance": time_json,
                             "in_system_ship_count": stored_ships.len(),
                             "traffic_summary": traffic_report.summary,
@@ -715,6 +777,18 @@ pub async fn execute_tool(
 
             match action {
                 "market" => {
+                    let chars = db.list_characters(campaign_id).await?;
+                    let ships = db.list_ships(campaign_id).await?;
+                    let roster_refs: Vec<(&traveller_rules::character::Character, &[Value])> = chars
+                        .iter()
+                        .map(|r| (&r.character, r.equipment.as_slice()))
+                        .collect();
+                    let fleet_assets: Vec<Value> = ships
+                        .iter()
+                        .flat_map(|s| s.cargo.iter().cloned())
+                        .collect();
+                    let fleet_broker = compute_fleet_max_broker(&roster_refs, &fleet_assets);
+
                     let dest_name = input
                         .get("dest_system")
                         .and_then(|v| v.as_str())
@@ -725,8 +799,17 @@ pub async fn execute_tool(
                         origin_uwp.clone()
                     };
                     let parsecs = input.get("parsecs").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
-                    let broker = input.get("broker_skill").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
-                    let steward = input.get("steward_skill").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    // Automatically use MAX Broker & Steward across the entire fleet (including robots & Neural Jacks!)
+                    let broker = input
+                        .get("broker_skill")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v as i32).max(fleet_broker.max_broker_skill))
+                        .unwrap_or(fleet_broker.max_broker_skill);
+                    let steward = input
+                        .get("steward_skill")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v as i32).max(fleet_broker.max_steward_skill))
+                        .unwrap_or(fleet_broker.max_steward_skill);
                     let illegal = input.get("include_illegal").and_then(|v| v.as_bool()).unwrap_or(false);
 
                     let market = {
@@ -744,8 +827,14 @@ pub async fn execute_tool(
                             illegal,
                         )
                     };
+                    let mut market_val = serde_json::to_value(&market)?;
+                    if let Some(obj) = market_val.as_object_mut() {
+                        obj.insert("effective_broker_skill".into(), json!(broker));
+                        obj.insert("effective_steward_skill".into(), json!(steward));
+                        obj.insert("fleet_broker".into(), serde_json::to_value(&fleet_broker)?);
+                    }
                     Ok(ToolExecutionResult {
-                        output_json: serde_json::to_string(&market)?,
+                        output_json: serde_json::to_string(&market_val)?,
                         state_changed: false,
                     })
                 }
@@ -811,9 +900,24 @@ pub async fn execute_tool(
                     })
                 }
                 "sell_cargo" => {
-                    let d66 = input.get("d66").and_then(|v| v.as_u64()).context("d66 required")? as u8;
-                    let broker = input.get("broker_skill").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                    let chars = db.list_characters(campaign_id).await?;
                     let mut ships = db.list_ships(campaign_id).await?;
+                    let roster_refs: Vec<(&traveller_rules::character::Character, &[Value])> = chars
+                        .iter()
+                        .map(|r| (&r.character, r.equipment.as_slice()))
+                        .collect();
+                    let fleet_assets: Vec<Value> = ships
+                        .iter()
+                        .flat_map(|s| s.cargo.iter().cloned())
+                        .collect();
+                    let fleet_broker = compute_fleet_max_broker(&roster_refs, &fleet_assets);
+
+                    let d66 = input.get("d66").and_then(|v| v.as_u64()).context("d66 required")? as u8;
+                    let broker = input
+                        .get("broker_skill")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| (v as i32).max(fleet_broker.max_broker_skill))
+                        .unwrap_or(fleet_broker.max_broker_skill);
                     let ship = ships.first_mut().context("No ship owned")?;
                     let idx = ship
                         .cargo
@@ -1197,18 +1301,77 @@ pub async fn execute_tool(
                         state_changed: true,
                     })
                 }
+                "ai_turn" => {
+                    let rec = db
+                        .get_active_combat(campaign_id, "personal")
+                        .await?
+                        .context("No active personal combat")?;
+                    let mut state: PersonalCombatState = serde_json::from_value(rec.state)?;
+                    let reaction = match input.get("reaction").and_then(|v| v.as_str()).unwrap_or("none") {
+                        "dodge" => ReactionKind::Dodge,
+                        "parry" => ReactionKind::Parry,
+                        "dive_for_cover" => ReactionKind::DiveForCover,
+                        _ => ReactionKind::None,
+                    };
+                    let react_dm = input
+                        .get("defender_reaction_dm")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(1) as i32;
+                    let report = {
+                        let mut r = rng();
+                        execute_personal_ai_turn(&mut r, &mut state, reaction, react_dm)
+                    };
+                    // Sync any wounded party characters back to PostgreSQL
+                    for c in &state.combatants {
+                        if c.side == "party"
+                            && let Some(mut row) = db.get_character(campaign_id, c.character_id).await?
+                        {
+                            row.character.upp_current.end_val = c.end_cur;
+                            row.character.upp_current.dex_val = c.dex_cur;
+                            row.character.upp_current.str_val = c.str_cur;
+                            db.save_character(&row.character, &row.equipment).await?;
+                        }
+                    }
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(rec.id, campaign_id, "personal", "active", state.round as i32, "active", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&report)?,
+                        state_changed: true,
+                    })
+                }
                 "next_round" => {
                     let rec = db
                         .get_active_combat(campaign_id, "personal")
                         .await?
                         .context("No active personal combat")?;
                     let mut state: PersonalCombatState = serde_json::from_value(rec.state)?;
+                    let auto_ai = input.get("auto_ai_turn").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let ai_report = if auto_ai {
+                        let rep = {
+                            let mut r = rng();
+                            execute_personal_ai_turn(&mut r, &mut state, ReactionKind::None, 0)
+                        };
+                        for c in &state.combatants {
+                            if c.side == "party"
+                                && let Some(mut row) = db.get_character(campaign_id, c.character_id).await?
+                            {
+                                row.character.upp_current.end_val = c.end_cur;
+                                row.character.upp_current.dex_val = c.dex_cur;
+                                row.character.upp_current.str_val = c.str_cur;
+                                db.save_character(&row.character, &row.equipment).await?;
+                            }
+                        }
+                        Some(rep)
+                    } else {
+                        None
+                    };
                     next_personal_round(&mut state);
                     let val = serde_json::to_value(&state)?;
                     db.upsert_combat(rec.id, campaign_id, "personal", "active", state.round as i32, "active", &val)
                         .await?;
                     Ok(ToolExecutionResult {
-                        output_json: serde_json::to_string(&state)?,
+                        output_json: json!({"round": state.round, "ai_report": ai_report, "state": state}).to_string(),
                         state_changed: true,
                     })
                 }
@@ -1429,18 +1592,61 @@ pub async fn execute_tool(
                         state_changed: true,
                     })
                 }
+                "ai_turn" => {
+                    let rec = db.get_active_combat(campaign_id, "space").await?.context("No active space combat")?;
+                    let mut state: SpaceCombatState = serde_json::from_value(rec.state)?;
+                    let sand = input.get("sandcaster_count").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                    let gunner = input.get("gunner_skill").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                    let report = {
+                        let mut r = rng();
+                        execute_space_ai_turn(&mut r, &mut state, sand, gunner)
+                    };
+                    // Sync party ship hull back to PostgreSQL ships table
+                    let mut owned = db.list_ships(campaign_id).await?;
+                    for cs in &state.ships {
+                        if let Some(ship) = owned.iter_mut().find(|s| s.id == cs.ship_id) {
+                            ship.hull_current = cs.hull_current;
+                            db.save_ship(ship).await?;
+                        }
+                    }
+                    let val = serde_json::to_value(&state)?;
+                    db.upsert_combat(rec.id, campaign_id, "space", "active", state.round as i32, "actions", &val)
+                        .await?;
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&report)?,
+                        state_changed: true,
+                    })
+                }
                 "next_round" => {
                     let rec = db.get_active_combat(campaign_id, "space").await?.context("No active space combat")?;
                     let mut state: SpaceCombatState = serde_json::from_value(rec.state)?;
+                    let auto_ai = input.get("auto_ai_turn").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let ai_report = if auto_ai {
+                        let sand = input.get("sandcaster_count").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                        let gunner = input.get("gunner_skill").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                        Some({
+                            let mut r = rng();
+                            execute_space_ai_turn(&mut r, &mut state, sand, gunner)
+                        })
+                    } else {
+                        None
+                    };
                     let events = {
                         let mut r = rng();
                         advance_space_round(&mut r, &mut state)
                     };
+                    let mut owned = db.list_ships(campaign_id).await?;
+                    for cs in &state.ships {
+                        if let Some(ship) = owned.iter_mut().find(|s| s.id == cs.ship_id) {
+                            ship.hull_current = cs.hull_current;
+                            db.save_ship(ship).await?;
+                        }
+                    }
                     let val = serde_json::to_value(&state)?;
                     db.upsert_combat(rec.id, campaign_id, "space", "active", state.round as i32, "maneuver", &val)
                         .await?;
                     Ok(ToolExecutionResult {
-                        output_json: json!({"round": state.round, "events": events, "state": state}).to_string(),
+                        output_json: json!({"round": state.round, "ai_report": ai_report, "events": events, "state": state}).to_string(),
                         state_changed: true,
                     })
                 }
@@ -2057,6 +2263,155 @@ pub async fn execute_tool(
             }
         }
 
+        "port_ops" => {
+            let camp = db
+                .get_campaign(campaign_id)
+                .await?
+                .context("Campaign not found")?;
+            let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("refuel");
+            let mut ships = db.list_ships(campaign_id).await?;
+            let ship_id_opt = input
+                .get("ship_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            let ship = if let Some(sid) = ship_id_opt {
+                ships
+                    .iter_mut()
+                    .find(|s| s.id == sid)
+                    .context("Ship not found")?
+            } else {
+                ships.first_mut().context("No ship owned")?
+            };
+            let world = parse_uwp(&camp.current_system_uwp)?;
+            let sys_rec = db.get_system_by_name(&camp.current_system_name).await.ok().flatten();
+            let gas_giants = sys_rec.map(|s| s.gas_giants).unwrap_or(1);
+
+            match action {
+                "refuel" => {
+                    let mode = match input.get("mode").and_then(|v| v.as_str()).unwrap_or("refined") {
+                        "unrefined" => RefuelMode::Unrefined,
+                        "gas_giant_skim" => RefuelMode::GasGiantSkim,
+                        "process_onboard" => RefuelMode::ProcessOnboard,
+                        _ => RefuelMode::Refined,
+                    };
+                    let free_tank = (ship.spec.fuel_capacity_tons - (ship.fuel_refined + ship.fuel_unrefined)).max(0.0);
+                    let requested = input
+                        .get("tons")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or_else(|| {
+                            if mode == RefuelMode::ProcessOnboard {
+                                ship.fuel_unrefined
+                            } else {
+                                free_tank
+                            }
+                        });
+                    let actual_tons = if mode == RefuelMode::ProcessOnboard {
+                        requested.min(ship.fuel_unrefined).max(0.0)
+                    } else {
+                        requested.min(free_tank).max(0.0)
+                    };
+                    if actual_tons <= 0.001 {
+                        anyhow::bail!(
+                            "{} has no fuel space or unrefined fuel to process (Refined {:.1}t / Unrefined {:.1}t / Cap {:.1}t).",
+                            ship.name,
+                            ship.fuel_refined,
+                            ship.fuel_unrefined,
+                            ship.spec.fuel_capacity_tons
+                        );
+                    }
+                    let quote = calculate_refuel_quote(world.starport, gas_giants, &ship.spec, actual_tons, mode);
+                    if !quote.allowed {
+                        anyhow::bail!("{}", quote.note);
+                    }
+                    if quote.total_cost_cr > 0 {
+                        let accounts = db.list_accounts(campaign_id).await?;
+                        let company = accounts
+                            .iter()
+                            .find(|a| a.kind == AccountKind::Company)
+                            .or_else(|| accounts.first())
+                            .context("No account found")?;
+                        db.post_transaction(
+                            campaign_id,
+                            company.id,
+                            &camp.date.format_date_only(),
+                            -quote.total_cost_cr,
+                            "fuel",
+                            &format!("{} — {}", ship.name, quote.note),
+                            &format!("{} Starport", camp.current_system_name),
+                        )
+                        .await?;
+                    }
+                    match mode {
+                        RefuelMode::Refined => ship.fuel_refined += actual_tons,
+                        RefuelMode::Unrefined | RefuelMode::GasGiantSkim => ship.fuel_unrefined += actual_tons,
+                        RefuelMode::ProcessOnboard => {
+                            ship.fuel_unrefined = (ship.fuel_unrefined - actual_tons).max(0.0);
+                            ship.fuel_refined += actual_tons;
+                        }
+                    }
+                    db.save_ship(ship).await?;
+                    if quote.hours_required > 0 {
+                        let _ = Box::pin(execute_tool(
+                            db,
+                            hindsight,
+                            campaign_id,
+                            "advance_time",
+                            &json!({"hours": quote.hours_required, "pay_maintenance_periods": true}),
+                        ))
+                        .await;
+                    }
+                    Ok(ToolExecutionResult {
+                        output_json: json!({
+                            "ship": ship.name,
+                            "quote": quote,
+                            "fuel_refined": ship.fuel_refined,
+                            "fuel_unrefined": ship.fuel_unrefined
+                        })
+                        .to_string(),
+                        state_changed: true,
+                    })
+                }
+                "dock" => {
+                    let extra_days = input.get("extra_days").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let fee = {
+                        let mut r = rng();
+                        roll_berthing_fee(&mut r, world.starport, extra_days)
+                    };
+                    if fee.total_cr > 0 {
+                        let accounts = db.list_accounts(campaign_id).await?;
+                        let company = accounts
+                            .iter()
+                            .find(|a| a.kind == AccountKind::Company)
+                            .or_else(|| accounts.first())
+                            .context("No account found")?;
+                        db.post_transaction(
+                            campaign_id,
+                            company.id,
+                            &camp.date.format_date_only(),
+                            -fee.total_cr,
+                            "berthing_fee",
+                            &format!(
+                                "Starport {} docking/berthing fee for {} (1D={} -> Cr{} + {} extra days)",
+                                world.starport, ship.name, fee.roll_1d6, fee.base_berthing_cr, extra_days
+                            ),
+                            &format!("{} Port Authority", camp.current_system_name),
+                        )
+                        .await?;
+                    }
+                    Ok(ToolExecutionResult {
+                        output_json: json!({
+                            "ship": ship.name,
+                            "system": camp.current_system_name,
+                            "berthing_fee": fee
+                        })
+                        .to_string(),
+                        state_changed: true,
+                    })
+                }
+                other => anyhow::bail!("Unknown port_ops action '{other}'"),
+            }
+        }
+
         "recall_memory" => {
             let camp = db
                 .get_campaign(campaign_id)
@@ -2066,9 +2421,30 @@ pub async fn execute_tool(
                 .get("query")
                 .and_then(|v| v.as_str())
                 .context("query required")?;
-            let recalled = hindsight.recall(&camp.hindsight_bank_id, query, 2048).await?;
+            let sys_rec = db.get_system_by_name(&camp.current_system_name).await.ok().flatten();
+            let uwp = parse_uwp(&camp.current_system_uwp)
+                .unwrap_or_else(|_| parse_uwp("A788899-C").expect("valid uwp"));
+            let scope = build_spatial_memory_scope(
+                &camp.current_system_name,
+                sys_rec.as_ref().map(|s| s.sector_name.as_str()),
+                &uwp,
+                sys_rec.as_ref().map(|s| s.allegiance.as_str()).unwrap_or("Im"),
+            );
+            let recalled = hindsight
+                .recall_scoped(
+                    &camp.hindsight_bank_id,
+                    query,
+                    &scope.local_tags,
+                    &scope.polity_tags,
+                    2048,
+                )
+                .await?;
             Ok(ToolExecutionResult {
-                output_json: recalled,
+                output_json: if recalled.trim().is_empty() {
+                    "No matching memories found in Hindsight.".to_string()
+                } else {
+                    recalled
+                },
                 state_changed: false,
             })
         }

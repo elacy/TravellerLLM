@@ -363,6 +363,22 @@ export interface SystemShipRecord {
   status: string;
 }
 
+export interface FleetBrokerSummary {
+  max_broker_skill: number;
+  broker_source: string;
+  max_steward_skill: number;
+  steward_source: string;
+  contributors: Array<[string, number]>;
+}
+
+export interface FleetRunningCosts {
+  mortgage_cr: number;
+  maintenance_cr: number;
+  life_support_cr: number;
+  crew_salaries_cr: number;
+  total_cr: number;
+}
+
 export interface CampaignSnapshot {
   campaign: Campaign;
   characters: CharacterRow[];
@@ -381,6 +397,9 @@ export interface CampaignSnapshot {
   loaded_modules?: CampaignModuleRecord[];
   system_ships?: SystemShipRecord[];
   system_ship_count?: number;
+  fleet_max_jump?: number;
+  fleet_broker?: FleetBrokerSummary;
+  fleet_running_costs?: FleetRunningCosts;
   pack_stats?: { sectors: number; items: number };
 }
 
@@ -527,11 +546,30 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  // Ships
+  // Ships & Port Ops (Refuel, Docking Fees, Maintenance)
   updateShip: (id: string, shipId: string, ship: ShipRecord) =>
     req<{ ship: ShipRecord }>(`/api/campaigns/${id}/ships/${shipId}`, {
       method: "PATCH",
       body: JSON.stringify(ship),
+    }),
+  refuelShip: (
+    id: string,
+    shipId: string,
+    mode: "refined" | "unrefined" | "gas_giant_skim" | "process_onboard",
+    tons?: number
+  ) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/ships/${shipId}/refuel`, {
+      method: "POST",
+      body: JSON.stringify({ mode, tons }),
+    }),
+  dockShip: (id: string, shipId: string, extra_days = 0) =>
+    req<Record<string, unknown>>(`/api/campaigns/${id}/ships/${shipId}/dock`, {
+      method: "POST",
+      body: JSON.stringify({ extra_days }),
+    }),
+  payMaintenance: (id: string) =>
+    req<{ total_paid_cr: number }>(`/api/campaigns/${id}/finances/pay-maintenance`, {
+      method: "POST",
     }),
 
   // Universe & Jump

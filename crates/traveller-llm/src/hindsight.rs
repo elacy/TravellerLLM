@@ -70,18 +70,28 @@ impl HindsightClient {
         role: &str,
         content: &str,
         content_hash: &str,
+        extra_tags: Vec<String>,
+        entities: Vec<(String, String)>,
     ) -> Result<()> {
         if !self.is_enabled() || content.trim().is_empty() {
             return Ok(());
         }
         let url = format!("{}/v1/default/banks/{}/memories", self.base_url, bank_id);
         let doc_id = format!("msg-{content_hash}");
+        let mut tags = vec!["chat".to_string(), role.to_string()];
+        tags.extend(extra_tags);
+        let entities_json: Vec<Value> = entities
+            .into_iter()
+            .map(|(name, etype)| json!({ "text": name, "type": etype }))
+            .collect();
         let body = json!({
             "async": true,
             "items": [{
                 "document_id": doc_id,
                 "content": format!("[{role}] {content}"),
-                "tags": ["chat", role]
+                "tags": tags,
+                "entities": entities_json,
+                "observation_scopes": "per_tag"
             }]
         });
         let resp = self.apply_auth(self.http.post(&url).json(&body)).send().await?;
@@ -94,7 +104,8 @@ impl HindsightClient {
     }
 
     /// Chunk and ingest a module knowledge file (Markdown/text lore, patron brief, faction dossier)
-    /// into a campaign's Hindsight bank so the Referee can recall module facts & secrets on demand.
+    /// into a campaign's Hindsight bank with spatial/polity tags so regional lore surfaces automatically.
+    #[allow(clippy::too_many_arguments)]
     pub async fn retain_knowledge_document(
         &self,
         bank_id: &str,
@@ -102,6 +113,8 @@ impl HindsightClient {
         filename: &str,
         title: &str,
         content: &str,
+        extra_tags: Vec<String>,
+        entities: Vec<(String, String)>,
     ) -> Result<usize> {
         if !self.is_enabled() || content.trim().is_empty() {
             return Ok(0);
@@ -113,13 +126,22 @@ impl HindsightClient {
             .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
             .collect();
 
+        let entities_json: Vec<Value> = entities
+            .into_iter()
+            .map(|(name, etype)| json!({ "text": name, "type": etype }))
+            .collect();
+
         let mut items = Vec::with_capacity(chunks.len());
         for (idx, chunk) in chunks.iter().enumerate() {
             let doc_id = format!("mod-{module_slug}-{safe_file}-p{}", idx + 1);
+            let mut tags = vec!["module".to_string(), module_slug.to_string(), filename.to_string()];
+            tags.extend(extra_tags.iter().cloned());
             items.push(json!({
                 "document_id": doc_id,
                 "content": format!("[Module: {module_slug} | File: {filename} | {title} (part {}/{})]\n\n{}", idx + 1, chunks.len(), chunk),
-                "tags": ["module", module_slug, filename]
+                "tags": tags,
+                "entities": entities_json,
+                "observation_scopes": "per_tag"
             }));
         }
 
@@ -150,19 +172,43 @@ impl HindsightClient {
     }
 
     pub async fn recall(&self, bank_id: &str, query: &str, max_tokens: u32) -> Result<String> {
+        let lines = self
+            .recall_with_tags(bank_id, query, None, None, max_tokens)
+            .await?;
+        if lines.is_empty() {
+            Ok("No matching memories found in Hindsight.".to_string())
+        } else {
+            Ok(lines.join("\n"))
+        }
+    }
+
+    async fn recall_with_tags(
+        &self,
+        bank_id: &str,
+        query: &str,
+        tags: Option<&[String]>,
+        tags_match: Option<&str>,
+        max_tokens: u32,
+    ) -> Result<Vec<String>> {
         if !self.is_enabled() {
-            return Ok("Hindsight memory is disabled.".to_string());
+            return Ok(vec![]);
         }
         let url = format!(
             "{}/v1/default/banks/{}/memories/recall",
             self.base_url, bank_id
         );
-        let body = json!({
+        let mut body = json!({
             "query": query,
             "budget": "mid",
             "max_tokens": max_tokens,
-            "types": ["world", "experience"]
+            "types": ["world", "experience", "observation"]
         });
+        if let Some(t) = tags
+            && !t.is_empty()
+        {
+            body["tags"] = json!(t);
+            body["tags_match"] = json!(tags_match.unwrap_or("any_strict"));
+        }
         let resp = self
             .apply_auth(self.http.post(&url).json(&body))
             .send()
@@ -182,11 +228,59 @@ impl HindsightClient {
                 }
             }
         }
-        if lines.is_empty() {
-            Ok("No matching memories found in Hindsight.".to_string())
-        } else {
-            Ok(lines.join("\n"))
+        Ok(lines)
+    }
+
+    /// 3-tier spatial & polity-weighted recall:
+    /// 1. Local system & sector memories (`any_strict`)
+    /// 2. Polity & government-type memories (`any_strict`)
+    /// 3. Global campaign fallback (deduplicated)
+    ///
+    /// Ensures memories relevant to the current region of space or government ALWAYS surface first.
+    pub async fn recall_scoped(
+        &self,
+        bank_id: &str,
+        query: &str,
+        local_tags: &[String],
+        polity_tags: &[String],
+        max_tokens: u32,
+    ) -> Result<String> {
+        if !self.is_enabled() {
+            return Ok(String::new());
         }
+        let tier_budget = (max_tokens / 3).max(256);
+        let (local_res, polity_res, global_res) = tokio::join!(
+            self.recall_with_tags(bank_id, query, Some(local_tags), Some("any_strict"), tier_budget),
+            self.recall_with_tags(bank_id, query, Some(polity_tags), Some("any_strict"), tier_budget),
+            self.recall_with_tags(bank_id, query, None, None, tier_budget),
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        let mut sections = Vec::new();
+
+        if let Ok(local) = local_res {
+            let uniq: Vec<String> = local.into_iter().filter(|l| seen.insert(l.clone())).collect();
+            if !uniq.is_empty() {
+                sections.push(format!("### Local System & Sector Memories\n{}", uniq.join("\n")));
+            }
+        }
+        if let Ok(polity) = polity_res {
+            let uniq: Vec<String> = polity.into_iter().filter(|l| seen.insert(l.clone())).collect();
+            if !uniq.is_empty() {
+                sections.push(format!("### Polity & Government Memories\n{}", uniq.join("\n")));
+            }
+        }
+        if let Ok(global) = global_res {
+            let uniq: Vec<String> = global
+                .into_iter()
+                .filter(|l| seen.insert(l.clone()))
+                .take(6)
+                .collect();
+            if !uniq.is_empty() {
+                sections.push(format!("### Campaign-Wide Memories\n{}", uniq.join("\n")));
+            }
+        }
+        Ok(sections.join("\n\n"))
     }
 }
 

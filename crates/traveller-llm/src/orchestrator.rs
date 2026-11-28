@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use traveller_db::Db;
+use traveller_rules::universe::{build_spatial_memory_scope, parse_uwp};
 use uuid::Uuid;
 
 use crate::hindsight::HindsightClient;
@@ -101,30 +102,57 @@ impl Orchestrator {
             .insert_message(campaign_id, "user", &user_text, &user_hash, None, 0, 0, 0, 0, 0.0)
             .await?;
 
-        // Ensure Hindsight bank & retain player message asynchronously
+        // Build spatial/polity/government Hindsight scope for current system
+        let sys_rec = self.db.get_system_by_name(&camp.current_system_name).await.ok().flatten();
+        let uwp = parse_uwp(&camp.current_system_uwp)
+            .unwrap_or_else(|_| parse_uwp("A788899-C").expect("valid uwp"));
+        let spatial_scope = build_spatial_memory_scope(
+            &camp.current_system_name,
+            sys_rec.as_ref().map(|s| s.sector_name.as_str()),
+            &uwp,
+            sys_rec.as_ref().map(|s| s.allegiance.as_str()).unwrap_or("Im"),
+        );
+
+        // Ensure Hindsight bank & retain player message asynchronously with spatial/polity tags
         {
             let hs = self.hindsight.clone();
             let bank = camp.hindsight_bank_id.clone();
             let cname = camp.name.clone();
             let txt = user_text.clone();
             let h = user_hash.clone();
+            let tags = spatial_scope.all_tags.clone();
+            let ents = spatial_scope.entities.clone();
             tokio::spawn(async move {
                 let _ = hs.ensure_bank(&bank, &cname).await;
-                let _ = hs.retain_message(&bank, "user", &txt, &h).await;
+                let _ = hs.retain_message(&bank, "user", &txt, &h, tags, ents).await;
             });
         }
 
-        // 2. Concurrent pre-turn loads (anthropic-pipe parity)
-        let (state_res, msgs_res, legs_res, summaries_res) = tokio::join!(
+        // 2. Concurrent pre-turn loads (including automatic spatial/polity-weighted Hindsight recall!)
+        let regional_query = format!(
+            "{} {} {}",
+            camp.current_system_name,
+            sys_rec.as_ref().map(|s| s.sector_name.as_str()).unwrap_or(""),
+            user_text.chars().take(180).collect::<String>()
+        );
+        let (state_res, msgs_res, legs_res, summaries_res, regional_mem_res) = tokio::join!(
             self.db.render_state_snapshot(campaign_id),
             self.db.list_messages(campaign_id),
             self.db.load_turn_legs_map(campaign_id),
             self.db.list_summaries(campaign_id),
+            self.hindsight.recall_scoped(
+                &camp.hindsight_bank_id,
+                &regional_query,
+                &spatial_scope.local_tags,
+                &spatial_scope.polity_tags,
+                900
+            ),
         );
         let state_xml = state_res?;
         let messages = msgs_res?;
         let legs_map = legs_res?;
         let summaries = summaries_res?;
+        let regional_mem = regional_mem_res.unwrap_or_default();
 
         // 3. Build cache-stable conversation messages:
         //    [Compressed summaries block (cached)] + [Recent messages with replayed turn_legs]
@@ -198,6 +226,12 @@ impl Orchestrator {
                     blocks.push(json!({"type": "text", "text": &state_xml}));
                     if camp.story_ledger.has_content() {
                         blocks.push(json!({"type": "text", "text": camp.story_ledger.render_xml()}));
+                    }
+                    if !regional_mem.trim().is_empty() {
+                        blocks.push(json!({
+                            "type": "text",
+                            "text": format!("<regional_memory>\nAutomatically recalled memories weighted by current system, sector, polity, and government type:\n\n{}\n</regional_memory>", regional_mem.trim())
+                        }));
                     }
                 }
                 api_messages.push(json!({
@@ -391,9 +425,11 @@ impl Orchestrator {
         let hs = self.hindsight.clone();
         let bank = camp.hindsight_bank_id.clone();
         let reply_clone = final_text.clone();
+        let reply_tags = spatial_scope.all_tags.clone();
+        let reply_ents = spatial_scope.entities.clone();
         tokio::spawn(async move {
             let _ = hs
-                .retain_message(&bank, "assistant", &reply_clone, &reply_hash)
+                .retain_message(&bank, "assistant", &reply_clone, &reply_hash, reply_tags, reply_ents)
                 .await;
         });
 

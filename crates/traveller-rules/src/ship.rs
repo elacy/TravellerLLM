@@ -505,6 +505,189 @@ pub fn roll_poor_maintenance<R: Rng + ?Sized>(
     }
 }
 
+/// Core 2022: A fleet jumping together is limited to the LOWEST Jump Rating among its ships.
+pub fn fleet_max_jump_rating(specs: &[&ShipSpec]) -> u8 {
+    specs.iter().map(|s| s.jump_rating).min().unwrap_or(0)
+}
+
+/// Core 2022 p. 151: Jump fuel consumed = 10% of hull tonnage per parsec jumped.
+pub fn jump_fuel_for_distance(tonnage: u32, parsecs: u8) -> f64 {
+    f64::from(tonnage) * 0.10 * f64::from(parsecs.max(1))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefuelMode {
+    Refined,
+    Unrefined,
+    GasGiantSkim,
+    ProcessOnboard,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefuelQuote {
+    pub allowed: bool,
+    pub mode: RefuelMode,
+    pub tons: f64,
+    pub cost_per_ton_cr: i64,
+    pub total_cost_cr: i64,
+    pub hours_required: u32,
+    pub note: String,
+}
+
+/// Core 2022 pp. 151–152 Refueling costs & requirements (Refined Cr500/t at A/B, Unrefined Cr100/t at A–D,
+/// Gas Giant skimming Cr0 with scoops, Onboard Fuel Processor 20t/day per processor ton).
+pub fn calculate_refuel_quote(
+    starport: char,
+    gas_giants: i16,
+    spec: &ShipSpec,
+    requested_tons: f64,
+    mode: RefuelMode,
+) -> RefuelQuote {
+    let tons = requested_tons.max(0.0);
+    match mode {
+        RefuelMode::Refined => {
+            if !matches!(starport, 'A' | 'B') {
+                return RefuelQuote {
+                    allowed: false,
+                    mode,
+                    tons: 0.0,
+                    cost_per_ton_cr: 500,
+                    total_cost_cr: 0,
+                    hours_required: 0,
+                    note: format!("Starport Class {starport} does not offer Refined fuel (requires Class A or B)."),
+                };
+            }
+            let total = (tons * 500.0).round() as i64;
+            RefuelQuote {
+                allowed: true,
+                mode,
+                tons,
+                cost_per_ton_cr: 500,
+                total_cost_cr: total,
+                hours_required: 1,
+                note: format!("Purchased {tons:.1}t Refined fuel at Starport {starport} for Cr{total}."),
+            }
+        }
+        RefuelMode::Unrefined => {
+            if !matches!(starport, 'A' | 'B' | 'C' | 'D') {
+                return RefuelQuote {
+                    allowed: false,
+                    mode,
+                    tons: 0.0,
+                    cost_per_ton_cr: 100,
+                    total_cost_cr: 0,
+                    hours_required: 0,
+                    note: format!("Starport Class {starport} has no commercial fuel facilities (try Gas Giant skimming)."),
+                };
+            }
+            let total = (tons * 100.0).round() as i64;
+            RefuelQuote {
+                allowed: true,
+                mode,
+                tons,
+                cost_per_ton_cr: 100,
+                total_cost_cr: total,
+                hours_required: 1,
+                note: format!("Purchased {tons:.1}t Unrefined fuel at Starport {starport} for Cr{total} (DM-2 Astrogation / misjump risk unless processed)."),
+            }
+        }
+        RefuelMode::GasGiantSkim => {
+            if gas_giants <= 0 {
+                return RefuelQuote {
+                    allowed: false,
+                    mode,
+                    tons: 0.0,
+                    cost_per_ton_cr: 0,
+                    total_cost_cr: 0,
+                    hours_required: 0,
+                    note: "No gas giant in this system to skim fuel from.".into(),
+                };
+            }
+            if !spec.fuel_scoops {
+                return RefuelQuote {
+                    allowed: false,
+                    mode,
+                    tons: 0.0,
+                    cost_per_ton_cr: 0,
+                    total_cost_cr: 0,
+                    hours_required: 0,
+                    note: "Ship does not have Fuel Scoops installed for gas giant skimming.".into(),
+                };
+            }
+            RefuelQuote {
+                allowed: true,
+                mode,
+                tons,
+                cost_per_ton_cr: 0,
+                total_cost_cr: 0,
+                hours_required: 6,
+                note: format!("Skimmed {tons:.1}t Unrefined fuel from gas giant (Cr0; 6h transit/skimming)."),
+            }
+        }
+        RefuelMode::ProcessOnboard => {
+            if spec.fuel_processor_tons <= 0.0 {
+                return RefuelQuote {
+                    allowed: false,
+                    mode,
+                    tons: 0.0,
+                    cost_per_ton_cr: 0,
+                    total_cost_cr: 0,
+                    hours_required: 0,
+                    note: "Ship does not have an onboard Fuel Processor installed.".into(),
+                };
+            }
+            let tons_per_hour = (spec.fuel_processor_tons * 20.0) / 24.0;
+            let hours = (tons / tons_per_hour).ceil().max(1.0) as u32;
+            RefuelQuote {
+                allowed: true,
+                mode,
+                tons,
+                cost_per_ton_cr: 0,
+                total_cost_cr: 0,
+                hours_required: hours,
+                note: format!("Refined {tons:.1}t unrefined fuel onboard in {hours}h."),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BerthingFeeResult {
+    pub starport: char,
+    pub roll_1d6: u8,
+    pub base_berthing_cr: i64,
+    pub extra_days: u32,
+    pub extra_days_cr: i64,
+    pub total_cr: i64,
+}
+
+/// Core 2022 p. 235 Starport Berthing / Docking Fees (covers 1–6 days + extra days).
+pub fn roll_berthing_fee<R: Rng + ?Sized>(
+    rng: &mut R,
+    starport: char,
+    extra_days: u32,
+) -> BerthingFeeResult {
+    let d = roll_nd6(rng, 1)[0];
+    let (mult, per_extra_day): (i64, i64) = match starport {
+        'A' => (1_000, 500),
+        'B' => (500, 200),
+        'C' => (100, 100),
+        'D' => (10, 10),
+        _ => (0, 0),
+    };
+    let base_berthing_cr = i64::from(d) * mult;
+    let extra_days_cr = i64::from(extra_days) * per_extra_day;
+    BerthingFeeResult {
+        starport,
+        roll_1d6: d,
+        base_berthing_cr,
+        extra_days,
+        extra_days_cr,
+        total_cr: base_berthing_cr + extra_days_cr,
+    }
+}
+
 /// Standard Type-A Free Trader (200 tons, J-1, M-1) starter ship template.
 pub fn sample_free_trader() -> ShipSpec {
     ShipSpec {

@@ -36,7 +36,14 @@ export function StarMapPanel({
   const [searchTradeCode, setSearchTradeCode] = useState("");
   const [searchResults, setSearchResults] = useState<SystemRecord[]>([]);
   const [routeDest, setRouteDest] = useState("");
-  const [jumpRating, setJumpRating] = useState(snapshot.ships[0]?.spec.jump_rating || 1);
+  const [jumpRating, setJumpRating] = useState(
+    snapshot.fleet_max_jump || snapshot.ships[0]?.spec.jump_rating || 1
+  );
+  useEffect(() => {
+    if (snapshot.fleet_max_jump && snapshot.fleet_max_jump > 0) {
+      setJumpRating(snapshot.fleet_max_jump);
+    }
+  }, [snapshot.fleet_max_jump]);
   const [avoidRed, setAvoidRed] = useState(true);
   const [requireRefuel, setRequireRefuel] = useState(true);
   const [routeResult, setRouteResult] = useState<Awaited<ReturnType<typeof api.planRoute>> | null>(

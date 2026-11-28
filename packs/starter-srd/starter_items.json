@@ -198,6 +198,28 @@
       "law_restriction": 9,
       "stats": { "speed": "Medium (100 km/h)", "shipping": "4 tons", "passengers": "4" },
       "tags": ["vehicle", "tl8", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "robot_drone",
+      "name": "Commercial Broker Robot (TL12)",
+      "tl": 12,
+      "cost_cr": 45000,
+      "mass_kg": 85.0,
+      "law_restriction": 9,
+      "stats": { "broker": 2, "steward": 1, "skills": { "Broker": 2, "Admin": 2, "Steward": 1 }, "effect": "Autonomous trade negotiations (Broker-2, Admin-2, Steward-1)" },
+      "tags": ["robot_drone", "tl12", "broker", "srd"]
+    },
+    {
+      "pack_id": "starter-srd",
+      "category": "robot_drone",
+      "name": "Executive Megacorp Trade Droid (TL13)",
+      "tl": 13,
+      "cost_cr": 120000,
+      "mass_kg": 90.0,
+      "law_restriction": 9,
+      "stats": { "broker": 3, "steward": 2, "skills": { "Broker": 3, "Admin": 3, "Diplomat": 2, "Steward": 2 }, "effect": "High-end commercial negotiation robot (Broker-3, Diplomat-2)" },
+      "tags": ["robot_drone", "tl13", "broker", "srd"]
     }
   ]
 }
