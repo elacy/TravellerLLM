@@ -2,7 +2,9 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use traveller_rules::character::CharacterKind;
 use traveller_rules::chargen::{
-    finalize_lifepath_character, muster_out, run_lifepath_term, start_lifepath, Career,
+    all_background_skills, all_careers, all_species, finalize_lifepath_character, muster_out,
+    run_lifepath_term, run_lifepath_term_detailed, run_pre_career, set_background_skills,
+    start_lifepath, Career, PreCareerChoice, SkillTableChoice,
 };
 use traveller_rules::crew::{generate_hiring_hall, standard_crew_salary};
 use traveller_rules::universe::parse_uwp;
@@ -116,4 +118,39 @@ fn starport_hiring_hall_scales_with_starport_and_assigns_authentic_crew_salaries
         );
         assert_eq!(cand.character.salary_cr, cand.asking_salary_cr);
     }
+}
+
+#[test]
+fn species_catalog_background_skills_pre_career_and_detailed_terms() {
+    let mut rng = StdRng::seed_from_u64(777);
+    assert!(all_species().len() >= 10, "Must expose full Charted Space species list");
+    assert!(all_background_skills().len() >= 15);
+    assert_eq!(all_careers().len(), 12);
+
+    // Zhodani rolls PSI; Aslan gets STR+2/DEX-2 and traits
+    let zho = start_lifepath(&mut rng, "Zho".into(), "Human (Zhodani)".into(), vec![]);
+    assert!(zho.upp.psi_val.is_some());
+    let mut aslan = start_lifepath(&mut rng, "Htyowao".into(), "Aslan".into(), vec![]);
+    assert!(aslan.species_traits.contains("dewclaw"));
+
+    // Choosing custom background skills before Term 1 replaces defaults
+    set_background_skills(&mut aslan, vec!["Pilot (Spacecraft)".into(), "Broker".into()]);
+    assert!(aslan.background_skills_chosen);
+    assert_eq!(aslan.skills.get("Broker"), Some(&0));
+
+    // Pre-career education works before Term 1
+    let note = run_pre_career(&mut rng, &mut aslan, PreCareerChoice::University);
+    assert!(!note.is_empty());
+    assert!(aslan.pre_career_done);
+
+    // Detailed career term with Assignment & Personal Development table
+    let entry = run_lifepath_term_detailed(
+        &mut rng,
+        &mut aslan,
+        Career::Merchant,
+        Some("Free Trader".into()),
+        SkillTableChoice::Personal,
+    );
+    assert_eq!(entry.term, 1);
+    assert!(!entry.skills_gained.is_empty());
 }

@@ -24,7 +24,9 @@ use traveller_rules::ship::{
     compute_running_costs, fleet_max_jump_rating, jump_fuel_for_distance, roll_berthing_fee,
     roll_poor_maintenance, validate_ship, RefuelMode, SensorGrade,
 };
-use traveller_rules::trade::{compute_fleet_max_broker, generate_world_market, roll_speculative_sale};
+use traveller_rules::trade::{
+    compute_fleet_max_broker, generate_world_market, roll_speculative_sale, search_local_broker,
+};
 use traveller_rules::traffic::generate_system_traffic;
 use traveller_rules::universe::{
     build_spatial_memory_scope, hex_distance, parse_uwp, plan_jump_route, RouteNode,
@@ -779,6 +781,35 @@ pub async fn execute_tool(
             let origin_uwp = parse_uwp(&camp.current_system_uwp)?;
 
             match action {
+                "find_broker" => {
+                    let black_market = input
+                        .get("black_market")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let offer = {
+                        let mut r = rng();
+                        search_local_broker(
+                            &mut r,
+                            origin_uwp.starport,
+                            origin_uwp.population,
+                            black_market,
+                        )
+                    };
+                    if offer.days_spent > 0 {
+                        let _ = Box::pin(execute_tool(
+                            db,
+                            hindsight,
+                            campaign_id,
+                            "advance_time",
+                            &json!({"days": offer.days_spent, "pay_maintenance_periods": true}),
+                        ))
+                        .await;
+                    }
+                    Ok(ToolExecutionResult {
+                        output_json: serde_json::to_string(&offer)?,
+                        state_changed: true,
+                    })
+                }
                 "market" => {
                     let chars = db.list_characters(campaign_id).await?;
                     let ships = db.list_ships(campaign_id).await?;
@@ -802,22 +833,41 @@ pub async fn execute_tool(
                         origin_uwp.clone()
                     };
                     let parsecs = input.get("parsecs").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
-                    // Automatically use MAX Broker & Steward across the entire fleet (including robots & Neural Jacks!)
-                    let broker = input
-                        .get("broker_skill")
+                    // Never trust a manually typed broker score: use Fleet Max Broker (0% fee)
+                    // OR an explicitly located local starport broker (skill 1..=4, 5%..=20% commission).
+                    let local_skill = input
+                        .get("local_broker_skill")
                         .and_then(|v| v.as_i64())
-                        .map(|v| (v as i32).max(fleet_broker.max_broker_skill))
-                        .unwrap_or(fleet_broker.max_broker_skill);
-                    let steward = input
-                        .get("steward_skill")
-                        .and_then(|v| v.as_i64())
-                        .map(|v| (v as i32).max(fleet_broker.max_steward_skill))
-                        .unwrap_or(fleet_broker.max_steward_skill);
+                        .map(|v| (v as i32).clamp(1, 4));
+                    let local_comm = input
+                        .get("local_broker_commission_pct")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| (v as u32).clamp(0, 25))
+                        .unwrap_or(0);
+                    let local_name = input
+                        .get("local_broker_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let (broker, commission_pct, broker_source) = match local_skill {
+                        Some(ls) => (
+                            ls,
+                            if local_comm > 0 { local_comm } else { (ls as u32) * 5 },
+                            local_name.unwrap_or_else(|| format!("Local Starport Broker-{ls}")),
+                        ),
+                        None => (
+                            fleet_broker.max_broker_skill,
+                            0,
+                            fleet_broker.broker_source.clone(),
+                        ),
+                    };
+                    let steward = fleet_broker.max_steward_skill;
                     let illegal = input.get("include_illegal").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                    let market = {
+                    // Core 2022 p. 241: Locating a supplier & world market takes 1D days
+                    let (search_days, market) = {
                         let mut r = rng();
-                        generate_world_market(
+                        let d = u32::from(roll_nd6(&mut r, 1)[0]);
+                        let m = generate_world_market(
                             &mut r,
                             &camp.current_system_name,
                             &origin_uwp,
@@ -828,17 +878,30 @@ pub async fn execute_tool(
                             broker,
                             steward,
                             illegal,
-                        )
+                        );
+                        (d, m)
                     };
+                    let _ = Box::pin(execute_tool(
+                        db,
+                        hindsight,
+                        campaign_id,
+                        "advance_time",
+                        &json!({"days": search_days, "pay_maintenance_periods": true}),
+                    ))
+                    .await;
+
                     let mut market_val = serde_json::to_value(&market)?;
                     if let Some(obj) = market_val.as_object_mut() {
+                        obj.insert("days_spent".into(), json!(search_days));
                         obj.insert("effective_broker_skill".into(), json!(broker));
+                        obj.insert("commission_pct".into(), json!(commission_pct));
+                        obj.insert("broker_source".into(), json!(broker_source));
                         obj.insert("effective_steward_skill".into(), json!(steward));
                         obj.insert("fleet_broker".into(), serde_json::to_value(&fleet_broker)?);
                     }
                     Ok(ToolExecutionResult {
                         output_json: serde_json::to_string(&market_val)?,
-                        state_changed: false,
+                        state_changed: true,
                     })
                 }
                 "buy_cargo" => {
@@ -852,7 +915,14 @@ pub async fn execute_tool(
                         .get("unit_price_cr")
                         .and_then(|v| v.as_i64())
                         .context("unit_price_cr required")?;
-                    let total_cost = i64::from(tons) * unit_price;
+                    let comm_pct = input
+                        .get("commission_pct")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .min(25) as i64;
+                    let base_cost = i64::from(tons) * unit_price;
+                    let commission_cr = (base_cost * comm_pct) / 100;
+                    let total_cost = base_cost + commission_cr;
 
                     let mut ships = db.list_ships(campaign_id).await?;
                     let ship = ships.first_mut().context("No ship owned")?;
@@ -875,6 +945,17 @@ pub async fn execute_tool(
                         .iter()
                         .find(|a| a.kind == AccountKind::Company)
                         .context("Company account not found")?;
+                    let desc = if commission_cr > 0 {
+                        format!(
+                            "Bought {tons}t {good_name} @ Cr{unit_price}/t on {} (+Cr{commission_cr} {comm_pct}% broker fee)",
+                            camp.current_system_name
+                        )
+                    } else {
+                        format!(
+                            "Bought {tons}t {good_name} @ Cr{unit_price}/t on {}",
+                            camp.current_system_name
+                        )
+                    };
                     let tx = db
                         .post_transaction(
                             campaign_id,
@@ -882,7 +963,7 @@ pub async fn execute_tool(
                             &camp.date.format_date_only(),
                             -total_cost,
                             "trade_buy",
-                            &format!("Bought {tons}t {good_name} @ Cr{unit_price}/t on {}", camp.current_system_name),
+                            &desc,
                             &camp.current_system_name,
                         )
                         .await?;
@@ -891,12 +972,16 @@ pub async fn execute_tool(
                         "name": good_name,
                         "tons": tons,
                         "unit_cost_cr": unit_price,
+                        "purchase_price_cr": unit_price,
+                        "bought_at": camp.current_system_name,
                         "origin": camp.current_system_name
                     }));
                     db.save_ship(ship).await?;
                     Ok(ToolExecutionResult {
                         output_json: serde_json::to_string(&json!({
-                            "purchased": {"d66": d66, "name": good_name, "tons": tons, "total_cost_cr": total_cost},
+                            "purchased": {"d66": d66, "name": good_name, "tons": tons, "total_cost_cr": total_cost, "commission_cr": commission_cr},
+                            "total_cost_cr": total_cost,
+                            "commission_cr": commission_cr,
                             "balance_after_cr": tx.balance_after_cr
                         }))?,
                         state_changed: true,
@@ -916,11 +1001,16 @@ pub async fn execute_tool(
                     let fleet_broker = compute_fleet_max_broker(&roster_refs, &fleet_assets);
 
                     let d66 = input.get("d66").and_then(|v| v.as_u64()).context("d66 required")? as u8;
-                    let broker = input
-                        .get("broker_skill")
+                    let local_skill = input
+                        .get("local_broker_skill")
                         .and_then(|v| v.as_i64())
-                        .map(|v| (v as i32).max(fleet_broker.max_broker_skill))
-                        .unwrap_or(fleet_broker.max_broker_skill);
+                        .map(|v| (v as i32).clamp(1, 4));
+                    let comm_pct = input
+                        .get("local_broker_commission_pct")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v.min(25) as i64)
+                        .unwrap_or_else(|| local_skill.map(|ls| i64::from(ls) * 5).unwrap_or(0));
+                    let broker = local_skill.unwrap_or(fleet_broker.max_broker_skill);
                     let ship = ships.first_mut().context("No ship owned")?;
                     let idx = ship
                         .cargo
@@ -929,19 +1019,29 @@ pub async fn execute_tool(
                         .context("No matching cargo lot in ship hold")?;
                     let lot = ship.cargo.remove(idx);
                     let tons = lot.get("tons").and_then(|v| v.as_i64()).unwrap_or(1);
-                    let cost_basis = lot.get("unit_cost_cr").and_then(|v| v.as_i64()).unwrap_or(0) * tons;
+                    let cost_basis = lot
+                        .get("unit_cost_cr")
+                        .or_else(|| lot.get("purchase_price_cr"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
+                        * tons;
                     let lot_name = lot
                         .get("name")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Cargo")
                         .to_string();
 
-                    let (sale_pct, unit_sale, roll_total) = {
+                    // Finding a buyer takes 1D days (Core 2022 p. 243)
+                    let (days_spent, (sale_pct, unit_sale, roll_total)) = {
                         let mut r = rng();
-                        roll_speculative_sale(&mut r, d66, &origin_uwp, "Green", broker, 2)
-                            .context("Invalid trade good d66")?
+                        let d = u32::from(roll_nd6(&mut r, 1)[0]);
+                        let s = roll_speculative_sale(&mut r, d66, &origin_uwp, "Green", broker, 2)
+                            .context("Invalid trade good d66")?;
+                        (d, s)
                     };
-                    let proceeds = unit_sale * tons;
+                    let gross = unit_sale * tons;
+                    let commission_cr = (gross * comm_pct) / 100;
+                    let proceeds = gross - commission_cr;
                     let profit = proceeds - cost_basis;
 
                     let accounts = db.list_accounts(campaign_id).await?;
@@ -949,6 +1049,15 @@ pub async fn execute_tool(
                         .iter()
                         .find(|a| a.kind == AccountKind::Company)
                         .context("Company account not found")?;
+                    let desc = if commission_cr > 0 {
+                        format!(
+                            "Sold {tons}t {lot_name} @ Cr{unit_sale}/t ({sale_pct}%, -Cr{commission_cr} {comm_pct}% broker fee, net profit Cr{profit:+})"
+                        )
+                    } else {
+                        format!(
+                            "Sold {tons}t {lot_name} @ Cr{unit_sale}/t ({sale_pct}%, profit Cr{profit:+})"
+                        )
+                    };
                     let tx = db
                         .post_transaction(
                             campaign_id,
@@ -956,18 +1065,29 @@ pub async fn execute_tool(
                             &camp.date.format_date_only(),
                             proceeds,
                             "trade_sell",
-                            &format!("Sold {tons}t {lot_name} @ Cr{unit_sale}/t ({sale_pct}%, profit Cr{profit:+})"),
+                            &desc,
                             &camp.current_system_name,
                         )
                         .await?;
                     db.save_ship(ship).await?;
+                    let _ = Box::pin(execute_tool(
+                        db,
+                        hindsight,
+                        campaign_id,
+                        "advance_time",
+                        &json!({"days": days_spent, "pay_maintenance_periods": true}),
+                    ))
+                    .await;
                     Ok(ToolExecutionResult {
                         output_json: serde_json::to_string(&json!({
                             "sold": lot_name,
                             "tons": tons,
+                            "days_spent": days_spent,
                             "sale_percent": sale_pct,
                             "price_roll": roll_total,
                             "unit_price_cr": unit_sale,
+                            "commission_cr": commission_cr,
+                            "total_revenue_cr": proceeds,
                             "proceeds_cr": proceeds,
                             "profit_cr": profit,
                             "balance_after_cr": tx.balance_after_cr

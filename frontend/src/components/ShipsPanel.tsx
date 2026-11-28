@@ -1,16 +1,15 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   Anchor,
-  Edit3,
   Fuel,
   Package,
   Rocket,
-  Save,
   ShieldAlert,
   ShieldCheck,
   Wrench,
 } from "lucide-react";
-import { api, CampaignSnapshot, formatCr, RefitQuote, ShipRecord } from "../lib/api";
+import { api, CampaignSnapshot, formatCr, ShipRecord } from "../lib/api";
+import { ShipSpreadsheetModal } from "./ShipSpreadsheetModal";
 
 interface Props {
   campaignId: string;
@@ -20,11 +19,7 @@ interface Props {
 }
 
 export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) {
-  const [editingShipId, setEditingShipId] = useState<string | null>(null);
-  const [draft, setDraft] = useState<ShipRecord | null>(null);
-  const [quote, setQuote] = useState<RefitQuote | null>(null);
-  const [draftValidation, setDraftValidation] = useState<ShipRecord["validation"] | null>(null);
-  const [quoting, setQuoting] = useState(false);
+  const [spreadsheetShip, setSpreadsheetShip] = useState<ShipRecord | null>(null);
   const [portMsg, setPortMsg] = useState<string | null>(null);
 
   const starport = (snapshot.current_system_info?.starport || "A").toUpperCase();
@@ -33,61 +28,6 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
   const companyAcc =
     snapshot.accounts.find((a) => a.kind === "company") ?? snapshot.accounts[0];
   const companyAvailable = (companyAcc?.balance_cr ?? 0) + (companyAcc?.credit_limit_cr ?? 0);
-
-  // Live shipyard refit quote whenever the user adjusts refit fields
-  useEffect(() => {
-    if (!editingShipId || !draft) {
-      setQuote(null);
-      setDraftValidation(null);
-      return;
-    }
-    let cancelled = false;
-    setQuoting(true);
-    const t = setTimeout(() => {
-      api
-        .refitQuote(campaignId, editingShipId, draft)
-        .then((res) => {
-          if (!cancelled) {
-            setQuote(res.quote);
-            setDraftValidation(res.validation);
-          }
-        })
-        .catch(() => {
-          // ignore transient quote error while typing
-        })
-        .finally(() => {
-          if (!cancelled) setQuoting(false);
-        });
-    }, 180);
-    return () => {
-      cancelled = true;
-      clearTimeout(t);
-    };
-  }, [campaignId, editingShipId, draft]);
-
-  function startEdit(ship: ShipRecord) {
-    setEditingShipId(ship.id);
-    setDraft(structuredClone(ship));
-    setQuote(null);
-    setDraftValidation(ship.validation);
-  }
-
-  async function saveShip() {
-    if (!draft) return;
-    setPortMsg(null);
-    try {
-      const res = await api.updateShip(campaignId, draft.id, draft);
-      setEditingShipId(null);
-      setDraft(null);
-      setQuote(null);
-      setPortMsg(
-        `Shipyard refit applied for ${formatCr(res.quote?.total_cost_cr ?? 0)}!`
-      );
-      await onRefresh();
-    } catch (e) {
-      onError((e as Error).message);
-    }
-  }
 
   async function handleRefuel(
     shipId: string,
@@ -129,10 +69,8 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
     try {
       const res = await api.undockShip(campaignId, shipId);
       setPortMsg(typeof res.note === "string" ? res.note : "Ship undocked and broke orbit.");
-      if (editingShipId === shipId) {
-        setEditingShipId(null);
-        setDraft(null);
-        setQuote(null);
+      if (spreadsheetShip?.id === shipId) {
+        setSpreadsheetShip(null);
       }
       await onRefresh();
     } catch (e) {
@@ -192,7 +130,6 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
         <div className="text-slate-400 text-center py-6">No ships registered in this campaign.</div>
       )}
       {snapshot.ships.map((ship) => {
-        const isEditing = editingShipId === ship.id && draft;
         const cargoUsed = (ship.cargo || []).reduce((acc, c) => acc + (Number(c.tons) || 0), 0);
         const freeFuel = Math.max(
           0,
@@ -231,14 +168,6 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
         const canProcess = hasProcessor && ship.fuel_unrefined > 0.1;
         const canDock = !isDocked && ["A", "B", "C", "D", "E"].includes(starport);
         const canOpenShipyard = isDocked && ["A", "B", "C"].includes(starport);
-
-        const refitCanSubmit =
-          Boolean(quote) &&
-          quote!.allowed &&
-          quote!.has_changes &&
-          Boolean(draftValidation?.valid) &&
-          companyAvailable >= quote!.total_cost_cr &&
-          !quoting;
 
         return (
           <div
@@ -279,168 +208,23 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
                   </span>
                 )}
                 <button
-                  disabled={!isEditing && !canOpenShipyard}
+                  disabled={!canOpenShipyard}
                   title={
                     !isDocked
                       ? `Dock at ${snapshot.campaign.current_system_name} Starport first to access the Shipyard`
                       : !["A", "B", "C"].includes(starport)
                       ? `Starport Class ${starport} has no shipyard or repair facilities (requires Class A–C)`
-                      : "Open paid Shipyard Refit & Repair Bay"
+                      : "Open High Guard 2024 Shipyard Refit Spreadsheet"
                   }
-                  onClick={() => (isEditing ? setEditingShipId(null) : startEdit(ship))}
+                  onClick={() => setSpreadsheetShip(ship)}
                   className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-35 disabled:cursor-not-allowed border border-slate-700 text-[11px] flex items-center gap-1 transition-colors"
                 >
-                  <Edit3 className="w-3 h-3" /> {isEditing ? "Cancel" : "Shipyard"}
+                  <Wrench className="w-3 h-3 text-amber-400" /> Shipyard
                 </button>
               </div>
             </div>
 
-            {isEditing && draft ? (
-              <div className="bg-slate-950 border border-amber-700/60 rounded-lg p-2.5 space-y-2.5">
-                <div className="flex items-center justify-between">
-                  <div className="font-semibold text-amber-300 flex items-center gap-1">
-                    <Wrench className="w-3.5 h-3.5" /> Paid Shipyard Refit & Repair (Starport{" "}
-                    {starport}, TL{worldTl})
-                  </div>
-                  <span className="text-[10px] font-mono text-slate-400">
-                    Funds: {formatCr(companyAvailable)}
-                  </span>
-                </div>
-                <div className="text-[10px] text-slate-400">
-                  All upgrades and hull repairs must be paid from your Company account at a
-                  qualified Starport shipyard (Class A/B for refits, Class C for repairs). Hull
-                  tonnage &amp; fuel cannot be altered for free.
-                </div>
-                <div className="grid grid-cols-3 gap-1.5 text-[11px]">
-                  {(
-                    [
-                      ["TL (max " + worldTl + ")", "tl", 1, worldTl],
-                      ["Hull Max", "hull_points_max", 1, 9999],
-                      ["Armor", "armor_rating", 0, 20],
-                      ["Thrust (M)", "thrust", 0, 9],
-                      ["Jump (J)", "jump_rating", 0, 6],
-                      ["Power Out", "power_plant_output", 10, 5000],
-                      ["Stealth DM", "stealth_dm", -6, 0],
-                      ["Fuel Cap (t)", "fuel_capacity_tons", 0, 5000],
-                      ["Cargo Cap (t)", "cargo_capacity_tons", 0, 5000],
-                      ["Staterooms", "staterooms", 0, 200],
-                    ] as const
-                  ).map(([lbl, key, minV, maxV]) => (
-                    <label key={key} className="block">
-                      <span className="text-[10px] text-slate-400">{lbl}</span>
-                      <input
-                        type="number"
-                        min={minV}
-                        max={maxV}
-                        className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 font-mono"
-                        value={Number(draft.spec[key] ?? 0)}
-                        onChange={(e) =>
-                          setDraft({
-                            ...draft,
-                            spec: { ...draft.spec, [key]: Number(e.target.value) },
-                          })
-                        }
-                      />
-                    </label>
-                  ))}
-                  <label className="block">
-                    <span className="text-[10px] text-slate-400">Sensors</span>
-                    <select
-                      className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5"
-                      value={draft.spec.sensor_grade}
-                      onChange={(e) =>
-                        setDraft({ ...draft, spec: { ...draft.spec, sensor_grade: e.target.value } })
-                      }
-                    >
-                      {["basic", "civilian", "military", "improved", "advanced"].map((g) => (
-                        <option key={g} value={g}>
-                          {g}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="block">
-                    <span className="text-[10px] text-slate-400">
-                      Repair Hull (now {ship.hull_current}/{draft.spec.hull_points_max})
-                    </span>
-                    <input
-                      type="number"
-                      min={ship.hull_current}
-                      max={draft.spec.hull_points_max}
-                      className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 font-mono"
-                      value={draft.hull_current}
-                      onChange={(e) =>
-                        setDraft({
-                          ...draft,
-                          hull_current: Math.max(
-                            ship.hull_current,
-                            Math.min(draft.spec.hull_points_max, Number(e.target.value))
-                          ),
-                        })
-                      }
-                    />
-                  </label>
-                </div>
-
-                {/* Live Itemized Shipyard Quote */}
-                <div className="bg-slate-900 border border-slate-800 rounded p-2 space-y-1 text-[11px]">
-                  <div className="flex justify-between font-semibold">
-                    <span className="text-slate-300">Shipyard Work Order</span>
-                    <span className="font-mono text-amber-300">
-                      {quoting ? "Pricing…" : formatCr(quote?.total_cost_cr ?? 0)}
-                    </span>
-                  </div>
-                  {quote?.block_reason && (
-                    <div className="text-red-400 font-medium">{quote.block_reason}</div>
-                  )}
-                  {draftValidation && !draftValidation.valid && (
-                    <div className="text-red-400">
-                      High Guard Validation Error:{" "}
-                      {draftValidation.issues.map((i) => i.message).join("; ")}
-                    </div>
-                  )}
-                  {quote && quote.items.length === 0 && !quote.block_reason && (
-                    <div className="text-slate-500">Adjust specs or hull repair above to price a refit.</div>
-                  )}
-                  {quote &&
-                    quote.items.map((it, i) => (
-                      <div key={i} className="flex justify-between text-[10px] text-slate-300">
-                        <span>• {it.item}</span>
-                        <span className="font-mono text-amber-200">{formatCr(it.cost_cr)}</span>
-                      </div>
-                    ))}
-                  {quote && quote.total_cost_cr > companyAvailable && (
-                    <div className="text-red-400 text-[10px] font-semibold">
-                      Insufficient Company credits (short by{" "}
-                      {formatCr(quote.total_cost_cr - companyAvailable)}).
-                    </div>
-                  )}
-                </div>
-
-                <button
-                  disabled={!refitCanSubmit}
-                  title={
-                    !quote?.has_changes
-                      ? "No changes to apply"
-                      : !quote.allowed
-                      ? quote.block_reason || "Not allowed at this starport"
-                      : !draftValidation?.valid
-                      ? "Fix High Guard validation errors first"
-                      : companyAvailable < quote.total_cost_cr
-                      ? "Insufficient Company funds"
-                      : "Pay shipyard invoice and apply refit"
-                  }
-                  onClick={saveShip}
-                  className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-35 disabled:cursor-not-allowed text-white font-semibold rounded py-1.5 flex items-center justify-center gap-1 transition-colors"
-                >
-                  <Save className="w-3.5 h-3.5" />
-                  {quote?.has_changes
-                    ? `Pay ${formatCr(quote.total_cost_cr)} & Apply Refit (${quote.days_required}d)`
-                    : "No Refit Changes"}
-                </button>
-              </div>
-            ) : (
-              <>
+            <>
                 {/* Key Stats Grid */}
                 <div className="grid grid-cols-4 gap-1.5 text-center font-mono text-[11px]">
                   <div className="bg-slate-950 border border-slate-800 rounded p-1.5">
@@ -691,10 +475,24 @@ export function ShipsPanel({ campaignId, snapshot, onRefresh, onError }: Props) 
                   </div>
                 )}
               </>
-            )}
           </div>
         );
       })}
+      {spreadsheetShip && (
+        <ShipSpreadsheetModal
+          campaignId={campaignId}
+          ship={spreadsheetShip}
+          starport={starport}
+          worldTl={worldTl}
+          companyAvailable={companyAvailable}
+          onClose={() => setSpreadsheetShip(null)}
+          onApplied={async (msg) => {
+            setPortMsg(msg);
+            await onRefresh();
+          }}
+          onError={onError}
+        />
+      )}
     </div>
   );
 }

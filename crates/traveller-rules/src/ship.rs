@@ -10,8 +10,55 @@ pub enum HullConfig {
     Streamlined,
     PartiallyStreamlined,
     Distributed,
-    Planetoid,
+    Sphere,
     CloseStructure,
+    DispersedStructure,
+    Planetoid,
+    BufferedPlanetoid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmorType {
+    None,
+    TitaniumSteel,
+    #[default]
+    Crystaliron,
+    BondedSuperdense,
+    MolecularBonded,
+}
+
+impl ArmorType {
+    /// High Guard 2024: percentage of hull tonnage per point of armor, plus min TL.
+    pub fn pct_per_point(self) -> f64 {
+        match self {
+            ArmorType::None => 0.0,
+            ArmorType::TitaniumSteel => 2.5,
+            ArmorType::Crystaliron => 1.25,
+            ArmorType::BondedSuperdense => 0.8,
+            ArmorType::MolecularBonded => 0.5,
+        }
+    }
+
+    pub fn min_tl(self) -> u8 {
+        match self {
+            ArmorType::None => 0,
+            ArmorType::TitaniumSteel => 7,
+            ArmorType::Crystaliron => 10,
+            ArmorType::BondedSuperdense => 14,
+            ArmorType::MolecularBonded => 16,
+        }
+    }
+
+    pub fn cost_per_point_per_100t_cr(self) -> i64 {
+        match self {
+            ArmorType::None => 0,
+            ArmorType::TitaniumSteel => 250_000,
+            ArmorType::Crystaliron => 500_000,
+            ArmorType::BondedSuperdense => 750_000,
+            ArmorType::MolecularBonded => 1_250_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +109,8 @@ pub struct ShipSpec {
     pub tl: u8,
     pub hull_config: HullConfig,
     pub hull_points_max: i32,
+    #[serde(default)]
+    pub armor_type: ArmorType,
     pub armor_rating: i32,
     pub armor_tonnage: f64,
     pub thrust: u8,
@@ -71,7 +120,13 @@ pub struct ShipSpec {
     pub power_plant_output: i32,
     pub power_plant_tonnage: f64,
     pub bridge_tonnage: f64,
+    #[serde(default = "default_bridge_type")]
+    pub bridge_type: String, // "standard", "holographic", "dual_cockpit"
     pub computer_bandwidth: u32,
+    #[serde(default)]
+    pub computer_bis: bool,
+    #[serde(default)]
+    pub computer_fib: bool,
     pub sensor_grade: SensorGrade,
     pub sensor_tonnage: f64,
     #[serde(default)]
@@ -79,20 +134,60 @@ pub struct ShipSpec {
     /// Stealth coating DM: 0, -2, -4, or -6 (High Guard 2024 p. 76–77)
     #[serde(default)]
     pub stealth_dm: i32,
+    #[serde(default)]
+    pub hull_reflec: bool,
+    #[serde(default)]
+    pub radiation_shielding: bool,
+    #[serde(default)]
+    pub heat_shielding: bool,
+    #[serde(default)]
+    pub self_sealing: bool,
+    #[serde(default)]
+    pub reinforced_hull: bool,
+    #[serde(default)]
+    pub light_hull: bool,
     pub fuel_capacity_tons: f64,
     #[serde(default)]
     pub fuel_scoops: bool,
     #[serde(default)]
     pub fuel_processor_tons: f64,
     pub staterooms: u32,
+    #[serde(default)]
+    pub high_staterooms: u32,
+    #[serde(default)]
+    pub luxury_staterooms: u32,
+    #[serde(default)]
+    pub barracks_berths: u32,
     pub low_berths: u32,
+    #[serde(default)]
+    pub emergency_low_berths: u32,
     pub common_areas_tonnage: f64,
+    #[serde(default)]
+    pub armory_tons: f64,
+    #[serde(default)]
+    pub medical_bay_tons: f64,
+    #[serde(default)]
+    pub workshop_tons: f64,
+    #[serde(default)]
+    pub briefing_room: bool,
+    #[serde(default)]
+    pub library: bool,
+    #[serde(default)]
+    pub probe_drones: u32,
+    #[serde(default)]
+    pub docking_bay_tons: f64,
+    #[serde(default)]
+    pub cargo_scoops: bool,
     pub cargo_capacity_tons: f64,
     #[serde(default)]
     pub misc_tonnage: f64,
     #[serde(default)]
     pub weapon_mounts: Vec<WeaponMount>,
     pub purchase_price_cr: i64,
+}
+
+fn default_bridge_type() -> String {
+    "standard".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,9 +220,22 @@ pub fn validate_ship(spec: &ShipSpec) -> ShipValidationReport {
     let mut issues = Vec::new();
     let hull = f64::from(spec.tonnage);
 
-    // 1. Tonnage balance
+    // 1. Tonnage balance (all stateroom/berth types & ship auxiliaries included)
     let weapons_tonnage: f64 = spec.weapon_mounts.iter().map(|w| w.tonnage).sum();
-    let stateroom_tonnage = f64::from(spec.staterooms) * 4.0 + f64::from(spec.low_berths) * 0.5;
+    let stateroom_tonnage = f64::from(spec.staterooms) * 4.0
+        + f64::from(spec.high_staterooms) * 6.0
+        + f64::from(spec.luxury_staterooms) * 10.0
+        + f64::from(spec.barracks_berths) * 2.0
+        + f64::from(spec.low_berths) * 0.5
+        + f64::from(spec.emergency_low_berths) * 1.0;
+    let aux_tonnage = spec.armory_tons
+        + spec.medical_bay_tons
+        + spec.workshop_tons
+        + if spec.briefing_room { 4.0 } else { 0.0 }
+        + if spec.library { 4.0 } else { 0.0 }
+        + f64::from(spec.probe_drones) * 0.2
+        + spec.docking_bay_tons
+        + if spec.cargo_scoops { 2.0 } else { 0.0 };
     let used_tonnage = spec.armor_tonnage
         + spec.m_drive_tonnage
         + spec.j_drive_tonnage
@@ -138,6 +246,7 @@ pub fn validate_ship(spec: &ShipSpec) -> ShipValidationReport {
         + spec.fuel_processor_tons
         + stateroom_tonnage
         + spec.common_areas_tonnage
+        + aux_tonnage
         + weapons_tonnage
         + spec.cargo_capacity_tons
         + spec.misc_tonnage;
@@ -228,7 +337,11 @@ pub fn validate_ship(spec: &ShipSpec) -> ShipValidationReport {
     if spec.fuel_scoops
         && matches!(
             spec.hull_config,
-            HullConfig::Standard | HullConfig::Distributed | HullConfig::Planetoid
+            HullConfig::Standard
+                | HullConfig::Distributed
+                | HullConfig::DispersedStructure
+                | HullConfig::Planetoid
+                | HullConfig::BufferedPlanetoid
         )
     {
         issues.push(ValidationIssue {
@@ -852,21 +965,93 @@ pub fn calculate_refit_cost(
         days += 14;
     }
 
-    // 4. Armor Rating Upgrade (High Guard: ~Cr500k per armor point per 100t)
-    if proposed.armor_rating != current.armor_rating {
-        let delta = i64::from((proposed.armor_rating - current.armor_rating).abs());
-        let cost = if proposed.armor_rating > current.armor_rating {
-            delta * 500_000 * i64::from((proposed.tonnage / 100).max(1))
-        } else {
-            delta * 50_000 // stripping armor labor
-        };
+    // 4. Armor Rating / Type Upgrade (High Guard 2024)
+    if proposed.armor_rating != current.armor_rating || proposed.armor_type != current.armor_type {
+        let units = i64::from((proposed.tonnage / 100).max(1));
+        let old_val = i64::from(current.armor_rating) * current.armor_type.cost_per_point_per_100t_cr() * units;
+        let new_val = i64::from(proposed.armor_rating) * proposed.armor_type.cost_per_point_per_100t_cr() * units;
+        let cost = (new_val - old_val / 2).max(100_000);
         items.push(RefitLineItem {
-            item: format!("Armor refit ({} → {})", current.armor_rating, proposed.armor_rating),
+            item: format!(
+                "Armor refit ({:?} {} → {:?} {})",
+                current.armor_type, current.armor_rating, proposed.armor_type, proposed.armor_rating
+            ),
             cost_cr: cost,
             requires_shipyard: true,
         });
         needs_shipyard = true;
         days += 7;
+    }
+
+    // 4b. Hull Configuration & Hull Features (Reflec, Radiation/Heat Shielding, Self-Sealing, Reinforced/Light)
+    if proposed.hull_config != current.hull_config {
+        let cost = i64::from(proposed.tonnage) * 15_000;
+        items.push(RefitLineItem {
+            item: format!("Hull reconfiguration ({:?} → {:?})", current.hull_config, proposed.hull_config),
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 28;
+    }
+    if proposed.hull_reflec != current.hull_reflec {
+        let cost = if proposed.hull_reflec { i64::from(proposed.tonnage) * 100_000 } else { 100_000 };
+        items.push(RefitLineItem {
+            item: if proposed.hull_reflec { "Install Reflec Hull Coating (+3 vs Lasers)".into() } else { "Strip Reflec Coating".into() },
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 7;
+    }
+    if proposed.radiation_shielding != current.radiation_shielding {
+        let cost = if proposed.radiation_shielding { i64::from(proposed.tonnage) * 25_000 } else { 50_000 };
+        items.push(RefitLineItem {
+            item: if proposed.radiation_shielding { "Install Radiation Shielding".into() } else { "Remove Radiation Shielding".into() },
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 5;
+    }
+    if proposed.heat_shielding != current.heat_shielding {
+        let cost = if proposed.heat_shielding { i64::from(proposed.tonnage) * 100_000 } else { 50_000 };
+        items.push(RefitLineItem {
+            item: if proposed.heat_shielding { "Install Heat Shielding (Corona/Entry)".into() } else { "Remove Heat Shielding".into() },
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 5;
+    }
+    if proposed.self_sealing != current.self_sealing {
+        let cost = if proposed.self_sealing { i64::from(proposed.tonnage) * 10_000 } else { 25_000 };
+        items.push(RefitLineItem {
+            item: if proposed.self_sealing { "Install Self-Sealing Hull".into() } else { "Remove Self-Sealing Hull".into() },
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 4;
+    }
+    if proposed.reinforced_hull != current.reinforced_hull {
+        let cost = if proposed.reinforced_hull { i64::from(proposed.tonnage) * 25_000 } else { 100_000 };
+        items.push(RefitLineItem {
+            item: if proposed.reinforced_hull { "Reinforced Hull Structural Bracing (+10% Hull)".into() } else { "Remove Reinforced Hull Bracing".into() },
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 14;
+    }
+    if proposed.light_hull != current.light_hull {
+        items.push(RefitLineItem {
+            item: if proposed.light_hull { "Lightened Hull Conversion (-10% Hull)".into() } else { "Restore Standard Hull Framing".into() },
+            cost_cr: i64::from(proposed.tonnage) * 10_000,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 14;
     }
 
     // 5. M-Drive Thrust Refit (Core/HG: MCr2 per drive ton, ~1% hull per thrust)
@@ -953,22 +1138,202 @@ pub fn calculate_refit_cost(
         days += 7;
     }
 
-    // 10. Staterooms / Low Berths / Fuel Tankage / Cargo Reconfiguration
-    if proposed.staterooms != current.staterooms {
-        let delta = i64::from(proposed.staterooms.abs_diff(current.staterooms));
-        let cost = if proposed.staterooms > current.staterooms {
-            delta * 500_000
+    // 10. All Stateroom, Berth, Bridge, Computer, Fuel & Auxiliary Reconfiguration
+    let mut add_count_refit = |label: &str, old_v: u32, new_v: u32, unit_buy_cr: i64, unit_rm_cr: i64, d: u32| {
+        if new_v != old_v {
+            let delta = i64::from(new_v.abs_diff(old_v));
+            let cost = if new_v > old_v { delta * unit_buy_cr } else { delta * unit_rm_cr };
+            items.push(RefitLineItem {
+                item: format!("{label} ({old_v} → {new_v})"),
+                cost_cr: cost,
+                requires_shipyard: true,
+            });
+            needs_shipyard = true;
+            days += d;
+        }
+    };
+    add_count_refit("Standard Staterooms (4t)", current.staterooms, proposed.staterooms, 500_000, 50_000, 4);
+    add_count_refit("High Staterooms (6t)", current.high_staterooms, proposed.high_staterooms, 800_000, 80_000, 5);
+    add_count_refit("Luxury Staterooms (10t)", current.luxury_staterooms, proposed.luxury_staterooms, 1_500_000, 100_000, 7);
+    add_count_refit("Marine Barracks (2t)", current.barracks_berths, proposed.barracks_berths, 100_000, 20_000, 3);
+    add_count_refit("Low Berths (0.5t)", current.low_berths, proposed.low_berths, 50_000, 10_000, 2);
+    add_count_refit("Emergency Low Berths (1t)", current.emergency_low_berths, proposed.emergency_low_berths, 100_000, 15_000, 2);
+    add_count_refit("Probe Drones (0.2t)", current.probe_drones, proposed.probe_drones, 100_000, 5_000, 1);
+
+    if (proposed.common_areas_tonnage - current.common_areas_tonnage).abs() > 0.1 {
+        let delta = (proposed.common_areas_tonnage - current.common_areas_tonnage).abs();
+        let cost = if proposed.common_areas_tonnage > current.common_areas_tonnage {
+            (delta * 100_000.0).round() as i64
         } else {
-            delta * 50_000
+            (delta * 15_000.0).round() as i64
         };
         items.push(RefitLineItem {
-            item: format!("Stateroom refit ({} → {})", current.staterooms, proposed.staterooms),
+            item: format!("Common Areas ({:.1}t → {:.1}t)", current.common_areas_tonnage, proposed.common_areas_tonnage),
             cost_cr: cost,
             requires_shipyard: true,
         });
         needs_shipyard = true;
-        days += 4;
+        days += 2;
     }
+
+    if proposed.bridge_type != current.bridge_type {
+        let cost = match proposed.bridge_type.as_str() {
+            "holographic" => 250_000 * i64::from((proposed.tonnage / 100).max(1)),
+            _ => 150_000,
+        };
+        items.push(RefitLineItem {
+            item: format!("Bridge controls ({} → {})", current.bridge_type, proposed.bridge_type),
+            cost_cr: cost,
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 5;
+    }
+
+    if proposed.computer_bandwidth != current.computer_bandwidth
+        || proposed.computer_bis != current.computer_bis
+        || proposed.computer_fib != current.computer_fib
+    {
+        let comp_cost = |bw: u32, bis: bool, fib: bool| -> i64 {
+            let base: i64 = match bw {
+                0..=5 => 30_000,
+                6..=10 => 160_000,
+                11..=15 => 2_000_000,
+                16..=20 => 5_000_000,
+                21..=25 => 10_000_000,
+                26..=30 => 20_000_000,
+                _ => 30_000_000,
+            };
+            let mult = 1.0 + if bis { 0.5 } else { 0.0 } + if fib { 0.5 } else { 0.0 };
+            (base as f64 * mult).round() as i64
+        };
+        let old_c = comp_cost(current.computer_bandwidth, current.computer_bis, current.computer_fib);
+        let new_c = comp_cost(proposed.computer_bandwidth, proposed.computer_bis, proposed.computer_fib);
+        items.push(RefitLineItem {
+            item: format!(
+                "Ship Computer (/{} → /{}{}{})",
+                current.computer_bandwidth,
+                proposed.computer_bandwidth,
+                if proposed.computer_bis { "bis" } else { "" },
+                if proposed.computer_fib { "fib" } else { "" }
+            ),
+            cost_cr: (new_c - old_c / 2).max(50_000),
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 3;
+    }
+
+    if proposed.fuel_scoops != current.fuel_scoops {
+        items.push(RefitLineItem {
+            item: if proposed.fuel_scoops { "Install Fuel Scoops".into() } else { "Remove Fuel Scoops".into() },
+            cost_cr: if proposed.fuel_scoops { 1_000_000 } else { 50_000 },
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 3;
+    }
+    if (proposed.fuel_processor_tons - current.fuel_processor_tons).abs() > 0.1 {
+        let delta = (proposed.fuel_processor_tons - current.fuel_processor_tons).abs();
+        items.push(RefitLineItem {
+            item: format!("Fuel Processor ({:.1}t → {:.1}t)", current.fuel_processor_tons, proposed.fuel_processor_tons),
+            cost_cr: if proposed.fuel_processor_tons > current.fuel_processor_tons {
+                (delta * 50_000.0).round() as i64
+            } else {
+                25_000
+            },
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 2;
+    }
+
+    for (label, old_t, new_t, rate) in [
+        ("Ship's Armory", current.armory_tons, proposed.armory_tons, 250_000.0),
+        ("Medical Bay", current.medical_bay_tons, proposed.medical_bay_tons, 500_000.0),
+        ("Workshop", current.workshop_tons, proposed.workshop_tons, 150_000.0),
+        ("Small Craft Docking Bay", current.docking_bay_tons, proposed.docking_bay_tons, 200_000.0),
+    ] {
+        if (new_t - old_t).abs() > 0.1 {
+            let delta = (new_t - old_t).abs();
+            items.push(RefitLineItem {
+                item: format!("{label} ({old_t:.1}t → {new_t:.1}t)"),
+                cost_cr: if new_t > old_t { (delta * rate).round() as i64 } else { (delta * 20_000.0).round() as i64 },
+                requires_shipyard: true,
+            });
+            needs_shipyard = true;
+            days += 3;
+        }
+    }
+    if proposed.briefing_room != current.briefing_room {
+        items.push(RefitLineItem {
+            item: if proposed.briefing_room { "Install Briefing Room (4t)".into() } else { "Remove Briefing Room".into() },
+            cost_cr: if proposed.briefing_room { 500_000 } else { 50_000 },
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 2;
+    }
+    if proposed.library != current.library {
+        items.push(RefitLineItem {
+            item: if proposed.library { "Install Ship's Library (4t)".into() } else { "Remove Ship's Library".into() },
+            cost_cr: if proposed.library { 4_000_000 } else { 50_000 },
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 2;
+    }
+    if proposed.cargo_scoops != current.cargo_scoops {
+        items.push(RefitLineItem {
+            item: if proposed.cargo_scoops { "Install Cargo Scoop (2t)".into() } else { "Remove Cargo Scoop".into() },
+            cost_cr: if proposed.cargo_scoops { 500_000 } else { 50_000 },
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 2;
+    }
+
+    // 11. Weapon Mounts / Turrets / Barbettes Refit
+    let old_w_json = serde_json::to_string(&current.weapon_mounts).unwrap_or_default();
+    let new_w_json = serde_json::to_string(&proposed.weapon_mounts).unwrap_or_default();
+    if old_w_json != new_w_json {
+        let mount_value = |mounts: &[WeaponMount]| -> i64 {
+            mounts.iter().map(|m| {
+                let mount_base = match m.mount_kind.as_str() {
+                    "single_turret" => 200_000,
+                    "double_turret" => 500_000,
+                    "triple_turret" => 1_000_000,
+                    "barbette" => 4_000_000,
+                    "bay" => 12_000_000,
+                    _ => 500_000,
+                };
+                let weap_cost: i64 = m.weapons.iter().map(|w| {
+                    let wl = w.to_ascii_lowercase();
+                    if wl.contains("particle") { 4_000_000 }
+                    else if wl.contains("beam") { 1_000_000 }
+                    else if wl.contains("missile") { 750_000 }
+                    else if wl.contains("pulse") { 500_000 }
+                    else if wl.contains("sand") { 250_000 }
+                    else { 500_000 }
+                }).sum();
+                mount_base + weap_cost
+            }).sum()
+        };
+        let old_v = mount_value(&current.weapon_mounts);
+        let new_v = mount_value(&proposed.weapon_mounts);
+        items.push(RefitLineItem {
+            item: format!(
+                "Ordnance & Turret Refit ({} → {} mount(s))",
+                current.weapon_mounts.len(),
+                proposed.weapon_mounts.len()
+            ),
+            cost_cr: (new_v - old_v / 2).max(150_000),
+            requires_shipyard: true,
+        });
+        needs_shipyard = true;
+        days += 5;
+    }
+
     if (proposed.fuel_capacity_tons - current.fuel_capacity_tons).abs() > 0.1 {
         let delta = (proposed.fuel_capacity_tons - current.fuel_capacity_tons).abs();
         items.push(RefitLineItem {
@@ -1034,6 +1399,7 @@ pub fn sample_free_trader() -> ShipSpec {
         tl: 12,
         hull_config: HullConfig::Streamlined,
         hull_points_max: 80,
+        armor_type: ArmorType::Crystaliron,
         armor_rating: 2,
         armor_tonnage: 5.0,
         thrust: 1,
@@ -1043,17 +1409,38 @@ pub fn sample_free_trader() -> ShipSpec {
         power_plant_output: 75,
         power_plant_tonnage: 5.0,
         bridge_tonnage: 10.0,
+        bridge_type: "standard".to_string(),
         computer_bandwidth: 5,
+        computer_bis: false,
+        computer_fib: false,
         sensor_grade: SensorGrade::Civilian,
         sensor_tonnage: 1.0,
         extended_sensor_array: false,
         stealth_dm: 0,
+        hull_reflec: false,
+        radiation_shielding: false,
+        heat_shielding: false,
+        self_sealing: false,
+        reinforced_hull: false,
+        light_hull: false,
         fuel_capacity_tons: 22.0,
         fuel_scoops: true,
         fuel_processor_tons: 1.0,
         staterooms: 10,
+        high_staterooms: 0,
+        luxury_staterooms: 0,
+        barracks_berths: 0,
         low_berths: 20,
+        emergency_low_berths: 0,
         common_areas_tonnage: 12.0,
+        armory_tons: 0.0,
+        medical_bay_tons: 0.0,
+        workshop_tons: 0.0,
+        briefing_room: false,
+        library: false,
+        probe_drones: 0,
+        docking_bay_tons: 0.0,
+        cargo_scoops: false,
         cargo_capacity_tons: 82.0,
         misc_tonnage: 0.0,
         weapon_mounts: vec![],

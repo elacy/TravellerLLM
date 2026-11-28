@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Package, Search, ShoppingBag, Store, TrendingUp } from "lucide-react";
-import { api, CampaignSnapshot, formatCr, ItemRecord } from "../lib/api";
+import { AlertTriangle, Briefcase, Clock, Package, Search, ShoppingBag, Store, TrendingUp } from "lucide-react";
+import { api, CampaignSnapshot, formatCr, ItemRecord, LocalBrokerOffer } from "../lib/api";
 
 interface Props {
   campaignId: string;
@@ -25,22 +25,25 @@ const CATEGORIES = [
 export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Props) {
   const [subTab, setSubTab] = useState<"trade" | "shop">("trade");
 
-  // Trade state (automatically defaults to MAX Broker & Steward across entire fleet incl. robots!)
+  // Trade state: NEVER specify a manual broker score — use Fleet Max Broker (0% fee)
+  // OR search for a Local Starport Broker (takes 1D days, charges 5%–20% commission).
   const [destSystem, setDestSystem] = useState("Efate");
   const [parsecs, setParsecs] = useState(1);
-  const [brokerSkill, setBrokerSkill] = useState(snapshot.fleet_broker?.max_broker_skill ?? 1);
-  const [stewardSkill, setStewardSkill] = useState(snapshot.fleet_broker?.max_steward_skill ?? 0);
   const [includeIllegal, setIncludeIllegal] = useState(false);
-
-  useEffect(() => {
-    if (snapshot.fleet_broker) {
-      setBrokerSkill(snapshot.fleet_broker.max_broker_skill);
-      setStewardSkill(snapshot.fleet_broker.max_steward_skill);
-    }
-  }, [snapshot.fleet_broker]);
+  const [localBroker, setLocalBroker] = useState<LocalBrokerOffer | null>(null);
+  const [useLocalBroker, setUseLocalBroker] = useState(false);
+  const [searchingBroker, setSearchingBroker] = useState(false);
+  const [searchingMarket, setSearchingMarket] = useState(false);
   const [market, setMarket] = useState<Record<string, unknown> | null>(null);
   const [tradeMsg, setTradeMsg] = useState<string | null>(null);
   const [buyTons, setBuyTons] = useState<Record<number, number>>({});
+
+  // Clear local broker & cached market whenever the campaign moves to a new star system
+  useEffect(() => {
+    setLocalBroker(null);
+    setUseLocalBroker(false);
+    setMarket(null);
+  }, [snapshot.campaign.current_system_name]);
 
   // Shop state
   const [itemQ, setItemQ] = useState("");
@@ -83,19 +86,58 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
     }
   }
 
+  async function findLocalBroker() {
+    setTradeMsg(null);
+    setSearchingBroker(true);
+    try {
+      const offer = await api.tradeFindBroker(campaignId, includeIllegal);
+      if (offer.found) {
+        setLocalBroker(offer);
+        setUseLocalBroker(true);
+      } else {
+        setLocalBroker(null);
+        setUseLocalBroker(false);
+      }
+      setTradeMsg(offer.note);
+      await onRefresh();
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      setSearchingBroker(false);
+    }
+  }
+
   async function generateMarket() {
     setTradeMsg(null);
+    setSearchingMarket(true);
     try {
+      const activeLocal = useLocalBroker && localBroker?.found ? localBroker : null;
       const res = await api.tradeMarket(campaignId, {
         dest_system: destSystem,
         parsecs,
-        broker_skill: brokerSkill,
-        steward_skill: stewardSkill,
         include_illegal: includeIllegal,
+        ...(activeLocal
+          ? {
+              local_broker_skill: activeLocal.broker_skill,
+              local_broker_commission_pct: activeLocal.commission_pct,
+              local_broker_name: activeLocal.broker_name,
+            }
+          : {}),
       });
       setMarket(res);
+      const d = Number(res.days_spent ?? 1);
+      setTradeMsg(
+        `Located suppliers & port exchange in ${d} day(s) using ${String(
+          res.broker_source ?? "Fleet Broker"
+        )} (Broker-${res.effective_broker_skill ?? 0}${
+          Number(res.commission_pct ?? 0) > 0 ? `, ${res.commission_pct}% fee` : ""
+        }).`
+      );
+      await onRefresh();
     } catch (e) {
       onError((e as Error).message);
+    } finally {
+      setSearchingMarket(false);
     }
   }
 
@@ -111,6 +153,7 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
       return;
     }
     const tons = Math.min(offer.tons_available, Math.max(1, buyTons[offer.d66] ?? 5));
+    const commPct = useLocalBroker && localBroker?.found ? localBroker.commission_pct : 0;
     try {
       const res = await api.tradeBuy(campaignId, {
         ship_id: ship.id,
@@ -118,9 +161,13 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
         good_name: offer.name,
         tons,
         unit_price_cr: offer.unit_price_cr,
+        commission_pct: commPct,
       });
+      const commNote = Number(res.commission_cr ?? 0) > 0 ? ` (incl. ${formatCr(Number(res.commission_cr))} broker fee)` : "";
       setTradeMsg(
-        `Purchased ${tons}t ${offer.name} for ${formatCr(Number(res.total_cost_cr ?? tons * offer.unit_price_cr))}.`
+        `Purchased ${tons}t ${offer.name} for ${formatCr(
+          Number(res.total_cost_cr ?? tons * offer.unit_price_cr)
+        )}${commNote}.`
       );
       await onRefresh();
     } catch (e) {
@@ -131,18 +178,26 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
   async function handleSellCargo(lot: { d66?: number; name: string; tons: number }) {
     const ship = snapshot.ships[0];
     if (!ship) return;
+    const activeLocal = useLocalBroker && localBroker?.found ? localBroker : null;
     try {
       const res = await api.tradeSell(campaignId, {
         ship_id: ship.id,
         d66: lot.d66 ?? 11,
         good_name: lot.name,
         tons: lot.tons,
-        broker_skill: brokerSkill,
+        ...(activeLocal
+          ? {
+              local_broker_skill: activeLocal.broker_skill,
+              local_broker_commission_pct: activeLocal.commission_pct,
+            }
+          : {}),
       });
+      const days = Number(res.days_spent ?? 1);
+      const commNote = Number(res.commission_cr ?? 0) > 0 ? ` after ${formatCr(Number(res.commission_cr))} broker fee` : "";
       setTradeMsg(
-        `Sold ${lot.tons}t ${lot.name} at ${res.sale_percent ?? "?"}% for ${formatCr(
+        `Found buyer in ${days}d and sold ${lot.tons}t ${lot.name} at ${res.sale_percent ?? "?"}% for ${formatCr(
           Number(res.total_revenue_cr ?? 0)
-        )}!`
+        )}${commNote}!`
       );
       await onRefresh();
     } catch (e) {
@@ -248,80 +303,110 @@ export function TradeShopPanel({ campaignId, snapshot, onRefresh, onError }: Pro
 
       {subTab === "trade" ? (
         <div className="space-y-2.5">
-          {/* Market Generator Controls */}
+          {/* Market & Local Broker Search Controls (no manual broker score!) */}
           <div className="bg-slate-900 border border-slate-800 rounded p-2.5 space-y-2">
-            <div className="font-semibold text-cyan-300 flex items-center gap-1">
-              <Store className="w-3.5 h-3.5" /> {snapshot.campaign.current_system_name} Starport Trade Exchange
-            </div>
-            {snapshot.fleet_broker && (
-              <div className="bg-cyan-950/40 border border-cyan-800/60 rounded px-2 py-1 text-[10px] text-cyan-200 flex items-center justify-between gap-2">
-                <span>
-                  Fleet Max Broker: <strong>Broker-{snapshot.fleet_broker.max_broker_skill}</strong> ({snapshot.fleet_broker.broker_source})
+            <div className="font-semibold text-cyan-300 flex items-center justify-between gap-1">
+              <span className="flex items-center gap-1">
+                <Store className="w-3.5 h-3.5" /> {snapshot.campaign.current_system_name} Starport Trade Exchange
+              </span>
+              {Array.isArray(market?.trade_codes) && (
+                <span className="font-mono text-[10px] text-amber-300">
+                  {(market.trade_codes as string[]).join(" ") || "No codes"}
                 </span>
-                {Array.isArray(market?.trade_codes) && (
-                  <span className="font-mono text-amber-300">
-                    Codes: {(market.trade_codes as string[]).join(" ") || "None"}
+              )}
+            </div>
+
+            {/* Active Broker Representation (Fleet Auto-Max vs Searched Local Broker) */}
+            <div className="bg-slate-950 border border-slate-800 rounded p-2 space-y-1.5 text-[11px]">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-300">
+                  Fleet Broker (0% fee):{" "}
+                  <strong className="text-cyan-300">
+                    Broker-{snapshot.fleet_broker?.max_broker_skill ?? 0}
+                  </strong>{" "}
+                  <span className="text-[10px] text-slate-400">
+                    ({snapshot.fleet_broker?.broker_source ?? "Crew"}) · Steward-
+                    {snapshot.fleet_broker?.max_steward_skill ?? 0}
                   </span>
-                )}
+                </span>
+                <button
+                  disabled={
+                    searchingBroker ||
+                    (snapshot.current_system_info?.starport ?? "A").toUpperCase() === "X"
+                  }
+                  title={
+                    (snapshot.current_system_info?.starport ?? "A").toUpperCase() === "X"
+                      ? "Starport Class X has no commercial brokers"
+                      : "Spend 1D days searching the starport for a higher-skill local broker (5% commission per skill level)"
+                  }
+                  onClick={findLocalBroker}
+                  className="shrink-0 bg-amber-800/80 hover:bg-amber-700 disabled:opacity-35 disabled:cursor-not-allowed text-amber-100 rounded px-2 py-1 text-[10px] font-medium flex items-center gap-1"
+                >
+                  <Briefcase className="w-3 h-3" />
+                  {searchingBroker ? "Searching…" : "Find Local Broker (1D days)"}
+                </button>
               </div>
-            )}
-            <div className="grid grid-cols-2 gap-1.5">
-              <label className="block">
-                <span className="text-[10px] text-slate-400">Destination World</span>
+
+              {localBroker?.found && (
+                <div className="flex items-center justify-between gap-2 bg-amber-950/40 border border-amber-800/60 rounded px-2 py-1 text-[10px]">
+                  <span className="text-amber-200">
+                    Hired Factor: <strong>{localBroker.broker_name}</strong> ·{" "}
+                    <strong>Broker-{localBroker.broker_skill}</strong> ({localBroker.commission_pct}% fee)
+                  </span>
+                  <label className="flex items-center gap-1 text-amber-100 cursor-pointer shrink-0">
+                    <input
+                      type="checkbox"
+                      checked={useLocalBroker}
+                      onChange={(e) => setUseLocalBroker(e.target.checked)}
+                    />
+                    Use Local Broker
+                  </label>
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-3 gap-1.5">
+              <label className="block col-span-2">
+                <span className="text-[10px] text-slate-400">Destination World (Freight / Pax)</span>
                 <input
                   className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1"
                   value={destSystem}
                   onChange={(e) => setDestSystem(e.target.value)}
                 />
               </label>
-              <div className="grid grid-cols-3 gap-1">
-                <label className="block">
-                  <span className="text-[10px] text-slate-400">Parsecs</span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={6}
-                    className="w-full bg-slate-950 border border-slate-700 rounded px-1 py-1 text-center"
-                    value={parsecs}
-                    onChange={(e) => setParsecs(Number(e.target.value) || 1)}
-                  />
-                </label>
-                <label className="block">
-                  <span className="text-[10px] text-slate-400">Broker</span>
-                  <input
-                    type="number"
-                    className="w-full bg-slate-950 border border-slate-700 rounded px-1 py-1 text-center"
-                    value={brokerSkill}
-                    onChange={(e) => setBrokerSkill(Number(e.target.value))}
-                  />
-                </label>
-                <label className="block">
-                  <span className="text-[10px] text-slate-400">Steward</span>
-                  <input
-                    type="number"
-                    className="w-full bg-slate-950 border border-slate-700 rounded px-1 py-1 text-center"
-                    value={stewardSkill}
-                    onChange={(e) => setStewardSkill(Number(e.target.value))}
-                  />
-                </label>
-              </div>
+              <label className="block">
+                <span className="text-[10px] text-slate-400">Jump Parsecs</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={6}
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-1 py-1 text-center font-mono"
+                  value={parsecs}
+                  onChange={(e) => setParsecs(Math.max(1, Math.min(6, Number(e.target.value) || 1)))}
+                />
+              </label>
             </div>
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <label className="flex items-center gap-1 text-[11px] text-amber-300">
                 <input
                   type="checkbox"
                   checked={includeIllegal}
                   onChange={(e) => setIncludeIllegal(e.target.checked)}
                 />
-                Include Black Market Speculative Goods
+                Include Black Market Goods
               </label>
               <button
-                disabled={!destSystem.trim()}
-                title={!destSystem.trim() ? "Enter a destination world first" : "Roll MgT2e freight, passengers & speculative goods"}
+                disabled={searchingMarket || !destSystem.trim()}
+                title={
+                  !destSystem.trim()
+                    ? "Enter a destination world first"
+                    : "Spend 1D days locating suppliers, freight contracts, and passengers (advances Imperial Clock)"
+                }
                 onClick={generateMarket}
-                className="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-35 disabled:cursor-not-allowed text-white rounded px-3 py-1 font-medium"
+                className="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-35 disabled:cursor-not-allowed text-white rounded px-3 py-1 font-medium flex items-center gap-1"
               >
-                Roll World Market
+                <Clock className="w-3 h-3" />
+                {searchingMarket ? "Searching…" : "Search Market (1D days)"}
               </button>
             </div>
           </div>

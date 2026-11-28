@@ -14,9 +14,9 @@ use traveller_rules::combat_space::{
 use traveller_rules::ship::{
     calculate_accrued_berthing_fee, calculate_refuel_quote, calculate_refit_cost,
     fleet_max_jump_rating, jump_fuel_for_distance, roll_berthing_fee, sample_free_trader,
-    RefuelMode, SensorGrade,
+    validate_ship, ArmorType, HullConfig, RefuelMode, SensorGrade,
 };
-use traveller_rules::trade::compute_fleet_max_broker;
+use traveller_rules::trade::{compute_fleet_max_broker, search_local_broker};
 use traveller_rules::universe::{build_spatial_memory_scope, parse_uwp};
 use uuid::Uuid;
 
@@ -81,15 +81,36 @@ fn fleet_jump_limit_refueling_berthing_and_spatial_memory_tags() {
     assert_eq!(day15_e.newly_billable_days, 9);
     assert_eq!(day15_e.fee_cr, 0);
 
-    // 4. Paid Shipyard Refit Cost & Starport Eligibility
+    // 4. Paid Shipyard Refit Cost & Starport Eligibility (incl. all Stateroom types, Hull Config & Stealth)
     let mut upgraded = free_trader.clone();
-    upgraded.armor_rating = 4; // +2 armor on 200t hull -> Cr2,000,000
+    upgraded.armor_type = ArmorType::BondedSuperdense;
+    upgraded.armor_rating = 4;
     upgraded.sensor_grade = SensorGrade::Military;
+    upgraded.stealth_dm = -4;
+    upgraded.hull_reflec = true;
+    upgraded.hull_config = HullConfig::CloseStructure;
+    upgraded.high_staterooms = 1;
+    upgraded.luxury_staterooms = 1;
+    upgraded.barracks_berths = 2;
+    upgraded.emergency_low_berths = 2;
+    upgraded.cargo_capacity_tons = 60.0; // free space for new rooms
+    let v = validate_ship(&upgraded);
+    assert!(v.used_tonnage > validate_ship(&free_trader).used_tonnage - 22.0);
     let quote_a = calculate_refit_cost(&free_trader, 70, 0, &upgraded, 80, 0, 'A', 12);
     assert!(quote_a.allowed && quote_a.has_changes);
     assert!(quote_a.total_cost_cr >= 3_000_000, "Refit must charge real Cr costs");
     let quote_c = calculate_refit_cost(&free_trader, 70, 0, &upgraded, 80, 0, 'C', 12);
     assert!(!quote_c.allowed, "Major drive/armor refits must be blocked at Starport C");
+
+    // 4b. Core 2022 Local Starport Broker Search (1D days + 5%/lvl commission)
+    let broker_a = search_local_broker(&mut rng, 'A', 8, false);
+    assert!((1..=6).contains(&broker_a.days_spent));
+    if broker_a.found {
+        assert!((1..=4).contains(&broker_a.broker_skill));
+        assert_eq!(broker_a.commission_pct, (broker_a.broker_skill as u32) * 5);
+    }
+    let broker_x = search_local_broker(&mut rng, 'X', 0, false);
+    assert!(!broker_x.found);
 
     // 5. Spatial & Polity Hindsight Memory Tags
     let regina = parse_uwp("A788899-C").unwrap();

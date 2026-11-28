@@ -337,6 +337,116 @@ pub fn generate_world_market<R: Rng + ?Sized>(
     }
 }
 
+/// Core 2022 p. 241–242: Searching for a Local Starport Broker (takes 1D days, charges 5% per skill level).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalBrokerOffer {
+    pub found: bool,
+    pub broker_name: String,
+    pub broker_skill: i32,
+    pub commission_pct: u32,
+    pub days_spent: u32,
+    pub starport: char,
+    pub note: String,
+}
+
+pub fn search_local_broker<R: Rng + ?Sized>(
+    rng: &mut R,
+    starport: char,
+    population: u8,
+    black_market: bool,
+) -> LocalBrokerOffer {
+    let sp = starport.to_ascii_uppercase();
+    let days_spent = u32::from(roll_nd6(rng, 1)[0]);
+    if sp == 'X' || population == 0 {
+        return LocalBrokerOffer {
+            found: false,
+            broker_name: String::new(),
+            broker_skill: 0,
+            commission_pct: 0,
+            days_spent,
+            starport: sp,
+            note: format!(
+                "Searched for {days_spent} day(s), but no commercial brokers operate on this world (Starport {sp})."
+            ),
+        };
+    }
+
+    let max_skill = match sp {
+        'A' => 4,
+        'B' => 3,
+        'C' => 2,
+        'D' => 2,
+        _ => 1,
+    };
+    let port_dm = match sp {
+        'A' => 2,
+        'B' => 1,
+        'C' => 0,
+        'D' => -1,
+        _ => -2,
+    };
+    let pop_dm = if population >= 8 {
+        2
+    } else if population >= 5 {
+        1
+    } else if population <= 2 {
+        -2
+    } else {
+        0
+    };
+
+    let d = roll_nd6(rng, 2);
+    let roll = i32::from(d[0]) + i32::from(d[1]) + port_dm + pop_dm;
+    if roll < 6 {
+        return LocalBrokerOffer {
+            found: false,
+            broker_name: String::new(),
+            broker_skill: 0,
+            commission_pct: 0,
+            days_spent,
+            starport: sp,
+            note: format!(
+                "Spent {days_spent} day(s) networking at Starport {sp} (rolled {roll}/6+) — no reputable local broker available right now."
+            ),
+        };
+    }
+
+    let raw_skill = match roll {
+        6..=7 => 1,
+        8..=9 => 2,
+        10..=11 => 3,
+        _ => 4,
+    };
+    let broker_skill = raw_skill.min(max_skill).max(1);
+    let commission_pct = (broker_skill as u32) * 5;
+    let first_names = [
+        "Varek", "Sera", "Kellan", "Nadia", "Tovin", "Lira", "Marek", "Dax", "Olen", "Yara",
+    ];
+    let last_names = [
+        "Harrow", "Voss", "Kestrel", "Solin", "Marlowe", "Renn", "Corvus", "Talek", "Vane", "Zor",
+    ];
+    let fn_i = rng.random_range(0..first_names.len());
+    let ln_i = rng.random_range(0..last_names.len());
+    let broker_name = format!(
+        "{} {}{}",
+        first_names[fn_i],
+        last_names[ln_i],
+        if black_market { " (Fixer)" } else { " (Licensed Factor)" }
+    );
+
+    LocalBrokerOffer {
+        found: true,
+        broker_name: broker_name.clone(),
+        broker_skill,
+        commission_pct,
+        days_spent,
+        starport: sp,
+        note: format!(
+            "Located {broker_name} after {days_spent} day(s) at Starport {sp}: Broker-{broker_skill} ({commission_pct}% commission)."
+        ),
+    }
+}
+
 /// Core 2022 p. 243: Roll speculative cargo sale price on destination world.
 pub fn roll_speculative_sale<R: Rng + ?Sized>(
     rng: &mut R,

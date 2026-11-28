@@ -6,9 +6,9 @@ import {
   CampaignSnapshot,
   CharacterRow,
   formatCr,
-  LifepathSession,
   skillUpgradeCost,
 } from "../lib/api";
+import { CharGenStudio } from "./CharGenStudio";
 
 interface Props {
   campaignId: string;
@@ -17,21 +17,6 @@ interface Props {
   onRefresh: () => Promise<void>;
   onError: (msg: string) => void;
 }
-
-const CAREERS = [
-  "agent",
-  "army",
-  "citizen",
-  "drifter",
-  "entertainer",
-  "marine",
-  "merchant",
-  "navy",
-  "noble",
-  "rogue",
-  "scholar",
-  "scout",
-];
 
 export function CharactersPanel({
   campaignId,
@@ -71,16 +56,6 @@ export function CharactersPanel({
 
   // Quick Task Roller
   const [rollResult, setRollResult] = useState<string | null>(null);
-
-  // Lifepath Wizard state
-  const [lpName, setLpName] = useState("Capt. Morgan Vance");
-  const [lpSpecies, setLpSpecies] = useState("Human");
-  const [lpSession, setLpSession] = useState<LifepathSession | null>(null);
-  const [lpCareer, setLpCareer] = useState("merchant");
-  const [lpSpecialist, setLpSpecialist] = useState(true);
-  const [lpCashRolls, setLpCashRolls] = useState(2);
-  const [lpCommitKind, setLpCommitKind] = useState<"player" | "crew" | "npc">("player");
-  const [replaceExistingPlayer, setReplaceExistingPlayer] = useState(false);
 
   async function handleQuickCreate() {
     if (!newName.trim()) return;
@@ -224,61 +199,6 @@ export function CharactersPanel({
     }
   }
 
-  // Lifepath Handlers
-  async function startLp() {
-    try {
-      const { session } = await api.chargenStart(
-        lpName.trim() || "Traveller",
-        lpSpecies.trim() || "Human"
-      );
-      setLpSession(session);
-    } catch (e) {
-      onError((e as Error).message);
-    }
-  }
-
-  async function runTerm() {
-    if (!lpSession) return;
-    try {
-      const { session } = await api.chargenTerm(lpSession, lpCareer, lpSpecialist);
-      setLpSession(session);
-    } catch (e) {
-      onError((e as Error).message);
-    }
-  }
-
-  async function doMuster() {
-    if (!lpSession) return;
-    try {
-      const { session } = await api.chargenMuster(lpSession, lpCashRolls);
-      setLpSession(session);
-    } catch (e) {
-      onError((e as Error).message);
-    }
-  }
-
-  async function commitLp() {
-    if (!lpSession) return;
-    const personalAcc = snapshot.accounts.find((a) => a.kind === "personal");
-    try {
-      await api.chargenCommit(
-        campaignId,
-        lpSession,
-        lpCommitKind,
-        lpCommitKind === "crew" ? 4000 : 0,
-        lpCommitKind === "player" ? "Captain" : "Crew",
-        personalAcc?.id,
-        lpCommitKind === "player" && Boolean(existingPlayer) ? replaceExistingPlayer : false
-      );
-      setLpSession(null);
-      setReplaceExistingPlayer(false);
-      setMode("roster");
-      await onRefresh();
-    } catch (e) {
-      onError((e as Error).message);
-    }
-  }
-
   // Sort strictly so the single Player Character is always rendered first
   const sortedChars = [...snapshot.characters].sort((a, b) => {
     const rank = (k: string) => (k === "player" ? 0 : k === "crew" ? 1 : 2);
@@ -337,192 +257,15 @@ export function CharactersPanel({
       )}
 
       {mode === "lifepath" ? (
-        <div className="bg-slate-900 border border-slate-800 rounded p-3 space-y-3">
-          <div className="font-semibold text-amber-300 text-sm">
-            MgT2e Core 2022 Lifepath Character Generator
-          </div>
-          {!lpSession ? (
-            <div className="space-y-2">
-              <div className="grid grid-cols-2 gap-2">
-                <input
-                  className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5"
-                  placeholder="Character Name"
-                  value={lpName}
-                  onChange={(e) => setLpName(e.target.value)}
-                />
-                <input
-                  className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5"
-                  placeholder="Species"
-                  value={lpSpecies}
-                  onChange={(e) => setLpSpecies(e.target.value)}
-                />
-              </div>
-              <button
-                onClick={startLp}
-                className="w-full bg-amber-600 hover:bg-amber-500 text-slate-950 font-semibold rounded py-1.5 flex items-center justify-center gap-1.5"
-              >
-                <Dice5 className="w-4 h-4" /> Roll 2D6 Characteristics & Begin Age 18
-              </button>
-            </div>
-          ) : (
-            <div className="space-y-2.5">
-              <div className="flex items-center justify-between bg-slate-950 border border-slate-800 rounded p-2">
-                <div>
-                  <div className="font-bold text-slate-100">
-                    {lpSession.name} ({lpSession.species})
-                  </div>
-                  <div className="text-[11px] text-slate-400">
-                    Age {lpSession.age} · {lpSession.terms_completed} term(s) · Rank {lpSession.current_rank} ·{" "}
-                    {lpSession.benefit_rolls_earned} benefit roll(s)
-                  </div>
-                </div>
-                <button
-                  onClick={() => setLpSession(null)}
-                  className="text-slate-400 hover:text-red-400 text-[11px]"
-                >
-                  Reset
-                </button>
-              </div>
-
-              <div className="grid grid-cols-6 gap-1 text-center font-mono">
-                {(
-                  [
-                    ["STR", lpSession.upp.str_val],
-                    ["DEX", lpSession.upp.dex_val],
-                    ["END", lpSession.upp.end_val],
-                    ["INT", lpSession.upp.int_val],
-                    ["EDU", lpSession.upp.edu_val],
-                    ["SOC", lpSession.upp.soc_val],
-                  ] as const
-                ).map(([lbl, val]) => (
-                  <div key={lbl} className="bg-slate-950 border border-slate-800 rounded py-1">
-                    <div className="text-[9px] text-slate-400">{lbl}</div>
-                    <div className="font-bold text-cyan-300">{val}</div>
-                  </div>
-                ))}
-              </div>
-
-              <div className="flex flex-wrap gap-1">
-                {Object.entries(lpSession.skills).map(([sk, lvl]) => (
-                  <span
-                    key={sk}
-                    className="px-1.5 py-0.5 rounded bg-slate-950 border border-slate-700 text-slate-200 text-[11px]"
-                  >
-                    {sk}-{lvl}
-                  </span>
-                ))}
-              </div>
-
-              {!lpSession.mustered_out ? (
-                <div className="space-y-2 border-t border-slate-800 pt-2">
-                  <div className="flex gap-1.5 items-center">
-                    <select
-                      className="flex-1 bg-slate-950 border border-slate-700 rounded px-2 py-1 capitalize"
-                      value={lpCareer}
-                      onChange={(e) => setLpCareer(e.target.value)}
-                    >
-                      {CAREERS.map((c) => (
-                        <option key={c} value={c}>
-                          {c}
-                        </option>
-                      ))}
-                    </select>
-                    <label className="flex items-center gap-1 text-[11px] text-slate-300">
-                      <input
-                        type="checkbox"
-                        checked={lpSpecialist}
-                        onChange={(e) => setLpSpecialist(e.target.checked)}
-                      />
-                      Specialist
-                    </label>
-                    <button
-                      onClick={runTerm}
-                      className="bg-cyan-700 hover:bg-cyan-600 text-white rounded px-3 py-1 font-medium"
-                    >
-                      Run 4-Yr Term
-                    </button>
-                  </div>
-                  {lpSession.terms_completed > 0 && (
-                    <div className="flex gap-2 items-center">
-                      <label className="text-[11px] text-slate-400">
-                        Cash rolls (max 3):
-                        <input
-                          type="number"
-                          min={0}
-                          max={3}
-                          value={lpCashRolls}
-                          onChange={(e) => setLpCashRolls(Number(e.target.value))}
-                          className="w-12 ml-1 bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-center"
-                        />
-                      </label>
-                      <button
-                        onClick={doMuster}
-                        className="flex-1 bg-amber-600 hover:bg-amber-500 text-slate-950 font-semibold rounded py-1"
-                      >
-                        Muster Out & Roll Benefits
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="bg-emerald-950/40 border border-emerald-700 rounded p-2 space-y-2">
-                  <div className="text-emerald-200 font-semibold">
-                    Mustered Out! Cash: {formatCr(lpSession.cash_cr)} · Ship Shares: {lpSession.ship_shares} ·
-                    Pension: {formatCr(lpSession.pension_cr)}/yr
-                  </div>
-                  <div className="flex gap-2">
-                    <select
-                      className="bg-slate-950 border border-slate-700 rounded px-2 py-1"
-                      value={lpCommitKind}
-                      onChange={(e) => setLpCommitKind(e.target.value as "player" | "crew" | "npc")}
-                    >
-                      <option value="player">
-                        {existingPlayer ? "Player Character (Replace Existing)" : "Player Character"}
-                      </option>
-                      <option value="crew">Hired Crew</option>
-                      <option value="npc">NPC</option>
-                    </select>
-                    <button
-                      disabled={lpCommitKind === "player" && Boolean(existingPlayer) && !replaceExistingPlayer}
-                      onClick={commitLp}
-                      className="flex-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white font-semibold rounded py-1 flex items-center justify-center gap-1"
-                    >
-                      <Save className="w-3.5 h-3.5" /> Save to Game & Deposit Cash
-                    </button>
-                  </div>
-                  {lpCommitKind === "player" && existingPlayer && (
-                    <label className="flex items-center gap-1.5 text-[11px] text-amber-300">
-                      <input
-                        type="checkbox"
-                        checked={replaceExistingPlayer}
-                        onChange={(e) => setReplaceExistingPlayer(e.target.checked)}
-                      />
-                      Confirm replacing current Player Character ({existingPlayer.character.name}) — 1 Player max
-                    </label>
-                  )}
-                </div>
-              )}
-
-              {lpSession.log.length > 0 && (
-                <div className="max-h-40 overflow-y-auto space-y-1 border-t border-slate-800 pt-2">
-                  {lpSession.log.map((e) => (
-                    <div key={e.term} className="bg-slate-950 rounded p-1.5 text-[11px] border border-slate-800">
-                      <div className="font-semibold text-cyan-300">
-                        Term {e.term} (Age {e.age}) — {e.career} {!e.qualified && "[Drafted/Drifter]"}{" "}
-                        {e.advanced && `★ Rank ${e.rank}`}
-                      </div>
-                      <div className="text-slate-300">{e.event}</div>
-                      {e.skills_gained.length > 0 && (
-                        <div className="text-slate-400">Skills: {e.skills_gained.join(", ")}</div>
-                      )}
-                      {e.aging_note && <div className="text-amber-300">{e.aging_note}</div>}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
+        <CharGenStudio
+          campaignId={campaignId}
+          snapshot={snapshot}
+          onComplete={async () => {
+            setMode("roster");
+            await onRefresh();
+          }}
+          onError={onError}
+        />
       ) : (
         <>
           {/* Quick Character Creator (strictly enforces 1 Player Character) */}

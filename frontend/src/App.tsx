@@ -29,6 +29,7 @@ import {
   TurnEvent,
 } from "./lib/api";
 import { MarkdownMessage } from "./components/MarkdownMessage";
+import { CharGenStudio } from "./components/CharGenStudio";
 import { StarMapPanel } from "./components/StarMapPanel";
 import { CharactersPanel } from "./components/CharactersPanel";
 import { ShipsPanel } from "./components/ShipsPanel";
@@ -245,6 +246,38 @@ export default function App() {
   const playerChar = snapshot?.characters.find((r) => r.character.kind === "player")?.character;
   const companyAcc = snapshot?.accounts.find((a) => a.kind === "company");
   const hasActiveCombat = Boolean(snapshot?.active_space_combat || snapshot?.active_personal_combat);
+
+  // Mandatory full-screen Character Creation on new games without a Player Character
+  if (snapshot && activeId && !playerChar) {
+    return (
+      <>
+        {errorBanner && (
+          <div className="bg-red-950/95 border-b border-red-800 px-4 py-2 text-xs text-red-200 flex items-center justify-between">
+            <span>{errorBanner}</span>
+            <button
+              onClick={() => setErrorBanner(null)}
+              className="text-red-300 hover:text-white font-semibold px-2 py-0.5 rounded bg-red-900/60"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+        <CharGenStudio
+          campaignId={activeId}
+          snapshot={snapshot}
+          fullscreen
+          campaigns={campaigns}
+          onSelectCampaign={(id) => setActiveId(id)}
+          onDeleteCampaign={handleDeleteActiveCampaign}
+          onComplete={async () => {
+            setCharPanelMode("roster");
+            await refreshActive(activeId);
+          }}
+          onError={setErrorBanner}
+        />
+      </>
+    );
+  }
 
   return (
     <div className="h-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden">

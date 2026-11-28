@@ -19,8 +19,9 @@ use traveller_llm::tools::execute_tool;
 use traveller_llm::TurnEvent;
 use traveller_rules::character::{Character, CharacterKind, Characteristic};
 use traveller_rules::chargen::{
-    finalize_lifepath_character, muster_out, run_lifepath_term, start_lifepath, Career,
-    LifepathSession,
+    all_background_skills, all_careers, all_species, finalize_lifepath_character, muster_out,
+    run_lifepath_term_detailed, run_pre_career, set_background_skills, start_lifepath, Career,
+    LifepathSession, PreCareerChoice, SkillTableChoice,
 };
 use traveller_rules::dice::{resolve_task, Difficulty, ModifierItem, RollMode};
 use traveller_rules::finance::AccountKind;
@@ -134,13 +135,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/campaigns/{id}/shop/availability", post(shop_availability))
         .route("/api/campaigns/{id}/shop/purchase", post(shop_purchase))
         // Interactive Lifepath Chargen & Starport Hiring Hall
+        .route("/api/chargen/options", get(chargen_options))
         .route("/api/chargen/start", post(chargen_start))
+        .route("/api/chargen/background", post(chargen_background))
+        .route("/api/chargen/pre-career", post(chargen_pre_career))
         .route("/api/chargen/term", post(chargen_term))
         .route("/api/chargen/muster", post(chargen_muster))
         .route("/api/campaigns/{id}/chargen/commit", post(chargen_commit))
         .route("/api/campaigns/{id}/crew/hiring-hall", post(crew_hiring_hall))
         .route("/api/campaigns/{id}/crew/hire", post(crew_hire))
-        // Trade (Freight, Passengers, Mail, Speculative)
+        // Trade (Freight, Passengers, Mail, Speculative, Local Broker Search)
+        .route("/api/campaigns/{id}/trade/find-broker", post(trade_find_broker))
         .route("/api/campaigns/{id}/trade/market", post(trade_market))
         .route("/api/campaigns/{id}/trade/buy", post(trade_buy))
         .route("/api/campaigns/{id}/trade/sell", post(trade_sell))
@@ -1159,6 +1164,14 @@ fn default_human() -> String {
     "Human".to_string()
 }
 
+async fn chargen_options() -> Json<Value> {
+    Json(json!({
+        "species": all_species(),
+        "background_skills": all_background_skills(),
+        "careers": all_careers()
+    }))
+}
+
 async fn chargen_start(Json(body): Json<ChargenStartBody>) -> Result<Json<Value>, ApiError> {
     let session = {
         let mut r = rng();
@@ -1168,17 +1181,55 @@ async fn chargen_start(Json(body): Json<ChargenStartBody>) -> Result<Json<Value>
 }
 
 #[derive(Deserialize)]
+struct ChargenBackgroundBody {
+    session: LifepathSession,
+    background_skills: Vec<String>,
+}
+
+async fn chargen_background(
+    Json(mut body): Json<ChargenBackgroundBody>,
+) -> Result<Json<Value>, ApiError> {
+    set_background_skills(&mut body.session, body.background_skills);
+    Ok(Json(json!({ "session": body.session })))
+}
+
+#[derive(Deserialize)]
+struct ChargenPreCareerBody {
+    session: LifepathSession,
+    choice: PreCareerChoice,
+}
+
+async fn chargen_pre_career(
+    Json(mut body): Json<ChargenPreCareerBody>,
+) -> Result<Json<Value>, ApiError> {
+    let note = {
+        let mut r = rng();
+        run_pre_career(&mut r, &mut body.session, body.choice)
+    };
+    Ok(Json(json!({ "session": body.session, "note": note })))
+}
+
+#[derive(Deserialize)]
 struct ChargenTermBody {
     session: LifepathSession,
     career: Career,
     #[serde(default)]
     prefer_specialist: bool,
+    #[serde(default)]
+    assignment: Option<String>,
+    #[serde(default)]
+    skill_table: Option<SkillTableChoice>,
 }
 
 async fn chargen_term(Json(mut body): Json<ChargenTermBody>) -> Result<Json<Value>, ApiError> {
+    let table = body.skill_table.unwrap_or(if body.prefer_specialist {
+        SkillTableChoice::Specialist
+    } else {
+        SkillTableChoice::Service
+    });
     let entry = {
         let mut r = rng();
-        run_lifepath_term(&mut r, &mut body.session, body.career, body.prefer_specialist)
+        run_lifepath_term_detailed(&mut r, &mut body.session, body.career, body.assignment, table)
     };
     Ok(Json(json!({ "session": body.session, "entry": entry })))
 }
@@ -1365,6 +1416,20 @@ async fn crew_hire(
 }
 
 // ── Trade (Freight, Passengers, Mail, Speculative) ────────────────────────
+
+async fn trade_find_broker(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let mut payload = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("action".into(), json!("find_broker"));
+    }
+    let res = execute_tool(&st.db, &st.hindsight, id, "trade_ops", &payload).await?;
+    let parsed: Value = serde_json::from_str(&res.output_json)?;
+    Ok(Json(parsed))
+}
 
 async fn trade_market(
     State(st): State<AppState>,

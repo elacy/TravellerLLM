@@ -97,6 +97,15 @@ export interface CargoLot {
   bought_at?: string;
 }
 
+export interface WeaponMount {
+  name: string;
+  mount_kind: string;
+  weapons: string[];
+  tonnage: number;
+  power: number;
+  hardpoints: number;
+}
+
 export interface ShipRecord {
   id: string;
   campaign_id?: string;
@@ -108,18 +117,52 @@ export interface ShipRecord {
     tl: number;
     hull_config: string;
     hull_points_max: number;
+    armor_type?: string;
     armor_rating: number;
+    armor_tonnage: number;
     thrust: number;
+    m_drive_tonnage: number;
     jump_rating: number;
+    j_drive_tonnage: number;
     power_plant_output: number;
+    power_plant_tonnage: number;
+    bridge_tonnage: number;
+    bridge_type?: string;
+    computer_bandwidth: number;
+    computer_bis?: boolean;
+    computer_fib?: boolean;
     sensor_grade: string;
+    sensor_tonnage: number;
+    extended_sensor_array?: boolean;
     stealth_dm: number;
+    hull_reflec?: boolean;
+    radiation_shielding?: boolean;
+    heat_shielding?: boolean;
+    self_sealing?: boolean;
+    reinforced_hull?: boolean;
+    light_hull?: boolean;
     fuel_capacity_tons: number;
+    fuel_scoops?: boolean;
+    fuel_processor_tons?: number;
     staterooms: number;
+    high_staterooms?: number;
+    luxury_staterooms?: number;
+    barracks_berths?: number;
     low_berths: number;
+    emergency_low_berths?: number;
+    common_areas_tonnage: number;
+    armory_tons?: number;
+    medical_bay_tons?: number;
+    workshop_tons?: number;
+    briefing_room?: boolean;
+    library?: boolean;
+    probe_drones?: number;
+    docking_bay_tons?: number;
+    cargo_scoops?: boolean;
     cargo_capacity_tons: number;
+    misc_tonnage?: number;
+    weapon_mounts?: WeaponMount[];
     purchase_price_cr: number;
-    weapons?: Array<{ name: string; mount: string; count: number; power: number; tonnage: number }>;
     [key: string]: unknown;
   };
   validation: {
@@ -253,15 +296,59 @@ export interface LifepathLogEntry {
   aging_note?: string | null;
 }
 
+export interface SpeciesOption {
+  id: string;
+  name: string;
+  str_mod: number;
+  dex_mod: number;
+  end_mod: number;
+  int_mod: number;
+  edu_mod: number;
+  soc_mod: number;
+  psi_capable: boolean;
+  ignores_aging: boolean;
+  traits: string;
+}
+
+export interface CareerOption {
+  career: string;
+  name: string;
+  assignments: string[];
+  qual_stat: string;
+  qual_target: number;
+  surv_stat: string;
+  surv_target: number;
+  adv_stat: string;
+  adv_target: number;
+  service_skills: string[];
+  specialist_skills: string[];
+  personal_dev: string[];
+  advanced_edu_skills: string[];
+  has_ship_benefit: boolean;
+}
+
+export interface ChargenOptions {
+  species: SpeciesOption[];
+  background_skills: string[];
+  careers: CareerOption[];
+}
+
 export interface LifepathSession {
   id: string;
   name: string;
   species: string;
+  species_traits?: string;
   age: number;
   terms_completed: number;
   upp: Upp;
   skills: Record<string, number>;
+  background_skill_slots?: number;
+  background_skills_chosen?: boolean;
+  pre_career_done?: boolean;
+  pre_career_note?: string | null;
+  qualification_bonus_dm?: number;
   current_career?: string | null;
+  current_assignment?: string | null;
   current_rank: number;
   benefit_rolls_earned: number;
   cash_cr: number;
@@ -272,6 +359,16 @@ export interface LifepathSession {
   rivals: string[];
   mustered_out: boolean;
   log: LifepathLogEntry[];
+}
+
+export interface LocalBrokerOffer {
+  found: boolean;
+  broker_name: string;
+  broker_skill: number;
+  commission_pct: number;
+  days_spent: number;
+  starport: string;
+  note: string;
 }
 
 export interface CrewCandidate {
@@ -504,15 +601,32 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ skill, allow_general_xp: true }),
     }),
-  chargenStart: (name: string, species = "Human", background_skills: string[] = []) =>
+  chargenOptions: () => req<ChargenOptions>("/api/chargen/options"),
+  chargenStart: (name: string, species = "Human (Imperial)", background_skills: string[] = []) =>
     req<{ session: LifepathSession }>("/api/chargen/start", {
       method: "POST",
       body: JSON.stringify({ name, species, background_skills }),
     }),
-  chargenTerm: (session: LifepathSession, career: string, prefer_specialist: boolean) =>
+  chargenBackground: (session: LifepathSession, background_skills: string[]) =>
+    req<{ session: LifepathSession }>("/api/chargen/background", {
+      method: "POST",
+      body: JSON.stringify({ session, background_skills }),
+    }),
+  chargenPreCareer: (session: LifepathSession, choice: "none" | "university" | "military_academy") =>
+    req<{ session: LifepathSession; note: string }>("/api/chargen/pre-career", {
+      method: "POST",
+      body: JSON.stringify({ session, choice }),
+    }),
+  chargenTerm: (
+    session: LifepathSession,
+    career: string,
+    prefer_specialist: boolean,
+    assignment?: string,
+    skill_table?: "service" | "specialist" | "personal" | "advanced_edu"
+  ) =>
     req<{ session: LifepathSession; entry: LifepathLogEntry }>("/api/chargen/term", {
       method: "POST",
-      body: JSON.stringify({ session, career, prefer_specialist }),
+      body: JSON.stringify({ session, career, prefer_specialist, assignment, skill_table }),
     }),
   chargenMuster: (session: LifepathSession, cash_rolls: number) =>
     req<{ session: LifepathSession }>("/api/chargen/muster", {
@@ -658,7 +772,12 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  // Trade
+  // Trade (Local Broker Search, Market, Buy/Sell)
+  tradeFindBroker: (id: string, black_market = false) =>
+    req<LocalBrokerOffer>(`/api/campaigns/${id}/trade/find-broker`, {
+      method: "POST",
+      body: JSON.stringify({ black_market }),
+    }),
   tradeMarket: (id: string, body: Record<string, unknown>) =>
     req<Record<string, unknown>>(`/api/campaigns/${id}/trade/market`, {
       method: "POST",
