@@ -17,12 +17,15 @@ use tokio_stream::StreamExt;
 use traveller_db::{NewCharacterInput, ShipRecord, UpsertModuleInput};
 use traveller_llm::tools::execute_tool;
 use traveller_llm::TurnEvent;
-use traveller_rules::character::{Character, CharacterKind, Characteristic};
+use traveller_rules::character::{
+    all_skill_specializations_map, Character, CharacterKind, Characteristic,
+};
 use traveller_rules::chargen::{
-    all_background_skills, all_careers, all_skill_packages, all_species, all_university_skills,
-    apply_skill_package, assign_characteristics, finalize_lifepath_character, muster_out,
-    run_lifepath_term_full, run_pre_career_detailed, set_background_skills, start_lifepath, Career,
-    LifepathSession, MilitaryBranch, PreCareerChoice, SkillTableChoice,
+    all_background_skills, all_careers, all_skill_packages, all_species,
+    all_university_minor_skills, all_university_skills, apply_skill_package,
+    assign_characteristics, finalize_lifepath_character, muster_out, run_lifepath_term_full,
+    run_pre_career_detailed, set_background_skills, start_lifepath, Career, LifepathSession,
+    MilitaryBranch, PreCareerChoice, SkillTableChoice,
 };
 use traveller_rules::dice::{resolve_task, Difficulty, ModifierItem, RollMode};
 use traveller_rules::finance::AccountKind;
@@ -1199,7 +1202,9 @@ async fn chargen_options() -> Json<Value> {
     Json(json!({
         "species": all_species(),
         "background_skills": all_background_skills(),
+        "university_minor_skills": all_university_minor_skills(),
         "university_skills": all_university_skills(),
+        "skill_specializations": all_skill_specializations_map(),
         "skill_packages": all_skill_packages(),
         "careers": all_careers()
     }))

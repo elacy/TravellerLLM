@@ -208,4 +208,21 @@ fn character_task_resolution_augments_wounds_and_xp_progression() {
         traveller.upgrade_characteristic(Characteristic::Soc, true),
         Err(CharacterError::SocNotTrainable)
     ));
+
+    // 5. Core 2022 p. 62: Level 0 skills have NO specialisations; advancing 0 -> 1 requires one
+    traveller.general_xp = 3;
+    // Attempting to learn "Electronics (Computers)" when untrained stores unspecialised "Electronics-0"
+    assert_eq!(traveller.upgrade_skill("Electronics (Computers)", true).unwrap(), 0);
+    assert_eq!(traveller.skills.get("Electronics"), Some(&0));
+    assert!(!traveller.skills.contains_key("Electronics (Computers)"));
+    // Attempting to upgrade "Electronics-0" without choosing a specialisation fails
+    assert!(matches!(
+        traveller.upgrade_skill("Electronics", true),
+        Err(CharacterError::SpecializationRequired(_))
+    ));
+    // Upgrading with a specialisation advances directly to Level 1 while preserving base Electronics-0
+    assert_eq!(traveller.upgrade_skill("Electronics (Computers)", true).unwrap(), 1);
+    assert_eq!(traveller.skills.get("Electronics (Computers)"), Some(&1));
+    assert_eq!(traveller.skills.get("Electronics"), Some(&0));
+    assert_eq!(traveller.raw_skill_level("Electronics (Sensors)"), Some(0));
 }

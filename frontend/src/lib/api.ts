@@ -337,7 +337,9 @@ export interface SkillPackageOption {
 export interface ChargenOptions {
   species: SpeciesOption[];
   background_skills: string[];
+  university_minor_skills?: string[];
   university_skills: string[];
+  skill_specializations?: Record<string, string[]>;
   skill_packages: SkillPackageOption[];
   careers: CareerOption[];
 }

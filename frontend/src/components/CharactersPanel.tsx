@@ -17,49 +17,91 @@ interface Props {
   onError: (msg: string) => void;
 }
 
-const LEARNABLE_SKILLS = [
+// Core 2022 p. 62: Brand-new skills learned at Level 0 NEVER have specialisations!
+const LEARNABLE_BASE_SKILLS = [
   "Admin",
   "Advocate",
-  "Animals (Handling)",
+  "Animals",
+  "Art",
   "Astrogation",
-  "Athletics (Dexterity)",
-  "Athletics (Endurance)",
+  "Athletics",
   "Broker",
   "Carouse",
   "Deception",
   "Diplomat",
-  "Drive (Wheel)",
-  "Electronics (comms)",
-  "Electronics (computers)",
-  "Electronics (sensors)",
-  "Engineer (J-Drive)",
-  "Engineer (M-Drive)",
-  "Engineer (Power)",
-  "Flyer (Grav)",
+  "Drive",
+  "Electronics",
+  "Engineer",
+  "Explosives",
+  "Flyer",
   "Gambler",
-  "Gun Combat (Energy)",
-  "Gun Combat (Slug)",
-  "Gunner (Turret)",
+  "Gun Combat",
+  "Gunner",
+  "Heavy Weapons",
   "Investigate",
+  "Language",
   "Leadership",
   "Mechanic",
   "Medic",
-  "Melee (Blade)",
-  "Melee (Unarmed)",
+  "Melee",
   "Navigation",
   "Persuade",
-  "Pilot (Small Craft)",
-  "Pilot (Spacecraft)",
+  "Pilot",
+  "Profession",
   "Recon",
-  "Science (Physics)",
+  "Science",
+  "Seafarer",
   "Stealth",
   "Steward",
   "Streetwise",
   "Survival",
-  "Tactics (Military)",
-  "Tactics (Naval)",
+  "Tactics",
   "Vacc Suit",
 ];
+
+// Canonical MgT2e Core 2022 specialisations — chosen ONLY when advancing a specialised skill from 0 → 1!
+const SKILL_SPECIALIZATIONS: Record<string, string[]> = {
+  Animals: ["Handling", "Training", "Veterinary"],
+  Art: ["Holography", "Instrument", "Performer", "Visual Media", "Write"],
+  Athletics: ["Dexterity", "Endurance", "Strength"],
+  Drive: ["Hovercraft", "Mole", "Track", "Walker", "Wheel"],
+  Electronics: ["Comms", "Computers", "Remote Ops", "Sensors"],
+  Engineer: ["J-Drive", "Life Support", "M-Drive", "Power"],
+  Flyer: ["Airship", "Grav", "Ornithopter", "Rotor", "Wing"],
+  "Gun Combat": ["Archaic", "Energy", "Slug"],
+  Gunner: ["Capital", "Ortillery", "Screen", "Turret"],
+  "Heavy Weapons": ["Artillery", "Man Portable", "Vehicle"],
+  Language: ["Galanglic", "Gvegh", "Oynprith", "Trokh", "Vilani", "Zdetl"],
+  Melee: ["Blade", "Bludgeon", "Natural", "Unarmed"],
+  Pilot: ["Capital Ships", "Small Craft", "Spacecraft"],
+  Profession: ["Belter", "Biologicals", "Civil Engineering", "Construction", "Hydroponics", "Polymers"],
+  Science: [
+    "Archaeology",
+    "Astronomy",
+    "Biology",
+    "Chemistry",
+    "Cosmology",
+    "Cybernetics",
+    "Economics",
+    "Genetics",
+    "History",
+    "Linguistics",
+    "Philosophy",
+    "Physics",
+    "Planetology",
+    "Psionicology",
+    "Psychology",
+    "Robotics",
+    "Sophontology",
+    "Xenology",
+  ],
+  Seafarer: ["Ocean Ships", "Personal", "Sail", "Submarine"],
+  Tactics: ["Military", "Naval"],
+};
+
+function baseSkillName(skill: string): string {
+  return skill.split("(")[0].trim();
+}
 
 function charXpCost(stat: "STR" | "DEX" | "END" | "INT" | "EDU", newLevel: number): number {
   const lvl = Math.max(1, newLevel);
@@ -86,6 +128,7 @@ export function CharactersPanel({
   const [editStation, setEditStation] = useState("");
   const [editNotes, setEditNotes] = useState("");
   const [learnSkillMap, setLearnSkillMap] = useState<Record<string, string>>({});
+  const [specPrompt, setSpecPrompt] = useState<{ charId: string; baseSkill: string } | null>(null);
   const [rollResult, setRollResult] = useState<string | null>(null);
 
   function startMetaEdit(row: CharacterRow) {
@@ -240,7 +283,8 @@ export function CharactersPanel({
             const c = row.character;
             const isPlayer = c.kind === "player";
             const isEditing = editingId === c.id;
-            const unlearned = LEARNABLE_SKILLS.filter((sk) => !(sk in c.skills));
+            const ownedBases = new Set(Object.keys(c.skills).map((k) => baseSkillName(k).toLowerCase()));
+            const unlearned = LEARNABLE_BASE_SKILLS.filter((sk) => !ownedBases.has(sk.toLowerCase()));
             const chosenNewSkill = learnSkillMap[c.id] || unlearned[0] || "";
             const canLearnNew = c.general_xp >= 1 && Boolean(chosenNewSkill);
 
@@ -396,6 +440,7 @@ export function CharactersPanel({
                       const cost = skillUpgradeCost(lvl + 1);
                       const avail = xp + c.general_xp;
                       const canUpgrade = avail >= cost;
+                      const needsSpec = lvl === 0 && !sk.includes("(") && Boolean(SKILL_SPECIALIZATIONS[sk]);
                       return (
                         <div
                           key={sk}
@@ -418,10 +463,16 @@ export function CharactersPanel({
                             disabled={!canUpgrade}
                             title={
                               canUpgrade
-                                ? `Spend ${cost} XP to raise ${sk} to ${lvl + 1} (${xp} skill + ${c.general_xp} general XP)`
+                                ? needsSpec
+                                  ? `Choose a ${sk} specialisation to advance to Level 1 (${cost} XP)`
+                                  : `Spend ${cost} XP to raise ${sk} to ${lvl + 1} (${xp} skill + ${c.general_xp} general XP)`
                                 : `Need ${cost} XP to upgrade ${sk} to ${lvl + 1} (have ${avail} XP)`
                             }
-                            onClick={() => handleSpendSkillXp(c.id, sk)}
+                            onClick={() =>
+                              needsSpec
+                                ? setSpecPrompt({ charId: c.id, baseSkill: sk })
+                                : handleSpendSkillXp(c.id, sk)
+                            }
                             className="px-1 bg-emerald-700 hover:bg-emerald-600 disabled:bg-slate-800 disabled:text-slate-600 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded text-[9px]"
                           >
                             ↑
@@ -430,6 +481,42 @@ export function CharactersPanel({
                       );
                     })}
                   </div>
+
+                  {/* Specialisation picker when advancing a Level 0 specialised skill to Level 1 */}
+                  {specPrompt && specPrompt.charId === c.id && SKILL_SPECIALIZATIONS[specPrompt.baseSkill] && (
+                    <div className="bg-emerald-950/40 border border-emerald-700/80 rounded p-2 space-y-1.5">
+                      <div className="flex items-center justify-between text-[11px] text-emerald-200 font-medium">
+                        <span>
+                          Choose {specPrompt.baseSkill} specialisation for Level 1 (1 XP):
+                        </span>
+                        <button
+                          onClick={() => setSpecPrompt(null)}
+                          className="text-slate-400 hover:text-white"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {SKILL_SPECIALIZATIONS[specPrompt.baseSkill].map((sp) => {
+                          const full = `${specPrompt.baseSkill} (${sp})`;
+                          const alreadySpec = full in c.skills;
+                          return (
+                            <button
+                              key={sp}
+                              disabled={alreadySpec}
+                              onClick={async () => {
+                                await handleSpendSkillXp(c.id, full);
+                                setSpecPrompt(null);
+                              }}
+                              className="px-2 py-0.5 rounded bg-emerald-800 hover:bg-emerald-700 disabled:opacity-35 text-emerald-100 text-[10px]"
+                            >
+                              {sp} → Lvl 1
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
 
                   {/* Learn a brand-new Skill at Level 0 (strictly requires 1 General XP!) */}
                   {unlearned.length > 0 && (

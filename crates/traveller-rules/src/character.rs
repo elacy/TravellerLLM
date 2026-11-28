@@ -16,6 +16,84 @@ pub enum CharacterError {
     SkillAugmentRequiresSkill(String),
     #[error("Maximum of 3 different skill augmentations may be installed at once")]
     TooManySkillAugments,
+    #[error("Skill '{0}' requires choosing a specialisation when advancing to Level 1+ (Core 2022 p. 62)")]
+    SpecializationRequired(String),
+}
+
+/// Strip any `(Specialisation)` suffix to return the unspecialised base skill name.
+/// Per MgT2e Core 2022 p. 62, skills at Level 0 never have specialisations.
+pub fn skill_base_name(skill: &str) -> &str {
+    skill.split('(').next().unwrap_or(skill).trim()
+}
+
+/// Canonical MgT2e Core 2022 specialisations for specialised skills (empty slice for unspecialised skills).
+pub fn skill_specializations(base: &str) -> &'static [&'static str] {
+    match skill_base_name(base).to_ascii_lowercase().as_str() {
+        "animals" => &["Handling", "Training", "Veterinary"],
+        "art" => &["Holography", "Instrument", "Performer", "Visual Media", "Write"],
+        "athletics" => &["Dexterity", "Endurance", "Strength"],
+        "drive" => &["Hovercraft", "Mole", "Track", "Walker", "Wheel"],
+        "electronics" => &["Comms", "Computers", "Remote Ops", "Sensors"],
+        "engineer" => &["J-Drive", "Life Support", "M-Drive", "Power"],
+        "flyer" => &["Airship", "Grav", "Ornithopter", "Rotor", "Wing"],
+        "gun combat" => &["Archaic", "Energy", "Slug"],
+        "gunner" => &["Capital", "Ortillery", "Screen", "Turret"],
+        "heavy weapons" => &["Artillery", "Man Portable", "Vehicle"],
+        "language" => &["Galanglic", "Gvegh", "Oynprith", "Trokh", "Vilani", "Zdetl"],
+        "melee" => &["Blade", "Bludgeon", "Natural", "Unarmed"],
+        "pilot" => &["Capital Ships", "Small Craft", "Spacecraft"],
+        "profession" => &["Belter", "Biologicals", "Civil Engineering", "Construction", "Hydroponics", "Polymers"],
+        "science" => &[
+            "Archaeology",
+            "Astronomy",
+            "Biology",
+            "Chemistry",
+            "Cosmology",
+            "Cybernetics",
+            "Economics",
+            "Genetics",
+            "History",
+            "Linguistics",
+            "Philosophy",
+            "Physics",
+            "Planetology",
+            "Psionicology",
+            "Psychology",
+            "Robotics",
+            "Sophontology",
+            "Xenology",
+        ],
+        "seafarer" => &["Ocean Ships", "Personal", "Sail", "Submarine"],
+        "tactics" => &["Military", "Naval"],
+        _ => &[],
+    }
+}
+
+/// Map of all specialised base skill names to their canonical MgT2e Core 2022 specialisations.
+pub fn all_skill_specializations_map() -> BTreeMap<&'static str, &'static [&'static str]> {
+    let mut map = BTreeMap::new();
+    for base in [
+        "Animals",
+        "Art",
+        "Athletics",
+        "Drive",
+        "Electronics",
+        "Engineer",
+        "Flyer",
+        "Gun Combat",
+        "Gunner",
+        "Heavy Weapons",
+        "Language",
+        "Melee",
+        "Pilot",
+        "Profession",
+        "Science",
+        "Seafarer",
+        "Tactics",
+    ] {
+        map.insert(base, skill_specializations(base));
+    }
+    map
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,18 +532,45 @@ impl Character {
     }
 
     /// Upgrade a skill by 1 level using dedicated skill XP first, then optionally general XP.
+    /// Enforces Core 2022 p. 62:
+    /// - Brand-new skills learned at Level 0 never have specialisations (stored as base name).
+    /// - Advancing a specialised base skill from Level 0 to Level 1 requires specifying a specialisation
+    ///   (e.g. `Pilot (Spacecraft)` when you already hold `Pilot-0`), advancing directly to Level 1.
     pub fn upgrade_skill(&mut self, skill: &str, allow_general_xp: bool) -> Result<i32, CharacterError> {
-        let current = self.skills.get(skill).copied();
-        let target_level = match current {
-            None => 0,
-            Some(lvl) => lvl + 1,
-        };
-        let cost = skill_upgrade_cost(target_level);
-        let dedicated = self.skill_xp.get(skill).copied().unwrap_or(0);
-        let available = if allow_general_xp {
-            dedicated + self.general_xp
+        let trimmed = skill.trim();
+        let base = skill_base_name(trimmed);
+        let has_spec = trimmed.contains('(');
+        let specs = skill_specializations(base);
+
+        let (store_key, target_level) = if let Some(&lvl) = self.skills.get(trimmed) {
+            if lvl == 0 && !has_spec && !specs.is_empty() {
+                return Err(CharacterError::SpecializationRequired(base.to_string()));
+            }
+            (trimmed.to_string(), lvl + 1)
+        } else if has_spec {
+            if self.raw_skill_level(base).is_some() {
+                // Already possess base skill at 0+ -> advancing this specialisation to Level 1
+                (trimmed.to_string(), 1)
+            } else {
+                // Brand-new skill at Level 0 -> never has a specialisation (Core 2022 p. 62)
+                (base.to_string(), 0)
+            }
         } else {
-            dedicated
+            (base.to_string(), 0)
+        };
+
+        let cost = skill_upgrade_cost(target_level);
+        let dedicated_exact = self.skill_xp.get(&store_key).copied().unwrap_or(0);
+        let dedicated_base = if store_key != base {
+            self.skill_xp.get(base).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        let total_dedicated = dedicated_exact + dedicated_base;
+        let available = if allow_general_xp {
+            total_dedicated + self.general_xp
+        } else {
+            total_dedicated
         };
 
         if available < cost {
@@ -475,11 +580,19 @@ impl Character {
             });
         }
 
-        let from_dedicated = dedicated.min(cost);
-        let from_general = cost - from_dedicated;
-        *self.skill_xp.entry(skill.to_string()).or_insert(0) -= from_dedicated;
-        self.general_xp -= from_general;
-        self.skills.insert(skill.to_string(), target_level);
+        let mut rem = cost;
+        let from_exact = dedicated_exact.min(rem);
+        if from_exact > 0 {
+            *self.skill_xp.entry(store_key.clone()).or_insert(0) -= from_exact;
+            rem -= from_exact;
+        }
+        let from_base = dedicated_base.min(rem);
+        if from_base > 0 {
+            *self.skill_xp.entry(base.to_string()).or_insert(0) -= from_base;
+            rem -= from_base;
+        }
+        self.general_xp -= rem;
+        self.skills.insert(store_key, target_level);
         Ok(target_level)
     }
 

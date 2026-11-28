@@ -82,6 +82,10 @@ function fmtMod(label: string, val: number): string | null {
   return `${label} ${val > 0 ? `+${val}` : val}`;
 }
 
+function baseSkillName(skill: string): string {
+  return skill.split("(")[0].trim();
+}
+
 function statDm(score: number): number {
   if (score <= 0) return -3;
   if (score <= 2) return -2;
@@ -117,6 +121,7 @@ export function CharGenStudio({
   // Phase 3: Pre-Career Education choices
   const [preMode, setPreMode] = useState<"university" | "military_academy" | "none">("university");
   const [uniSkill0, setUniSkill0] = useState("Admin");
+  const [uniMinorGradSpec, setUniMinorGradSpec] = useState("");
   const [uniSkill1, setUniSkill1] = useState("Broker");
   const [acadBranch, setAcadBranch] = useState<"army" | "marine" | "navy">("navy");
   const [acadFocus, setAcadFocus] = useState<string[]>([]);
@@ -159,12 +164,38 @@ export function CharGenStudio({
   const speciesList = options?.species ?? FALLBACK_SPECIES;
   const careerList = options?.careers ?? FALLBACK_CAREERS;
   const bgSkillList = options?.background_skills ?? [];
-  const uniSkillList = options?.university_skills ?? ["Admin", "Broker", "Electronics (computers)", "Medic", "Science (Physics)"];
+  const uniMinorList = options?.university_minor_skills ?? [
+    "Admin",
+    "Advocate",
+    "Animals",
+    "Art",
+    "Astrogation",
+    "Broker",
+    "Electronics",
+    "Engineer",
+    "Language",
+    "Medic",
+    "Navigation",
+    "Profession",
+    "Science",
+  ];
+  const uniSkillList = options?.university_skills ?? [
+    "Admin",
+    "Broker",
+    "Electronics (Computers)",
+    "Medic",
+    "Science (Physics)",
+  ];
+  const specMap = options?.skill_specializations ?? {};
+  const uniMinorSpecs = specMap[uniSkill0] ?? [];
   const skillPackages = options?.skill_packages ?? [];
 
   const activeSpecies =
     speciesList.find((s) => s.id === species || s.name === species) ?? speciesList[0];
   const activeCareer = careerList.find((c) => c.career === career) ?? careerList[0];
+  const activeBasicChoices = Array.from(
+    new Set((activeCareer?.service_skills ?? []).map(baseSkillName))
+  );
   const acadCareerObj = careerList.find((c) => c.career === acadBranch);
   const activePkg = skillPackages.find((p) => p.id === pkgId) ?? skillPackages[0];
 
@@ -173,11 +204,22 @@ export function CharGenStudio({
       if (!activeCareer.assignments.includes(assignment)) {
         setAssignment(activeCareer.assignments[0]);
       }
-      if (activeCareer.service_skills.length > 0 && !activeCareer.service_skills.includes(basicSkillPick)) {
-        setBasicSkillPick(activeCareer.service_skills[0]);
+      const baseChoices = Array.from(new Set(activeCareer.service_skills.map(baseSkillName)));
+      if (baseChoices.length > 0 && !baseChoices.includes(basicSkillPick)) {
+        setBasicSkillPick(baseChoices[0]);
       }
     }
   }, [activeCareer, assignment, basicSkillPick]);
+
+  useEffect(() => {
+    if (uniMinorSpecs.length > 0) {
+      if (!uniMinorSpecs.includes(uniMinorGradSpec)) {
+        setUniMinorGradSpec(uniMinorSpecs[0]);
+      }
+    } else if (uniMinorGradSpec !== "") {
+      setUniMinorGradSpec("");
+    }
+  }, [uniSkill0, uniMinorSpecs, uniMinorGradSpec]);
 
   useEffect(() => {
     if (acadCareerObj && acadCareerObj.service_skills.length >= 3) {
@@ -301,8 +343,14 @@ export function CharGenStudio({
     if (!session) return;
     setBusy(true);
     try {
+      const minorPayload =
+        preMode === "university"
+          ? uniMinorSpecs.length > 0 && uniMinorGradSpec
+            ? `${uniSkill0} (${uniMinorGradSpec})`
+            : uniSkill0
+          : undefined;
       const { session: updated } = await api.chargenPreCareer(session, preMode, {
-        uni_skill_0: preMode === "university" ? uniSkill0 : undefined,
+        uni_skill_0: minorPayload,
         uni_skill_1: preMode === "university" ? uniSkill1 : undefined,
         academy_branch: preMode === "military_academy" ? acadBranch : undefined,
         academy_focus_skills: preMode === "military_academy" ? acadFocus : undefined,
@@ -637,12 +685,17 @@ export function CharGenStudio({
             <div className="bg-slate-900 border border-cyan-700/70 rounded-xl p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-sm font-semibold text-cyan-300">
-                  Step 3 · Pick Your Homeworld &amp; Background Skills (Level 0)
+                  Step 3 · Pick Your Homeworld &amp; Background Skills (Level 0 — No Specialisations)
                 </span>
                 <span className="font-mono text-xs text-amber-300">
                   {selectedBg.length} / {bgSlots} selected (3 + EDU DM)
                 </span>
               </div>
+              <p className="text-[11px] text-slate-400">
+                Per Core 2022 p. 16 &amp; p. 62, Level 0 skills never carry a specialisation (e.g.{" "}
+                <span className="text-slate-200">Electronics-0</span> covers all Electronics tasks
+                at +0 until you specialise at Level 1+).
+              </p>
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-1.5">
                 {bgSkillList.map((sk) => {
                   const checked = selectedBg.includes(sk);
@@ -733,48 +786,70 @@ export function CharGenStudio({
               </div>
 
               {preMode === "university" && (
-                <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <label className="block space-y-1">
-                    <span className="text-[11px] text-slate-300">
-                      Major Subject (Starts at Level 1 → Level 2 on Graduation)
-                    </span>
-                    <select
-                      className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs"
-                      value={uniSkill1}
-                      onChange={(e) => {
-                        const next = e.target.value;
-                        setUniSkill1(next);
-                        if (next === uniSkill0) {
-                          const alt = uniSkillList.find((s) => s !== next);
-                          if (alt) setUniSkill0(alt);
-                        }
-                      }}
-                    >
-                      {uniSkillList.map((sk) => (
-                        <option key={sk} value={sk}>
-                          {sk}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="block space-y-1">
-                    <span className="text-[11px] text-slate-300">
-                      Minor Subject (Starts at Level 0 → Level 1 on Graduation)
-                    </span>
-                    <select
-                      className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs"
-                      value={uniSkill0}
-                      onChange={(e) => setUniSkill0(e.target.value)}
-                    >
-                      {uniSkillList
-                        .filter((sk) => sk !== uniSkill1)
-                        .map((sk) => (
+                <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-2.5">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <label className="block space-y-1">
+                      <span className="text-[11px] text-slate-300">
+                        Major Subject (Starts at Level 1 → Level 2 on Graduation)
+                      </span>
+                      <select
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs"
+                        value={uniSkill1}
+                        onChange={(e) => {
+                          const next = e.target.value;
+                          setUniSkill1(next);
+                          if (baseSkillName(next) === uniSkill0) {
+                            const alt = uniMinorList.find((s) => s !== baseSkillName(next));
+                            if (alt) setUniSkill0(alt);
+                          }
+                        }}
+                      >
+                        {uniSkillList.map((sk) => (
                           <option key={sk} value={sk}>
                             {sk}
                           </option>
                         ))}
-                    </select>
-                  </label>
+                      </select>
+                    </label>
+                    <label className="block space-y-1">
+                      <span className="text-[11px] text-slate-300">
+                        Minor Subject (Starts at Level 0, Unspecialised → Level 1 on Grad)
+                      </span>
+                      <select
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs"
+                        value={uniSkill0}
+                        onChange={(e) => setUniSkill0(e.target.value)}
+                      >
+                        {uniMinorList
+                          .filter((sk) => sk !== baseSkillName(uniSkill1))
+                          .map((sk) => (
+                            <option key={sk} value={sk}>
+                              {sk}
+                            </option>
+                          ))}
+                      </select>
+                    </label>
+                  </div>
+                  {uniMinorSpecs.length > 0 && (
+                    <label className="block space-y-1">
+                      <span className="text-[11px] text-slate-400">
+                        Minor Graduation Specialisation (only applied if you graduate to Level 1;
+                        stays unspecialised <strong className="text-slate-200">{uniSkill0}-0</strong>{" "}
+                        otherwise):
+                      </span>
+                      <select
+                        className="w-full sm:w-64 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
+                        value={uniMinorGradSpec}
+                        onChange={(e) => setUniMinorGradSpec(e.target.value)}
+                      >
+                        {uniMinorSpecs.map((sp) => (
+                          <option key={sp} value={sp}>
+                            {uniSkill0} ({sp})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
                 </div>
               )}
 
@@ -963,13 +1038,13 @@ export function CharGenStudio({
 
                 {showBasicPick && activeCareer && (
                   <label className="flex items-center gap-1.5 text-slate-300">
-                    New Career Basic Training (Lvl 0):
+                    New Career Basic Training (Lvl 0, Unspecialised):
                     <select
                       className="bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-[11px]"
                       value={basicSkillPick}
                       onChange={(e) => setBasicSkillPick(e.target.value)}
                     >
-                      {activeCareer.service_skills.map((sk) => (
+                      {activeBasicChoices.map((sk) => (
                         <option key={sk} value={sk}>
                           {sk}
                         </option>

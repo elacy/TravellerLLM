@@ -4,7 +4,10 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::character::{characteristic_dm, Character, CharacterKind, Characteristic, Upp};
+use crate::character::{
+    characteristic_dm, skill_base_name, skill_specializations, Character, CharacterKind,
+    Characteristic, Upp,
+};
 use crate::dice::roll_nd6;
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,32 +61,49 @@ pub fn find_species(name: &str) -> Option<&'static SpeciesSpec> {
         })
 }
 
-/// Core 2022 p. 16 full Background Skills list (choose EDU DM + 3 at level 0).
+/// Core 2022 p. 16 full Background Skills list (choose EDU DM + 3 at Level 0 — NO specialisations at Level 0!).
 pub fn all_background_skills() -> &'static [&'static str] {
     &[
         "Admin",
-        "Animals (Handling)",
-        "Art (Performer)",
-        "Athletics (Dexterity)",
-        "Athletics (Endurance)",
+        "Animals",
+        "Art",
+        "Athletics",
         "Carouse",
-        "Drive (Wheel)",
-        "Electronics (comms)",
-        "Electronics (computers)",
-        "Flyer (Grav)",
-        "Language (Galanglic)",
+        "Drive",
+        "Electronics",
+        "Flyer",
+        "Language",
         "Mechanic",
         "Medic",
-        "Profession (Belter)",
-        "Science (Physics)",
-        "Seafarer (Personal)",
+        "Profession",
+        "Science",
+        "Seafarer",
         "Streetwise",
         "Survival",
         "Vacc Suit",
     ]
 }
 
-/// Core 2022 p. 17 University Study Skills (choose 1 at level 0 and 1 at level 1; both +1 on graduation).
+/// Core 2022 p. 17 University Minor Skills (starts at Level 0 — unspecialised base skills; gains specialisation only on graduation to Level 1!).
+pub fn all_university_minor_skills() -> &'static [&'static str] {
+    &[
+        "Admin",
+        "Advocate",
+        "Animals",
+        "Art",
+        "Astrogation",
+        "Broker",
+        "Electronics",
+        "Engineer",
+        "Language",
+        "Medic",
+        "Navigation",
+        "Profession",
+        "Science",
+    ]
+}
+
+/// Core 2022 p. 17 University Major Study Skills (starts at Level 1, so specialised skills carry a specialisation; +1 on graduation).
 pub fn all_university_skills() -> &'static [&'static str] {
     &[
         "Admin",
@@ -92,9 +112,9 @@ pub fn all_university_skills() -> &'static [&'static str] {
         "Art (Visual Media)",
         "Astrogation",
         "Broker",
-        "Electronics (comms)",
-        "Electronics (computers)",
-        "Electronics (sensors)",
+        "Electronics (Comms)",
+        "Electronics (Computers)",
+        "Electronics (Sensors)",
         "Engineer (Power)",
         "Language (Galanglic)",
         "Medic",
@@ -590,7 +610,11 @@ pub fn start_lifepath<R: Rng + ?Sized>(
         background_skills.into_iter().take(bg_limit).collect()
     };
     for sk in chosen {
-        skills.entry(sk).or_insert(0);
+        // Core 2022 p. 16 & p. 62: Level 0 background skills NEVER have specialisations.
+        let base = skill_base_name(&sk);
+        if !base.is_empty() {
+            skills.entry(base.to_string()).or_insert(0);
+        }
     }
     if canonical_species == "Bwap" {
         skills.entry("Admin".to_string()).or_insert(0);
@@ -681,6 +705,7 @@ pub fn assign_characteristics(
 }
 
 /// Set the player's chosen Core 2022 background skills at Level 0 (allowed before Pre-Career / Term 1).
+/// Per Core 2022 p. 62, Level 0 skills never have specialisations; any `(Spec)` suffix is stripped.
 pub fn set_background_skills(session: &mut LifepathSession, chosen: Vec<String>) {
     if session.terms_completed > 0 || session.pre_career_done {
         return;
@@ -688,7 +713,10 @@ pub fn set_background_skills(session: &mut LifepathSession, chosen: Vec<String>)
     let limit = session.background_skill_slots.max(1) as usize;
     session.skills.clear();
     for sk in chosen.into_iter().take(limit) {
-        session.skills.entry(sk).or_insert(0);
+        let base = skill_base_name(&sk);
+        if !base.is_empty() {
+            session.skills.entry(base.to_string()).or_insert(0);
+        }
     }
     if session.species == "Bwap" {
         session.skills.entry("Admin".to_string()).or_insert(0);
@@ -739,14 +767,29 @@ pub fn run_pre_career_detailed<R: Rng + ?Sized>(
             session.terms_completed += 1;
             session.upp.edu_val = (session.upp.edu_val + 1).min(15);
 
-            // Core 2022 p. 17: Choose 1 skill at Level 0 and 1 skill at Level 1 on entry!
-            let s0 = uni_skill_0
+            // Core 2022 p. 17 & p. 62:
+            // - Minor Subject starts at Level 0 (NO specialisation at Level 0!).
+            //   If the student graduates and raises it to Level 1, it takes the chosen specialisation
+            //   (if any) or first canonical specialisation for specialised skills.
+            // - Major Subject starts at Level 1 (specialised if applicable).
+            let raw_s0 = uni_skill_0
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "Admin".to_string());
+            let s0_base = skill_base_name(&raw_s0).to_string();
+            let s0_grad_target = if raw_s0.contains('(') {
+                raw_s0.clone()
+            } else {
+                let specs = skill_specializations(&s0_base);
+                if specs.is_empty() {
+                    s0_base.clone()
+                } else {
+                    format!("{s0_base} ({})", specs[0])
+                }
+            };
             let s1 = uni_skill_1
-                .filter(|s| !s.trim().is_empty() && s != &s0)
-                .unwrap_or_else(|| "Electronics (computers)".to_string());
-            session.skills.entry(s0.clone()).or_insert(0);
+                .filter(|s| !s.trim().is_empty() && s != &s0_base && s != &raw_s0)
+                .unwrap_or_else(|| "Electronics (Computers)".to_string());
+            session.skills.entry(s0_base.clone()).or_insert(0);
             let s1_entry = session.skills.entry(s1.clone()).or_insert(0);
             if *s1_entry < 1 {
                 *s1_entry = 1;
@@ -779,32 +822,33 @@ pub fn run_pre_career_detailed<R: Rng + ?Sized>(
             // Graduation Roll: INT 7+ (Honours 11+)
             let gd = roll_nd6(rng, 2);
             let grad = i32::from(gd[0]) + i32::from(gd[1]) + session.upp.dm(Characteristic::Int);
-            let note = if grad >= 11 {
+            let (note, minor_display) = if grad >= 11 {
                 session.upp.edu_val = (session.upp.edu_val + 2).min(15);
-                *session.skills.entry(s0.clone()).or_insert(0) += 1;
+                let m_label = gain_skill_level1(&mut session.skills, &s0_grad_target);
                 *session.skills.entry(s1.clone()).or_insert(1) += 1;
                 session.qualification_bonus_dm += 2;
-                format!(
-                    "University Graduated with HONOURS (roll {grad}/11+)! EDU +3 total, {s0}-{}, {s1}-{}, +2 DM to first career qualification. Event: {ev_text}",
-                    session.skills.get(&s0).copied().unwrap_or(1),
+                let n = format!(
+                    "University Graduated with HONOURS (roll {grad}/11+)! EDU +3 total, {m_label}, {s1}-{}, +2 DM to first career qualification. Event: {ev_text}",
                     session.skills.get(&s1).copied().unwrap_or(2)
-                )
+                );
+                (n, m_label)
             } else if grad >= 7 {
                 session.upp.edu_val = (session.upp.edu_val + 1).min(15);
-                *session.skills.entry(s0.clone()).or_insert(0) += 1;
+                let m_label = gain_skill_level1(&mut session.skills, &s0_grad_target);
                 *session.skills.entry(s1.clone()).or_insert(1) += 1;
                 session.qualification_bonus_dm += 1;
-                format!(
-                    "University Graduated (roll {grad}/7+)! EDU +2 total, {s0}-{}, {s1}-{}, +1 DM to first career qualification. Event: {ev_text}",
-                    session.skills.get(&s0).copied().unwrap_or(1),
+                let n = format!(
+                    "University Graduated (roll {grad}/7+)! EDU +2 total, {m_label}, {s1}-{}, +1 DM to first career qualification. Event: {ev_text}",
                     session.skills.get(&s1).copied().unwrap_or(2)
-                )
+                );
+                (n, m_label)
             } else {
-                format!(
-                    "Attended University (did not graduate, roll {grad}/7+). Kept EDU +1, {s0}-{}, {s1}-{}. Event: {ev_text}",
-                    session.skills.get(&s0).copied().unwrap_or(0),
+                let m_label = format!("{s0_base}-{}", session.skills.get(&s0_base).copied().unwrap_or(0));
+                let n = format!(
+                    "Attended University (did not graduate, roll {grad}/7+). Kept EDU +1, {m_label}, {s1}-{}. Event: {ev_text}",
                     session.skills.get(&s1).copied().unwrap_or(1)
-                )
+                );
+                (n, m_label)
             };
             session.pre_career_note = Some(note.clone());
             session.log.push(LifepathLogEntry {
@@ -816,7 +860,7 @@ pub fn run_pre_career_detailed<R: Rng + ?Sized>(
                 advanced: grad >= 11,
                 rank: 0,
                 skills_gained: vec![
-                    format!("{s0}-{}", session.skills.get(&s0).copied().unwrap_or(0)),
+                    minor_display,
                     format!("{s1}-{}", session.skills.get(&s1).copied().unwrap_or(1)),
                 ],
                 event: note.clone(),
@@ -844,11 +888,15 @@ pub fn run_pre_career_detailed<R: Rng + ?Sized>(
             session.age += 4;
             session.terms_completed += 1;
             let bspec = career_spec(branch_career);
-            // Entry benefit: ALL 6 service skills of that military branch at Level 0!
+            // Entry benefit: ALL service skills of that military branch at Level 0 (unspecialised per Core 2022 p. 62)!
             let mut gained = Vec::new();
+            let mut seen_bt = std::collections::BTreeSet::new();
             for sk in bspec.service_skills {
-                session.skills.entry(sk.to_string()).or_insert(0);
-                gained.push(format!("{sk}-0"));
+                let base = skill_base_name(sk);
+                if seen_bt.insert(base) {
+                    session.skills.entry(base.to_string()).or_insert(0);
+                    gained.push(format!("{base}-0"));
+                }
             }
 
             let gd = roll_nd6(rng, 2);
@@ -1093,17 +1141,24 @@ pub fn run_lifepath_term_full<R: Rng + ?Sized>(
             }
             let first_adult_career = session.careers_entered.is_empty();
             session.careers_entered.push(career);
-            // Basic training: on first adult career, all 6 service skills at 0; later careers pick 1
+            // Basic training (Core 2022 p. 20 & p. 62): Level 0 skills NEVER have specialisations!
+            // First adult career grants all service skills at Level 0; later careers pick 1.
             if first_adult_career {
+                let mut seen_bt = std::collections::BTreeSet::new();
                 for sk in spec.service_skills {
-                    session.skills.entry(sk.to_string()).or_insert(0);
-                    skills_gained.push(format!("{sk}-0 (Basic)"));
+                    let base = skill_base_name(sk);
+                    if seen_bt.insert(base) {
+                        session.skills.entry(base.to_string()).or_insert(0);
+                        skills_gained.push(format!("{base}-0 (Basic)"));
+                    }
                 }
             } else {
                 let chosen_bt = basic_training_skill
-                    .filter(|s| spec.service_skills.contains(&s.as_str()))
-                    .unwrap_or_else(|| spec.service_skills[rng.random_range(0..6)].to_string());
-                session.skills.entry(chosen_bt.clone()).or_insert(0);
+                    .as_deref()
+                    .map(skill_base_name)
+                    .filter(|b| spec.service_skills.iter().any(|s| skill_base_name(s).eq_ignore_ascii_case(b)))
+                    .unwrap_or_else(|| skill_base_name(spec.service_skills[rng.random_range(0..6)]));
+                session.skills.entry(chosen_bt.to_string()).or_insert(0);
                 skills_gained.push(format!("{chosen_bt}-0 (Basic)"));
             }
             career
@@ -1128,14 +1183,18 @@ pub fn run_lifepath_term_full<R: Rng + ?Sized>(
             let first_adult_career = session.careers_entered.is_empty();
             session.careers_entered.push(chosen_fallback);
             if first_adult_career {
+                let mut seen_bt = std::collections::BTreeSet::new();
                 for sk in fspec.service_skills {
-                    session.skills.entry(sk.to_string()).or_insert(0);
-                    skills_gained.push(format!("{sk}-0 (Basic)"));
+                    let base = skill_base_name(sk);
+                    if seen_bt.insert(base) {
+                        session.skills.entry(base.to_string()).or_insert(0);
+                        skills_gained.push(format!("{base}-0 (Basic)"));
+                    }
                 }
             } else {
-                let sk = fspec.service_skills[0];
-                session.skills.entry(sk.to_string()).or_insert(0);
-                skills_gained.push(format!("{sk}-0 (Basic)"));
+                let base = skill_base_name(fspec.service_skills[0]);
+                session.skills.entry(base.to_string()).or_insert(0);
+                skills_gained.push(format!("{base}-0 (Basic)"));
             }
             chosen_fallback
         }

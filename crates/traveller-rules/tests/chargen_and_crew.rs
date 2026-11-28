@@ -144,10 +144,21 @@ fn species_catalog_background_skills_pre_career_and_detailed_terms() {
     assign_characteristics(&mut aslan, reversed, true).expect("valid permutation must succeed");
     assert!(aslan.stats_locked);
 
-    // Choosing custom background skills before Pre-Career replaces defaults
+    // Background skills list must NEVER contain specialisations (Core 2022 p. 16 & p. 62)
+    assert!(
+        all_background_skills().iter().all(|s| !s.contains('(')),
+        "Background skills at Level 0 must have no specialisations"
+    );
+
+    // Choosing custom background skills strips any accidental specialisation at Level 0
     set_background_skills(&mut aslan, vec!["Pilot (Spacecraft)".into(), "Broker".into()]);
     assert!(aslan.background_skills_chosen);
     assert_eq!(aslan.skills.get("Broker"), Some(&0));
+    assert_eq!(aslan.skills.get("Pilot"), Some(&0));
+    assert!(
+        !aslan.skills.contains_key("Pilot (Spacecraft)"),
+        "Level 0 background skill must NOT carry a specialisation"
+    );
 
     // Pre-career education works with player's chosen University skills
     let note = run_pre_career_detailed(
@@ -178,6 +189,15 @@ fn species_catalog_background_skills_pre_career_and_detailed_terms() {
     assert!(
         aslan.skills.values().any(|&lvl| lvl >= 1),
         "Career term skill roll must grant Level 1+ skill, not all zeros: {:?}",
+        aslan.skills
+    );
+    assert!(
+        aslan
+            .skills
+            .iter()
+            .filter(|&(_, &lvl)| lvl == 0)
+            .all(|(name, _)| !name.contains('(')),
+        "NO Level 0 skill may ever carry a specialisation (Core 2022 p. 62): {:?}",
         aslan.skills
     );
 
